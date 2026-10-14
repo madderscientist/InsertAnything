@@ -1,11 +1,14 @@
 """基于 mjlab 批量 MuJoCo 仿真的六自由度插孔动力学环境"""
 
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 import logging
 import math
-from typing import Any
+from typing import Any, Iterator
 
+import mujoco_warp as mjwarp
 import torch
+import warp as wp
 from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from mjlab.managers.event_manager import RecomputeLevel
@@ -17,6 +20,18 @@ from .geometry import build_model, geometry, symmetry_count
 from .transforms import (action_target, actor_observation, canonical_quat,
                          quat_inv, quat_mul, quat_rotvec, rotate,
                          rotvec_quat, tip_pose, transform_wrench)
+
+
+@contextmanager
+def capture_graph(device: str) -> Iterator[torch.cuda.CUDAGraph]:
+    with torch.cuda.device(device):
+        current = torch.cuda.current_stream(device)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(current)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            yield graph
+        current.wait_stream(stream)
 
 
 def bounded_stiffness_step(current: torch.Tensor, target: torch.Tensor, initial: torch.Tensor,
@@ -95,6 +110,7 @@ class PlantGroup:
         self.offset = self.nominal_offset.clone()
         self.peg_ids = torch.as_tensor(
             (self.model.geom_bodyid == self.body_id).nonzero()[0], device=device)
+        self.peg_geom_ids = self.peg_ids.tolist()
         self.default_geom_pos = torch.tensor(self.model.geom_pos, device=device,
                                               dtype=torch.float32)
         self.sensor_offset = torch.tensor([0, 0, 0.03 * cfg.scale],
@@ -136,6 +152,13 @@ class PlantGroup:
         self.applied_wrench = self.sim.data.xfrc_applied[:, self.body_id]
         self.physics_graph: torch.cuda.CUDAGraph | None = None
         self.sensor_graph: torch.cuda.CUDAGraph | None = None
+        self.physics_rollout_graph: torch.cuda.CUDAGraph | None = None
+        self.reset_constants_graph: torch.cuda.CUDAGraph | None = None
+        self.action_graph: torch.cuda.CUDAGraph | None = None
+        self.outcome_graph: torch.cuda.CUDAGraph | None = None
+        self.step_actions = torch.zeros(self.n, 6, device=device)
+        self.outcome_outputs: tuple[torch.Tensor, torch.Tensor, dict] | None = None
+        self.outcome_reward_terms: dict[str, torch.Tensor] = {}
         self.observation_graph: torch.cuda.CUDAGraph | None = None
         self.observation_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
         self.observation_noise = (
@@ -174,13 +197,14 @@ class PlantGroup:
         self.sim.expand_model_fields(("body_mass", "body_inertia", "geom_friction", "geom_pos"))
         self.peg_ids = torch.as_tensor(
             (self.model.geom_bodyid == self.body_id).nonzero()[0], device=self.device)
+        self.peg_geom_ids = self.peg_ids.tolist()
         self.default_geom_pos = torch.tensor(self.model.geom_pos, device=self.device,
                                               dtype=torch.float32)
         self.sim.model.body_mass[:, self.body_id] = self.mass[:, 0]
         self.sim.model.body_inertia[:, self.body_id] = self.inertia
         self.sim.model.geom_friction[:, :, 0] = friction
         grasp = self.offset - self.nominal_offset
-        for geom_id in self.peg_ids.tolist():
+        for geom_id in self.peg_geom_ids:
             self.sim.model.geom_pos[:, geom_id] = self.default_geom_pos[geom_id] + grasp
         self.sim.recompute_constants(RecomputeLevel.set_const)
         self.sim.data.qpos[:] = qpos
@@ -190,6 +214,12 @@ class PlantGroup:
         self.applied_wrench = self.sim.data.xfrc_applied[:, self.body_id]
         self.physics_graph = None
         self.sensor_graph = None
+        self.physics_rollout_graph = None
+        self.reset_constants_graph = None
+        self.action_graph = None
+        self.outcome_graph = None
+        self.outcome_outputs = None
+        self.outcome_reward_terms = {}
         self.physics_graph_signature = None
         self.observation_graph = None
         self.observation_outputs = None
@@ -262,9 +292,23 @@ class PlantGroup:
             grasp = self.uniform(n, 3, -cfg.grasp_position_error, cfg.grasp_position_error)
         grasp = grasp*self.noise_scale
         self.offset[ids] = self.nominal_offset[ids] + grasp
-        for geom_id in self.peg_ids.tolist():
+        for geom_id in self.peg_geom_ids:
             self.sim.model.geom_pos[ids, geom_id] = self.default_geom_pos[geom_id] + grasp
-        self.sim.recompute_constants(RecomputeLevel.set_const)
+        if self.reset_constants_graph is not None and cfg.physics_cuda_graph:
+            self.reset_constants_graph.replay()
+        else:
+            self.sim.recompute_constants(RecomputeLevel.set_const)
+            if cfg.physics_cuda_graph:
+                with torch.cuda.device(self.device):
+                    stream = torch.cuda.Stream(device=self.device)
+                    stream.wait_stream(torch.cuda.current_stream(self.device))
+                    graph = torch.cuda.CUDAGraph()
+                    with wp.ScopedStream(wp.stream_from_torch(stream)):
+                        with torch.cuda.graph(graph, stream=stream):
+                            with wp.ScopedCapture(external=True, capture_mode=wp.CaptureMode.GLOBAL):
+                                self.sim.recompute_constants(RecomputeLevel.set_const)
+                    torch.cuda.current_stream(self.device).wait_stream(stream)
+                self.reset_constants_graph = graph
         self.calibration[ids] = self.uniform(n, 3, -cfg.tip_calibration_error,
                                             cfg.tip_calibration_error)*self.noise_scale
         self.bias[ids] = self.uniform(n, 3, -cfg.position_bias, cfg.position_bias)*self.noise_scale
@@ -361,13 +405,8 @@ class PlantGroup:
             target.copy_(value)
         if self.observation_graph is None:
             self.observations_from_noise(*self.observation_noise)
-            with torch.cuda.device(self.device):
-                stream = torch.cuda.Stream(device=self.device)
-                stream.wait_stream(torch.cuda.current_stream(self.device))
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=stream):
-                    outputs = self.observations_from_noise(*self.observation_noise)
-                torch.cuda.current_stream(self.device).wait_stream(stream)
+            with capture_graph(self.device) as graph:
+                outputs = self.observations_from_noise(*self.observation_noise)
             self.observation_graph, self.observation_outputs = graph, outputs
         self.observation_graph.replay()
         assert self.observation_outputs is not None
@@ -435,6 +474,10 @@ class PlantGroup:
                      cfg.impedance_walk_rate_per_second, cfg.filter_seconds)
         use_graph = (cfg.physics_cuda_graph and self.physics_graph is not None
                      and self.physics_graph_signature == signature)
+        if use_graph and self.physics_rollout_graph is not None and not self.sim.nan_guard.enabled:
+            self.physics_rollout_graph.replay()
+            return
+        self.physics_rollout_graph = None
         for _ in range(cfg.decimation):
             if use_graph:
                 assert self.physics_graph is not None
@@ -460,10 +503,59 @@ class PlantGroup:
                 torch.cuda.current_stream(self.device).wait_stream(stream)
             self.physics_graph, self.sensor_graph = control_graph, sensor_graph
             self.physics_graph_signature = signature
+            if self.sim.use_cuda_graph and self.sim.step_graph is not None and not self.sim.nan_guard.enabled:
+                with torch.cuda.device(self.device):
+                    stream = torch.cuda.Stream(device=self.device)
+                    stream.wait_stream(torch.cuda.current_stream(self.device))
+                    rollout_graph = torch.cuda.CUDAGraph()
+                    # 在同一流中捕获原始操作，保持每个 1 ms 子步的读写顺序
+                    with wp.ScopedStream(wp.stream_from_torch(stream)):
+                        with torch.cuda.graph(rollout_graph, stream=stream):
+                            with wp.ScopedCapture(external=True, capture_mode=wp.CaptureMode.GLOBAL):
+                                for _ in range(cfg.decimation):
+                                    self.physics_control()
+                                    mjwarp.step(self.sim.wp_model, self.sim.wp_data)
+                                    self.physics_sensor()
+                    torch.cuda.current_stream(self.device).wait_stream(stream)
+                self.physics_rollout_graph = rollout_graph
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
         if not torch.isfinite(actions).all():
             raise FloatingPointError("non-finite policy action; no silent reset")
+        if self.cfg.physics_cuda_graph:
+            self.step_actions.copy_(actions)
+            if self.action_graph is None:
+                self.prepare_actions(self.step_actions)
+                with capture_graph(self.device) as graph:
+                    self.prepare_actions(self.step_actions)
+                self.action_graph = graph
+            else:
+                self.action_graph.replay()
+        else:
+            self.prepare_actions(actions)
+        self.sample_impedance_walk_target()
+        self.advance_physics()
+        if not torch.isfinite(self.sim.data.qpos[:]).all() or not torch.isfinite(self.raw_wrench).all():
+            raise FloatingPointError(f"invalid physical state in {self.shape}")
+        if not self.cfg.physics_cuda_graph:
+            return self.step_outcome(actions)
+        if self.outcome_graph is None:
+            result = self.step_outcome(self.step_actions)
+            terms = self.last_reward_terms
+            with capture_graph(self.device) as graph:
+                self.outcome_outputs = self.step_outcome(self.step_actions)
+            self.outcome_reward_terms = self.last_reward_terms
+            self.last_reward_terms = terms
+            self.outcome_graph = graph
+            return result
+        self.outcome_graph.replay()
+        self.last_reward_terms = self.outcome_reward_terms
+        assert self.outcome_outputs is not None
+        reward, done, info = self.outcome_outputs
+        # 图输出下次重放会被覆盖，不能泄露给 rollout 或终局信息的持有者
+        return reward.clone(), done.clone(), {key: value.clone() for key, value in info.items()}
+
+    def prepare_actions(self, actions: torch.Tensor) -> None:
         cfg = self.cfg
         pos, q, _, _ = self.state()
         p_target, q_target = action_target(tip_pose(pos, q, self.nominal_offset + self.calibration),
@@ -473,10 +565,9 @@ class PlantGroup:
         ids = torch.arange(self.n, device=self.device)
         self.physics_p_goal.copy_(self.targets_p[self.delay, ids])
         self.physics_q_goal.copy_(self.targets_q[self.delay, ids])
-        self.sample_impedance_walk_target()
-        self.advance_physics()
-        if not torch.isfinite(self.sim.data.qpos[:]).all() or not torch.isfinite(self.raw_wrench).all():
-            raise FloatingPointError(f"invalid physical state in {self.shape}")
+
+    def step_outcome(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        cfg = self.cfg
         pos, q, _, _ = self.state()
         tip = tip_pose(pos, q, self.offset)
         xy = torch.linalg.vector_norm(tip[:, :2], dim=-1)

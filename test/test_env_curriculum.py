@@ -1,6 +1,8 @@
 """奖励函数、孔间隙课程与批量 GPU 物理环境测试"""
 
 import math
+from dataclasses import replace
+from itertools import product
 from typing import Any
 import unittest
 
@@ -101,7 +103,8 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
             tip_calibration_error=0, grasp_position_error=0, sensor_rotation_error=0,
             position_noise=0, rotation_noise=0, force_noise=0, moment_noise=0,
         )
-        cls.env = InsertionEnv(cls.cfg, cls.device)
+        cls.env = InsertionEnv(replace(cls.cfg, physics_cuda_graph=True,
+                                      observation_cuda_graph=True), cls.device)
 
     def test_scripted_aligned_insertion_succeeds_all_shapes(self):
         for group in self.env.groups:
@@ -132,9 +135,18 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         group = env.groups[0]
         self.assertEqual(group.clearance, 0.002)
         self.assertAlmostEqual(group.difficulty, 0.25)
+        env.step(torch.zeros(4, 6, device=self.device))
+        self.assertIsNotNone(group.physics_rollout_graph)
+        self.assertIsNotNone(group.reset_constants_graph)
+        self.assertIsNotNone(group.action_graph)
+        self.assertIsNotNone(group.outcome_graph)
         env.record_curriculum_outcomes(torch.tensor([[0., 1., 1., 1.]] * 1000, device=self.device))
         logs = env.advance_noise_curriculum()
         self.assertEqual(group.clearance, 0.001)
+        self.assertIsNone(group.physics_rollout_graph)
+        self.assertIsNone(group.reset_constants_graph)
+        self.assertIsNone(group.action_graph)
+        self.assertIsNone(group.outcome_graph)
         self.assertAlmostEqual(group.difficulty, 0.40)
         self.assertAlmostEqual(float(logs["curriculum/clearance_mm"]), 1.0)
         for _ in range(4):
@@ -142,7 +154,78 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(obs["actor"]).all())
             self.assertTrue(torch.isfinite(rewards).all())
         self.assertIsNotNone(group.physics_graph)
+        self.assertIsNotNone(group.physics_rollout_graph)
+        self.assertIsNotNone(group.reset_constants_graph)
+        self.assertIsNotNone(group.action_graph)
+        self.assertIsNotNone(group.outcome_graph)
         self.assertIsNotNone(group.observation_graph)
+
+    def test_full_physics_graph_matches_eager_with_contacts_and_resets(self):
+        devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        for device, dynamics in product(devices, ("nominal", "train")):
+            with self.subTest(device=device, dynamics=dynamics):
+                cfg = replace(self.cfg, envs_per_shape=2, episode_seconds=0.4,
+                              dynamics=dynamics)
+                eager = InsertionEnv(cfg, device)
+                captured = InsertionEnv(replace(cfg, physics_cuda_graph=True,
+                                               observation_cuda_graph=True), device)
+                actions = torch.zeros(eager.num_envs, 6, device=device)
+                actions[:, 2] = -1
+                saw_contact = False
+                saw_reset = False
+                with torch.inference_mode():
+                    for step in range(24):
+                        actions[:, 0] = 0.05 * math.sin(step)
+                        actions[:, 5] = 0.02 * math.cos(step)
+                        obs, reward, done, info = eager.step(actions)
+                        other_obs, other_reward, other_done, other_info = captured.step(actions)
+                        torch.testing.assert_close(other_obs, obs, rtol=1e-5, atol=2e-6)
+                        torch.testing.assert_close(other_reward, reward, rtol=1e-5, atol=2e-6)
+                        torch.testing.assert_close(other_done, done)
+                        for key in info["terminal"]:
+                            torch.testing.assert_close(other_info["terminal"][key],
+                                                       info["terminal"][key], rtol=1e-5, atol=2e-6)
+                        for left, right in zip(eager.groups, captured.groups, strict=True):
+                            for name in ("qpos", "qvel", "time"):
+                                torch.testing.assert_close(getattr(right.sim.data, name)[:],
+                                                           getattr(left.sim.data, name)[:],
+                                                           rtol=1e-5, atol=2e-6)
+                            for name in ("wrench", "raw_wrench", "k", "d", "hold", "length"):
+                                torch.testing.assert_close(getattr(right, name), getattr(left, name),
+                                                           rtol=1e-5, atol=2e-6)
+                            for key in left.last_reward_terms:
+                                torch.testing.assert_close(right.last_reward_terms[key],
+                                                           left.last_reward_terms[key],
+                                                           rtol=1e-5, atol=2e-6)
+                            saw_contact |= bool((left.peak_force > 0.1).any())
+                            self.assertIsNotNone(right.physics_rollout_graph)
+                        saw_reset |= bool(done.any())
+                self.assertTrue(saw_contact)
+                self.assertTrue(saw_reset)
+
+    def test_step_graph_outputs_are_owned_and_invalid_actions_still_raise(self):
+        cfg = replace(self.cfg, shapes=("square",), physics_cuda_graph=True,
+                      observation_cuda_graph=True)
+        env = InsertionEnv(cfg, self.device)
+        group = env.groups[0]
+        actions = torch.zeros(env.num_envs, 6, device=self.device)
+        group.step(actions)
+        reward, done, terminal = group.step(actions)
+        saved_reward, saved_done = reward.clone(), done.clone()
+        saved_terminal = {key: value.clone() for key, value in terminal.items()}
+        actions[:, 2] = -1
+        group.step(actions)
+        torch.testing.assert_close(reward, saved_reward)
+        torch.testing.assert_close(done, saved_done)
+        for key, value in terminal.items():
+            torch.testing.assert_close(value, saved_terminal[key])
+        actions[0, 0] = float("nan")
+        with self.assertRaisesRegex(FloatingPointError, "non-finite policy action"):
+            env.step(actions)
+        actions.zero_()
+        group.sim.data.qpos[0, 0] = float("nan")
+        with self.assertRaisesRegex(FloatingPointError, "invalid physical state"):
+            group.step(actions)
 
 
 if __name__ == "__main__":

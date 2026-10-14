@@ -181,6 +181,8 @@ class DistributedRunner(ContinuousRunner):
                     self.verify_shared_state()
                 if self.gpu_global_rank == 0:
                     self.save(str(self.output / "checkpoint.pt"))
+                else:
+                    self.release_update_cache()
                 # 等待主进程完成原子保存后再进入下一轮采样
                 dist.barrier()
                 stopping = torch.tensor(int(stop_event.is_set() or (self.output/"STOP").exists()),

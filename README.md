@@ -23,8 +23,8 @@
 运行环境需要支持 CUDA 的 Linux 系统与 Python 3.11+。推荐使用 `micromamba` 或 `conda` 创建虚拟环境，并通过 [requirements.txt](./requirements.txt) 安装依赖：
 
 ```bash
-micromamba create -n mj python=3.11 -y
-micromamba run -n mj pip install -r requirements.txt
+micromamba create -r ~/micromamba -n mj -c conda-forge python=3.13 pip -y
+micromamba run -r ~/micromamba -n mj python -m pip install -r requirements.txt
 ```
 
 核心依赖版本（见 [requirements.txt](./requirements.txt)）：
@@ -94,6 +94,38 @@ micromamba run -n mj python export_policy.py runs/continuous_dual/checkpoint.pt 
 ```
 
 
+### 单卡持续训练
+
+以下为 24 GB RTX 4090 的参考配置，较小显存应降低环境数。启动新训练时不要复用已有输出目录：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 micromamba run -r ~/micromamba -n mj python -u train.py \
+  --output runs/continuous_single --device cuda:0 \
+  --envs-per-shape 512 --steps 256 \
+  --success-noise-curriculum --physics-cuda-graph --observation-cuda-graph
+
+# 已有训练在线扩容：当前轮次保存后由守护进程恢复
+micromamba run -r ~/micromamba -n mj python train.py \
+  --resize-envs --envs-per-shape 512 --output runs/continuous_single
+
+# 优雅停止
+touch runs/continuous_single/STOP
+
+# 停止后恢复（使用保存的环境数和课程配置）
+rm -f runs/continuous_single/STOP
+CUDA_VISIBLE_DEVICES=0 micromamba run -r ~/micromamba -n mj python -u train.py \
+  --resume --output runs/continuous_single --device cuda:0
+```
+
+此配置共 2560 个环境，每轮采样 655360 条 transition。接触状态和回合长度会影响
+吞吐与峰值显存。扩容保留权重、归一化器、优化器和课程，但重置进行中的回合及
+GRU 隐藏状态，并改变 PPO 采样批量；恢复训练使用已保存的配置。
+
+持续训练在每轮检查点保存后释放 PyTorch 未使用的 CUDA 分配缓存，避免变长 GRU
+训练工作区长期占据显存、拖慢下一轮仿真；分布式各 rank 分别释放本卡缓存。
+这不释放存活的模型、优化器或 CUDA Graph 缓冲区，也不能降低 PPO 更新本身的峰值需求。
+`heartbeat.json` 的 `cuda_memory` 记录各设备的存活分配、释放前后保留量及剩余显存。
+
 ## 4. 架构与方法设计
 
 ### 4.1 观测、动作与网络结构
@@ -112,7 +144,7 @@ micromamba run -n mj python export_policy.py runs/continuous_dual/checkpoint.pt 
 - **几何构建**（[insertion/geometry.py](./insertion/geometry.py)）：无需外部 USD 资产，程序化生成正三角形、方形、正五边形、正六边形、L 形及测试用圆形。正多边形外接圆半径 `10 mm`，L 形包络 `20 mm`，孔深 `25 mm`，插头长 `35 mm`。孔壁拆分为独立凸棱柱以保持中心孔贯通，L 形插头拆分为双盒体保留凹口。
 - **传感器动力学**（[insertion/env.py](./insertion/env.py)）：关闭重力代表理想重力补偿。腕部传感器测量外部接触载荷减去传感器下游质量加速度与陀螺力矩，经时间常数 `15 ms` 的一阶低通滤波后搬移至名义尖端。
 - **各向异性阻抗与时变游走**：支持 `train`、`nominal`、`soft`、`stiff` 四种动力学模式。训练模式下刚度主轴随机旋转，且刚度在回合初始值 `±10%` 范围内每秒采样局部目标并以 `1 s` 时间常数平滑游走（变化率上限 `5%/s`）。
-- **CUDA Graph 加速**：`--physics-cuda-graph` 与 `--observation-cuda-graph` 将每个物理子步的阻抗控制、传感器滤波及确定性观测变换捕获为 CUDA Graph，在保持 `1000 Hz` 物理求解精度不变的前提下显著降低 Python 调度开销。
+- **CUDA Graph 加速**：`--physics-cuda-graph` 分别捕获动作处理、完整 20 个物理子步、奖励/终止计算及重置时的模型常量重计算；`--observation-cuda-graph` 捕获确定性观测变换。保持 `1000 Hz` 物理步长和逐子步控制/传感器更新；有限值检查、随机采样、动态重置和课程推进仍在图外。预热后捕获，模型重建后重新捕获，返回张量不受后续重放覆盖。启用 mjlab NaN 调试守卫时保留逐子步调用以执行调试回调。单卡与多卡各 rank 共用优化路径，多卡端到端收益尚未实测。
 
 ### 4.3 孔间隙、难度与噪声三阶段自动课程
 [insertion/curriculum.py](./insertion/curriculum.py) 中的 `SuccessNoiseCurriculum` 按每种形状最近 **1000 个完成回合**的真实成功率推进课程（所有训练形状成功率均达到 **80%** 时升级，清空窗口并过滤跨等级旧回合）：

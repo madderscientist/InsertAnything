@@ -238,6 +238,7 @@ class ContinuousRunner(OnPolicyRunner):
             previous.replace(self.output / "previous.pt")
         temporary.replace(checkpoint)
         reward = list(self.logger.rewbuffer)
+        memory = self.release_update_cache()
         progress = {
             "timestamp": time.time(),
             "pid": os.getpid(),
@@ -250,12 +251,29 @@ class ContinuousRunner(OnPolicyRunner):
             "difficulty": self.env.groups[0].difficulty,
             "noise_scale": self.env.groups[0].noise_scale,
             "checkpoint": str(checkpoint),
+            "cuda_memory": memory,
         }
         atomic_json(self.output / "heartbeat.json", progress)
         publish_scene(self.env, self.output, self.metadata, progress)
         self.last_saved = progress_key
         if self.stop_requested:
             raise TrainingStopped()
+
+    def release_update_cache(self) -> dict:
+        memory = {}
+        for device in dict.fromkeys(group.device for group in self.env.groups):
+            with torch.cuda.device(device):
+                allocated = torch.cuda.memory_allocated(device)
+                reserved = torch.cuda.memory_reserved(device)
+                # 循环 PPO 的变长序列工作区不应挤占下一轮仿真的显存。
+                torch.cuda.empty_cache()
+                free, total = torch.cuda.mem_get_info(device)
+                memory[device] = {
+                    "allocated_bytes": allocated, "reserved_before_bytes": reserved,
+                    "reserved_after_bytes": torch.cuda.memory_reserved(device),
+                    "free_bytes": free, "total_bytes": total,
+                }
+        return memory
 
 
 def worker(output: Path, device: str, attempt: int) -> None:

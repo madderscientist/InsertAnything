@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -86,6 +87,23 @@ class PolicyAndViewerTests(unittest.TestCase):
 
 
 class RuntimeAndDistributedTests(unittest.TestCase):
+    def test_update_cache_released_once_per_simulation_device(self):
+        runner = ContinuousRunner.__new__(ContinuousRunner)
+        runner.env = SimpleNamespace(groups=[
+            SimpleNamespace(device=device) for device in ("cuda:0", "cuda:0", "cuda:1")])
+        with (patch("torch.cuda.device", side_effect=lambda _: nullcontext()),
+              patch("torch.cuda.memory_allocated", return_value=100),
+              patch("torch.cuda.memory_reserved", side_effect=[900, 150, 800, 140]),
+              patch("torch.cuda.mem_get_info", return_value=(700, 1000)),
+              patch("torch.cuda.empty_cache") as release):
+            memory = runner.release_update_cache()
+        self.assertEqual(release.call_count, 2)
+        self.assertEqual(set(memory), {"cuda:0", "cuda:1"})
+        self.assertEqual(memory["cuda:0"]["reserved_before_bytes"], 900)
+        self.assertEqual(memory["cuda:0"]["reserved_after_bytes"], 150)
+        self.assertEqual(memory["cuda:1"]["reserved_before_bytes"], 800)
+        self.assertEqual(memory["cuda:1"]["reserved_after_bytes"], 140)
+
     def test_watchdog_and_corrupt_checkpoint_recovery(self):
         self.assertEqual(health_state(None, 100, 10, None, 120), "running")
         self.assertEqual(health_state(None, 200, 10, None, 120), "stalled")
