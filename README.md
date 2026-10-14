@@ -1,0 +1,137 @@
+# 基于 mjlab 的通用六自由度多几何力控插入策略
+
+本项目使用 `mjlab` 批量 MuJoCo GPU 仿真与双层 GRU 循环 PPO，训练**单一策略网络**同时完成三角形、方形、正五边形、正六边形和 L 形的高精度力控插孔，并在未见过的圆形孔上检验零样本泛化能力。
+
+奖励函数、运行成本上界与终止判据详见 [REWARD.md](./REWARD.md)。
+
+## 1. 原始 InsertAnything 实现的缺陷与我们的方法对比
+
+通过对原始 [InsertAnything](https://arxiv.org/abs/2609.24511) 开源仓库代码的审查，可以发现其实现为掩盖奖励诱导悬停与高维探索困难，依赖了大量在通用真机场景下不成立的硬编码简化：
+
+| 维度 | 原仓库 (`InsertAnything`) 的问题 | 本项目的方法与改进 |
+|---|---|---|
+| **悬停刷分与回合终止** | **全正奖励 + 永不提前终止**：原仓库对 XY 对齐与偏航角持续发放正奖励，若提前终止会导致智能体损失后续正分；为此原仓库在 `_get_dones` 中删去了成功终止与安全终止，所有回合硬跑满固定时长（10–20 s）。即便如此，孔口上方“无接触悬停”仍是旱涝保收的局部极大值，一旦下探接触孔口反而触发平方接触力惩罚与 `1°` 偏航硬门控截断 | **严格负运行成本 + 一次性成功终局奖励**：每步非终止状态严格为负分（含固定时间成本 `-0.02/步`），彻底消除悬停刷分与拖延动机；提供 `5 N / 0.1 N·m` 接触死区鼓励利用接触力探索孔口；达标保持 5 步后立即终止并发放 `+20` 奖励 |
+| **控制自由度** | **假 6 轴、实 4 轴**：虽然声明 6 维动作空间，但在 `_apply_action` 中每步硬编码覆盖 `roll = π, pitch = 0`，强行锁死两个倾角自由度，不允许插头发生任何倾斜 | **真 6 自由度全姿态控制**：开放完整三维平移 + 三维旋转增量控制，初始状态即包含 `±3°` 随机倾角，配合 6 轴各向异性阻抗控制、刚度主轴随机旋转与时变刚度游走 |
+| **多形状泛化与观测作弊** | **一形状一模型 + 观测预折叠**：每个形状与公差单独训练一个网络；且在输入给 Actor 前先用已知几何的 `symmetry_angles_deg` 将相对四元数折叠到最近对称轴 | **单一权重通吃 5 种形状 + 未见圆形测试**：Actor 严格只接收 **13 维物理观测**，不输入形状 ID，也不对 Actor 观测做对称性折叠，完全依靠双层 GRU 从接触力旋量历史中隐式推断几何约束 |
+| **力觉传感器物理** | 仅读取 3 维线性接触力（无力矩），关闭重力且忽略传感器下游质量惯性与陀螺力矩；在多个任务配置中甚至默认关闭了力观测 | **完整 6 轴腕部力/力矩传感器建模**：建模接触载荷减去下游质量加速度与陀螺力矩，经低通滤波后从腕部变换至名义尖端（$M_T = M_S - r_{ST}\times F_S$），并叠加传感器安装角误差、尖端标定误差与真实夹持偏移 |
+| **成功与安全标准** | 成功判据硬编码为 `xy_dist < 2.5 mm`（远大于孔间隙）、仅固定插到底部、无倾角与过载检查，且单步擦边即记为成功 | **随机目标深度 + 间隙级 6 轴保持判据**：目标深度每回合在 `5–22.5 mm` 随机采样；真实尖端必须同时满足 `0.4 × clearance` 的 XY/倾角/偏航对齐并**连续保持 5 步**；峰值力 `> 30 N` 或力矩 `> 2 N·m` 立即触发 `-200` 安全失败终止 |
+| **课程学习机制** | 无自动课程，依赖人工拆分为 `_I (2 mm)`、`_II (0.5 mm)`、`_III (0.1 mm)` 等独立配置分别调参 | **全自动孔间隙 + 难度 + 噪声课程**：从 `2.0 mm` 孔间隙自动按五种形状 `80%` 成功率逐级收紧至 `0.1 mm`，同步提升初始位姿/刚度难度，达标后再逐级开启全量传感器与标定噪声 |
+
+
+## 2. 环境配置与安装
+
+运行环境需要支持 CUDA 的 Linux 系统与 Python 3.11+。推荐使用 `micromamba` 或 `conda` 创建虚拟环境，并通过 [requirements.txt](./requirements.txt) 安装依赖：
+
+```bash
+micromamba create -n mj python=3.11 -y
+micromamba run -n mj pip install -r requirements.txt
+```
+
+核心依赖版本（见 [requirements.txt](./requirements.txt)）：
+- `torch>=2.14.1`
+- `mujoco>=3.11.0`, `mujoco-warp>=3.11.0`, `warp-lang>=1.18.0`
+- `mjlab>=1.6.0`, `rsl-rl-lib>=5.4.2`, `tensordict>=0.14.3`
+- `numpy>=2.4.6`, `trimesh>=5.1.1`, `viser>=1.1.1`, `pillow>=12.3.0`, `tensorboard>=2.21.0`
+
+## 3. 核心命令
+
+```bash
+# 运行全部单元测试与 GPU 物理集成测试
+micromamba run -n mj python -m unittest discover -s test -t . -v
+
+# 短周期冒烟训练（验证环境与管线）
+micromamba run -n mj python train.py \
+  --envs-per-shape 4 --steps 16 --iterations 2 --output runs/smoke
+
+# 单卡有限轮次训练（默认开启孔间隙课程）
+micromamba run -n mj python train.py \
+  --envs-per-shape 64 --steps 256 --iterations 2000 \
+  --noise-curriculum --physics-cuda-graph --observation-cuda-graph \
+  --output runs/train
+
+# 双卡分布式持续训练（不传 --iterations 时默认进入带守护进程的持续训练模式）
+micromamba run -n mj python train.py \
+  --output runs/continuous_dual --device cuda:0 \
+  --simulation-devices cuda:0 cuda:1 --envs-per-shape 408 --steps 256 \
+  --success-noise-curriculum --physics-cuda-graph --observation-cuda-graph \
+  --distributed-ppo
+
+# 调整正在运行的训练环境数（保留网络、归一化器、优化器与课程状态）
+micromamba run -n mj python train.py \
+  --resize-envs --envs-per-shape 204 --output runs/continuous_dual
+
+# 优雅停止持续训练（当前 PPO 轮次保存完成后退出）
+touch runs/continuous_dual/STOP
+
+# 从检查点恢复持续训练
+rm -f runs/continuous_dual/STOP
+micromamba run -n mj python train.py \
+  --resume --output runs/continuous_dual
+
+# Viser 网页实时查看训练快照（CPU 正向运动学，不占用 GPU 采样）
+micromamba run -n mj python viser_view.py \
+  --run-dir runs/continuous_dual --host 127.0.0.1 --port 8080
+
+# Viser 独立缓冲回放最新策略（按 1x 仿真时间 50 Hz 播放）
+micromamba run -n mj python viser_view.py \
+  --run-dir runs/continuous_dual --mode policy --device cuda:1 \
+  --host 127.0.0.1 --port 8080
+
+# 冻结策略多条件泛化评估（输出 trials.csv 与 summary.json）
+micromamba run -n mj python evaluate.py runs/continuous_dual/checkpoint.pt \
+  --seeds 0 42 2026 --trials 16 --dynamics nominal soft stiff \
+  --clearances 0.0001 0.0005 --scales 1.0 0.8 1.2 \
+  --target-depths 0.005 0.015 0.020 --output runs/evaluation
+
+# 本地 MuJoCo 交互窗口或无头模式渲染快照
+micromamba run -n mj python play.py runs/continuous_dual/checkpoint.pt --shape l
+MUJOCO_GL=egl micromamba run -n mj python play.py runs/continuous_dual/checkpoint.pt \
+  --shape hexagon --headless --steps 50 --snapshot runs/hexagon.png
+
+# 导出 TorchScript 离线策略并校验序列等价性与单步延迟
+micromamba run -n mj python export_policy.py runs/continuous_dual/checkpoint.pt \
+  --output runs/export
+```
+
+
+## 4. 架构与方法设计
+
+### 4.1 观测、动作与网络结构
+孔坐标系 `H` 固定于孔口中心；工具坐标系 `T` 原点位于**名义插头尖端**；虚拟六轴腕部传感器坐标系 `S` 位于质心上方。单位统一采用国际单位制（`m, s, rad, N, N·m`），四元数顺序为 `wxyz`。
+
+- **Actor 输入（13 维）**：
+  1. `H` 系中目标位置减去当前估计尖端位置（3 维）
+  2. 规范化相对四元数 `inverse(current) * target`（4 维，消除 `q/-q` 双重覆盖）
+  3. `T` 系中关于名义尖端的重力补偿后滤波力旋量 `wrench`（6 维）
+- **Critic 特权输入（57 维）**：包含无噪真实状态、线速度/角速度、6 轴刚度与阻尼、质量/主惯量、下游质量/惯量、标定误差、夹持偏移及几何类别独热编码。
+- **循环策略网络**：观测经验归一化 → 两层 `GRU(128)` → `ELU MLP(128, 64)` → 6 维动作输出。
+- **动作语义**：输出 `H` 系下的三维平移增量（限幅 `±1 mm/步`）与三维旋转向量增量（限幅 `±0.5°/步`），以估计名义尖端为旋转中心合成下一策略周期的阻抗目标：
+  $$p_{\mathrm{target}} = p_{\mathrm{current}} + \Delta p, \qquad q_{\mathrm{target}} = \mathrm{Exp}(\Delta r) \otimes q_{\mathrm{current}}$$
+
+### 4.2 参数化凸几何与物理模型
+- **几何构建**（[insertion/geometry.py](./insertion/geometry.py)）：无需外部 USD 资产，程序化生成正三角形、方形、正五边形、正六边形、L 形及测试用圆形。正多边形外接圆半径 `10 mm`，L 形包络 `20 mm`，孔深 `25 mm`，插头长 `35 mm`。孔壁拆分为独立凸棱柱以保持中心孔贯通，L 形插头拆分为双盒体保留凹口。
+- **传感器动力学**（[insertion/env.py](./insertion/env.py)）：关闭重力代表理想重力补偿。腕部传感器测量外部接触载荷减去传感器下游质量加速度与陀螺力矩，经时间常数 `15 ms` 的一阶低通滤波后搬移至名义尖端。
+- **各向异性阻抗与时变游走**：支持 `train`、`nominal`、`soft`、`stiff` 四种动力学模式。训练模式下刚度主轴随机旋转，且刚度在回合初始值 `±10%` 范围内每秒采样局部目标并以 `1 s` 时间常数平滑游走（变化率上限 `5%/s`）。
+- **CUDA Graph 加速**：`--physics-cuda-graph` 与 `--observation-cuda-graph` 将每个物理子步的阻抗控制、传感器滤波及确定性观测变换捕获为 CUDA Graph，在保持 `1000 Hz` 物理求解精度不变的前提下显著降低 Python 调度开销。
+
+### 4.3 孔间隙、难度与噪声三阶段自动课程
+[insertion/curriculum.py](./insertion/curriculum.py) 中的 `SuccessNoiseCurriculum` 按每种形状最近 **1000 个完成回合**的真实成功率推进课程（所有训练形状成功率均达到 **80%** 时升级，清空窗口并过滤跨等级旧回合）：
+
+1. **阶段一（孔间隙与初始难度课程，零噪声）**：
+   孔间隙按 `2.0 mm → 1.0 mm → 0.5 mm → 0.25 mm → 0.15 mm → 0.10 mm` 逐级收紧；同时初始位姿与刚度随机化难度 `difficulty` 从 `0.25` 线性提升至 `1.0`。升级瞬间自动重建 MuJoCo 几何模型并重捕获 CUDA Graph，成功阈值（`0.4 × clearance`）随孔间隙同步收紧。
+2. **阶段二（传感器与标定噪声课程，固定 `0.10 mm` 间隙与 `1.0` 难度）**：
+   在目标 `0.10 mm` 间隙下，每次达标将 `noise_scale` 提升 `0.1` 直至 `1.0`，逐步激活逐步观测噪声（位置 `0.5 mm`、姿态 `1.5°`、力 `0.2 N`、力矩 `0.001 N·m`）与回合固定误差（真实夹持偏移 `1.25 mm`、尖端标定误差 `0.5 mm`、目标位置偏差 `0.5 mm`、传感器旋转误差 `0.5°`）。
+
+
+## 5. 离线推理接口
+
+[export_policy.py](./export_policy.py) 将训练好的 Actor 导出为确定性有状态 TorchScript 模型，并提供无机器人 I/O 依赖的 `OfflinePolicy` 封装：
+
+```python
+from pathlib import Path
+from export_policy import OfflinePolicy
+
+policy = OfflinePolicy(Path("runs/export"))
+policy.reset()  # 每个新回合开始或异常中止后重置 GRU 隐状态
+p_target, q_target = policy.step(p_tip, q_tool, p_goal, q_goal, wrench_tip)
+```

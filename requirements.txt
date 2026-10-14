@@ -1,0 +1,12 @@
+torch>=2.14.1
+mujoco>=3.11.0
+mujoco-warp>=3.11.0
+warp-lang>=1.18.0
+mjlab>=1.6.0
+rsl-rl-lib>=5.4.2
+tensordict>=0.14.3
+numpy>=2.4.6
+trimesh>=5.1.1
+viser>=1.1.1
+pillow>=12.3.0
+tensorboard>=2.21.0
