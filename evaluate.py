@@ -47,6 +47,7 @@ def evaluate_condition(actor: RNNModel, cfg: InsertionCfg, device: str,
         raise ValueError("trials_per_shape must be positive")
     actor.reset()
     env = InsertionEnv(cfg, device)
+    shapes_by_index = [group.shape for group in env.groups for _ in range(group.n)]
     obs = env.get_observations()
     records = []
     counts = {s: 0 for s in cfg.shapes}
@@ -57,7 +58,7 @@ def evaluate_condition(actor: RNNModel, cfg: InsertionCfg, device: str,
         actor.reset(dones)
         terminal = info["terminal"]
         for index in dones.nonzero().flatten().tolist():
-            shape = cfg.shapes[index // cfg.envs_per_shape]
+            shape = shapes_by_index[index]
             if counts[shape] >= trials_per_shape:
                 continue
             counts[shape] += 1
@@ -75,7 +76,7 @@ def evaluate_condition(actor: RNNModel, cfg: InsertionCfg, device: str,
                 "termination": reason,
             })
         steps += 1
-        if steps > env.max_episode_length * (math.ceil(trials_per_shape/cfg.envs_per_shape)+1):
+        if steps > env.max_episode_length * (math.ceil(trials_per_shape/min(cfg.environment_counts))+1):
             raise RuntimeError("evaluation exceeded its bounded trial budget")
     return records
 
@@ -139,6 +140,7 @@ def main() -> None:
                     for seed in args.seeds:
                         cfg = replace(base, shapes=tuple(args.shapes), clearance=clearance,
                                       scale=scale, dynamics=dynamics, seed=seed, training=False,
+                                      shape_env_counts=(), adaptive_sampling=False,
                                       fixed_target_depth_m=depth,
                                       envs_per_shape=args.envs_per_shape,
                                       episode_seconds=(base.episode_seconds if args.episode_seconds is None

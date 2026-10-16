@@ -4,6 +4,32 @@ from collections import deque
 import math
 
 
+def adaptive_environment_counts(counts: tuple[int, ...], failures: list[float],
+                                unit: int = 1) -> tuple[int, ...]:
+    if (not counts or len(counts) != len(failures) or type(unit) is not int or unit < 1
+            or any(type(n) is not int or n < unit or n % unit for n in counts)
+            or any(not math.isfinite(f) or not 0 <= f <= 1 for f in failures)):
+        raise ValueError("invalid adaptive sampling counts, failure rates or device unit")
+    total = sum(counts) // unit
+    baseline = total / len(counts)
+    failure_sum = sum(failures)
+    targets = [0.5 * baseline + 0.5 * total * (
+        f / failure_sum if failure_sum else 1 / len(counts)) for f in failures]
+    lower = [max(1, math.ceil(0.5 * baseline),
+                 math.ceil(n/unit - baseline*0.125)) for n in counts]
+    upper = [max(lo, min(math.floor(1.5*baseline),
+                         math.floor(n/unit + baseline*0.125)))
+             for lo, n in zip(lower, counts, strict=True)]
+    result = lower.copy()
+    if sum(lower) > total or sum(upper) < total:
+        raise ValueError("adaptive sampling bounds cannot preserve the total")
+    for _ in range(total - sum(result)):
+        eligible = [i for i in range(len(counts)) if result[i] < upper[i]]
+        index = max(eligible, key=lambda i: targets[i]-result[i])
+        result[index] += 1
+    return tuple(n*unit for n in result)
+
+
 class SuccessNoiseCurriculum:
     window_size = 1000
     threshold = 0.8
@@ -78,4 +104,3 @@ class SuccessNoiseCurriculum:
         for shape, values in state["windows"].items():
             self.windows[shape].clear()
             self.windows[shape].extend(values)
-

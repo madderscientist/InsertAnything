@@ -19,6 +19,7 @@ import torch
 from rsl_rl.runners import OnPolicyRunner
 
 from insertion import InsertionCfg, InsertionEnv, TRAIN_SHAPES, runner_config
+from insertion.curriculum import adaptive_environment_counts
 
 
 def prepare_runner_config(config: dict) -> dict:
@@ -31,6 +32,26 @@ def prepare_runner_config(config: dict) -> dict:
 
 def make_runner(env: InsertionEnv, config: dict, log_dir: str | None = None) -> OnPolicyRunner:
     return OnPolicyRunner(env, prepare_runner_config(config), log_dir=log_dir, device=str(env.device))
+
+
+def environment_config(args: argparse.Namespace) -> InsertionCfg:
+    return InsertionCfg(
+        shapes=tuple(args.shapes), envs_per_shape=args.envs_per_shape,
+        seed=args.seed, episode_seconds=args.episode_seconds,
+        clearance_curriculum=args.clearance_curriculum,
+        noise_curriculum=args.noise_curriculum or args.success_noise_curriculum,
+        noise_curriculum_mode="success" if args.success_noise_curriculum else "steps",
+        physics_cuda_graph=args.physics_cuda_graph,
+        observation_cuda_graph=args.observation_cuda_graph,
+        force_bias=args.force_bias, moment_bias=args.moment_bias,
+        adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
+        initial_z_min=args.initial_z_min, initial_z_max=args.initial_z_max,
+        initial_tilt=math.radians(args.initial_tilt_deg),
+        initial_yaw=math.radians(args.initial_yaw_deg),
+        noise_zero_steps=100*args.steps, noise_full_steps=800*args.steps,
+        target_depth_min_m=args.target_depth_min,
+        target_depth_max_fraction=args.target_depth_max_fraction,
+    )
 
 
 def contract(cfg: InsertionCfg) -> dict:
@@ -72,6 +93,9 @@ def contract(cfg: InsertionCfg) -> dict:
             "rotation_vector_component_std_rad": cfg.rotation_noise,
             "force_std_n": cfg.force_noise,
             "moment_std_nm": cfg.moment_noise,
+            "force_bias_half_range_n": cfg.force_bias,
+            "moment_bias_half_range_nm": cfg.moment_bias,
+            "wrench_bias_sampling": "independent uniform per axis at reset, fixed per episode; actor only",
             "pose_sampling": "independent Gaussian per observation; current tip pose only",
             "wrench_sampling": "independent Gaussian per observation after tip transform/filter",
             "grasp_distribution": cfg.grasp_error_distribution,
@@ -87,6 +111,15 @@ def contract(cfg: InsertionCfg) -> dict:
         "max_tilt_rad": 0.6108652381980153,
         "hidden_state": [2, "batch", 128],
         "training_shapes": list(cfg.shapes),
+        "initial_tip_position": {
+            "xy_half_range_m": cfg.initial_xy,
+            "z_bounds_m": [cfg.initial_z_min, cfg.initial_z_max],
+            "xy_curriculum_scaled": True,
+        },
+        "initial_rotation_vector_half_ranges_rad": [
+            cfg.initial_tilt, cfg.initial_tilt, cfg.initial_yaw],
+        "shape_environment_counts": list(cfg.environment_counts),
+        "adaptive_sampling": cfg.adaptive_sampling,
         "target_depth_bounds_m": list(cfg.target_depth_bounds_m),
         "target_depth_sampling": "uniform per episode" if cfg.fixed_target_depth_m is None else "fixed",
         "depth_success": "reach or exceed target, with existing 0.2 mm tolerance",
@@ -229,6 +262,10 @@ class ContinuousRunner(OnPolicyRunner):
         }
         if self.env.noise_curriculum is not None:
             saved["infos"]["noise_curriculum_state"] = self.env.noise_curriculum.state_dict()
+        cfg = InsertionCfg.from_checkpoint(self.metadata["environment"])
+        if cfg.adaptive_sampling:
+            saved["infos"]["adaptive_sampling_state"] = json.loads(
+                (self.output / "config.json").read_text()).get("adaptive_sampling_state")
         temporary = self.output / "checkpoint.pt.tmp"
         checkpoint = self.output / "checkpoint.pt"
         torch.save(saved, temporary)
@@ -252,6 +289,8 @@ class ContinuousRunner(OnPolicyRunner):
             "noise_scale": self.env.groups[0].noise_scale,
             "checkpoint": str(checkpoint),
             "cuda_memory": memory,
+            "shape_environment_counts": dict(zip(cfg.shapes, cfg.environment_counts, strict=True)),
+            "adaptive_sampling": cfg.adaptive_sampling,
         }
         atomic_json(self.output / "heartbeat.json", progress)
         publish_scene(self.env, self.output, self.metadata, progress)
@@ -330,6 +369,13 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
             if ("noise_curriculum_state" in saved["infos"]
                     and source_cfg.get("clearance_curriculum", False) == cfg.clearance_curriculum):
                 env.noise_curriculum.load_state_dict(saved["infos"]["noise_curriculum_state"])
+                defaults = InsertionCfg()
+                if any(source_cfg.get(key, getattr(defaults, key)) != getattr(cfg, key)
+                       for key in ("force_bias", "moment_bias", "initial_xy",
+                                   "initial_z_min", "initial_z_max", "initial_tilt", "initial_yaw")):
+                    for window in env.noise_curriculum.windows.values():
+                        window.clear()
+                    logging.warning("Initial pose or wrench bias distribution changed; retaining curriculum level, clearing windows.")
             else:
                 logging.info("Resetting success curriculum to level 0 for updated curriculum config.")
         else:
@@ -373,7 +419,7 @@ def resize_training(output: Path, envs_per_shape: int) -> None:
     output = output.resolve()
     metadata = json.loads((output / "config.json").read_text())
     cfg = replace(InsertionCfg.from_checkpoint(metadata["environment"]),
-                  envs_per_shape=envs_per_shape)
+                  envs_per_shape=envs_per_shape, shape_env_counts=())
     devices = metadata.get("simulation_devices", ["cuda:0"])
     if envs_per_shape % len(devices) or envs_per_shape*len(cfg.shapes) % 4:
         raise ValueError("environment counts must divide evenly across devices and PPO mini-batches")
@@ -390,9 +436,52 @@ def resize_training(output: Path, envs_per_shape: int) -> None:
         "retained": ["actor", "critic", "normalization", "optimizer", "curriculum"],
     })
     metadata.update(environment=asdict(cfg), contract=contract(cfg))
+    metadata.pop("adaptive_sampling_state", None)
     atomic_json(output / "config.json", metadata)
     logging.warning("Resize prepared; requesting a graceful handoff from worker PID %d.", pid)
     os.kill(pid, signal.SIGTERM)
+
+
+def adapt_training_layout(output: Path, iteration: int) -> bool:
+    metadata = json.loads((output / "config.json").read_text())
+    cfg = InsertionCfg.from_checkpoint(metadata["environment"])
+    if not cfg.adaptive_sampling:
+        return False
+    state = metadata.get("adaptive_sampling_state") or {}
+    if iteration - state.get("iteration", -100) < 100:
+        return False
+    saved = load_recovery_checkpoint(output, "cpu")
+    curriculum = saved["infos"]["noise_curriculum_state"]
+    level = curriculum["level"]
+    windows = curriculum["windows"]
+    if state.get("level") != level or any(len(windows[s]) < 1000 for s in cfg.shapes):
+        metadata["adaptive_sampling_state"] = {
+            **(state if state.get("level") == level else {}),
+            "level": level, "iteration": iteration,
+        }
+        atomic_json(output / "config.json", metadata)
+        return False
+    failures = [1-sum(windows[s])/len(windows[s]) for s in cfg.shapes]
+    previous = state.get("failures", failures)
+    smoothed = [0.8*a+0.2*b for a, b in zip(previous, failures, strict=True)]
+    unit = len(metadata.get("simulation_devices", ["cuda:0"]))
+    counts = adaptive_environment_counts(cfg.environment_counts, smoothed, unit)
+    state = {"level": level, "iteration": iteration, "failures": smoothed}
+    metadata["adaptive_sampling_state"] = state
+    if counts == cfg.environment_counts:
+        atomic_json(output / "config.json", metadata)
+        return False
+    updated = replace(cfg, shape_env_counts=counts)
+    metadata.update(environment=asdict(updated), contract=contract(updated))
+    atomic_json(output / f"sampling_{iteration}.json", {
+        **state, "shapes": cfg.shapes, "from": cfg.environment_counts, "to": counts,
+    })
+    pid = registered_worker_pid(output)
+    atomic_json(output / "config.json", metadata)
+    logging.warning("Adaptive sampling handoff: %s -> %s; retaining total %d.",
+                    cfg.environment_counts, counts, sum(counts))
+    os.kill(pid, signal.SIGTERM)
+    return True
 
 
 def stop_worker(process: subprocess.Popen, grace_seconds: float) -> None:
@@ -410,16 +499,7 @@ def supervise(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     if not args.resume:
         output.mkdir(parents=True, exist_ok=False)
-        cfg = InsertionCfg(shapes=tuple(args.shapes), envs_per_shape=args.envs_per_shape,
-                           seed=args.seed, episode_seconds=args.episode_seconds,
-                           clearance_curriculum=args.clearance_curriculum,
-                           noise_curriculum=args.noise_curriculum or args.success_noise_curriculum,
-                           noise_curriculum_mode="success" if args.success_noise_curriculum else "steps",
-                           physics_cuda_graph=args.physics_cuda_graph,
-                           observation_cuda_graph=args.observation_cuda_graph,
-                           noise_zero_steps=100*args.steps, noise_full_steps=800*args.steps,
-                           target_depth_min_m=args.target_depth_min,
-                           target_depth_max_fraction=args.target_depth_max_fraction)
+        cfg = environment_config(args)
         if cfg.envs_per_shape * len(cfg.shapes) % 4:
             raise ValueError("environment count must be divisible by four")
         config = runner_config(args.steps)
@@ -473,6 +553,7 @@ def supervise(args: argparse.Namespace) -> None:
                         "attempt": attempt, "started": started,
                     })
                     record("started", pid=process.pid, attempt=attempt)
+                    handoff = False
                     while not stopping and not (output / "STOP").exists():
                         heartbeat_path = output / "heartbeat.json"
                         heartbeat = (json.loads(heartbeat_path.read_text())
@@ -484,19 +565,24 @@ def supervise(args: argparse.Namespace) -> None:
                                    elapsed_seconds=now-start, heartbeat=heartbeat)
                             next_check += args.check_seconds
                         if state != "running":
-                            record("anomaly", state=state, exit_code=process.poll(),
+                            record("layout_handoff" if handoff else "anomaly",
+                                   state=state, exit_code=process.poll(),
                                    pid=process.pid, heartbeat=heartbeat)
                             stop_worker(process, args.stop_grace_seconds)
                             break
+                        if (not handoff and heartbeat is not None
+                                and heartbeat["timestamp"] >= started):
+                            handoff = adapt_training_layout(output, heartbeat["iteration"])
                         time.sleep(3)
                     if stopping or (output / "STOP").exists():
                         stop_worker(process, args.stop_grace_seconds)
                         record("stopped", pid=process.pid, exit_code=process.poll())
                         break
                 attempt += 1
-                record("restarting", attempt=attempt, delay_seconds=30,
+                delay = 0 if handoff else 30
+                record("restarting", attempt=attempt, delay_seconds=delay,
                        checkpoint_exists=(output / "checkpoint.pt").exists())
-                for _ in range(30):
+                for _ in range(delay):
                     if stopping or (output / "STOP").exists():
                         break
                     time.sleep(1)
@@ -508,16 +594,7 @@ def supervise(args: argparse.Namespace) -> None:
 def run_finite(args: argparse.Namespace) -> None:
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
-    cfg = InsertionCfg(shapes=tuple(args.shapes), envs_per_shape=args.envs_per_shape,
-                       seed=args.seed, episode_seconds=args.episode_seconds,
-                       clearance_curriculum=args.clearance_curriculum,
-                       noise_curriculum=args.noise_curriculum or args.success_noise_curriculum,
-                       noise_curriculum_mode="success" if args.success_noise_curriculum else "steps",
-                       physics_cuda_graph=args.physics_cuda_graph,
-                       observation_cuda_graph=args.observation_cuda_graph,
-                       noise_zero_steps=100*args.steps, noise_full_steps=800*args.steps,
-                       target_depth_min_m=args.target_depth_min,
-                       target_depth_max_fraction=args.target_depth_max_fraction)
+    cfg = environment_config(args)
     count = cfg.envs_per_shape * len(cfg.shapes)
     if count < 4 or count % 4:
         raise ValueError("environment count must be a positive multiple of four")
@@ -557,6 +634,20 @@ def main() -> None:
     parser.add_argument("--shapes", nargs="+", choices=TRAIN_SHAPES, default=list(TRAIN_SHAPES))
     parser.add_argument("--noise-curriculum", action="store_true")
     parser.add_argument("--success-noise-curriculum", action="store_true")
+    parser.add_argument("--force-bias", type=float, default=0.,
+                        help="per-episode force zero-bias half range per axis in N")
+    parser.add_argument("--initial-xy", type=float, default=0.003,
+                        help="initial true tip X/Y uniform half range in meters")
+    parser.add_argument("--initial-z-min", type=float, default=0.004)
+    parser.add_argument("--initial-z-max", type=float, default=0.01)
+    parser.add_argument("--initial-tilt-deg", type=float, default=3.,
+                        help="initial rotation-vector X/Y component half range in degrees")
+    parser.add_argument("--initial-yaw-deg", type=float, default=15.,
+                        help="initial rotation-vector Z component half range in degrees")
+    parser.add_argument("--moment-bias", type=float, default=0.,
+                        help="per-episode moment zero-bias half range per axis in Nm")
+    parser.add_argument("--adaptive-sampling", action="store_true",
+                        help="supervised continuous training: gently rebalance shape environments")
     parser.add_argument("--clearance-curriculum",
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--physics-cuda-graph", action="store_true")
@@ -569,6 +660,8 @@ def main() -> None:
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--attempt", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.adaptive_sampling and args.iterations is not None:
+        parser.error("--adaptive-sampling requires continuous supervised training")
     if args.steps < 4 or args.envs_per_shape < 1:
         parser.error("rollout steps must be >= 4 and environments positive")
     if args.iterations is not None and args.iterations < 1:

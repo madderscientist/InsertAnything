@@ -32,7 +32,7 @@ def main() -> None:
     cfg = replace(base, shapes=(args.shape,),
                   fixed_target_depth_m=(base.fixed_target_depth_m if args.target_depth is None
                                         else args.target_depth),
-                  envs_per_shape=1, training=False)
+                  envs_per_shape=1, shape_env_counts=(), adaptive_sampling=False, training=False)
     env = InsertionEnv(cfg, args.device)
     obs = env.get_observations()
     group = env.groups[0]

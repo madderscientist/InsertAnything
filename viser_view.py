@@ -28,12 +28,13 @@ def replay_index(elapsed: float, count: int) -> int:
 
 def replay_config(environment: dict, shape: str, zero_noise: bool = False) -> InsertionCfg:
     cfg = replace(InsertionCfg.from_checkpoint(environment),
-                  shapes=(shape,), envs_per_shape=1, training=False)
+                  shapes=(shape,), shape_env_counts=(), adaptive_sampling=False,
+                  envs_per_shape=1, training=False)
     if zero_noise:
         cfg = replace(cfg, noise_curriculum=False, noise_curriculum_mode="steps",
                       position_noise=0., rotation_noise=0., force_noise=0., moment_noise=0.,
                       position_bias=0., tip_calibration_error=0., grasp_position_error=0.,
-                      sensor_rotation_error=0.)
+                      sensor_rotation_error=0., force_bias=0., moment_bias=0.)
     return cfg
 
 

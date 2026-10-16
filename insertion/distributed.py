@@ -37,7 +37,9 @@ def validate_layout(metadata: dict, device: str) -> int:
     if world_size > torch.cuda.device_count():
         raise ValueError("distributed PPO requests unavailable CUDA devices")
     cfg = InsertionCfg.from_checkpoint(metadata["environment"])
-    if cfg.envs_per_shape % world_size or cfg.envs_per_shape*len(cfg.shapes)//world_size % 4:
+    if (cfg.envs_per_shape % world_size
+            or any(n % world_size for n in cfg.environment_counts)
+            or sum(cfg.environment_counts)//world_size % 4):
         raise ValueError("each rank must have whole shape shards and an environment count divisible by four")
     if metadata["runner"]["algorithm"]["class_name"] != "PPO" or any(
             metadata["runner"][key]["class_name"] != "RNNModel" for key in ("actor", "critic")):
@@ -81,6 +83,7 @@ class SharedPPO(PPO):
 class DistributedInsertionEnv(LiveInsertionEnv):
     def __init__(self, cfg: InsertionCfg, rank: int, world_size: int, output: Path, metadata: dict):
         local_cfg = replace(cfg, envs_per_shape=cfg.envs_per_shape//world_size,
+                            shape_env_counts=tuple(n//world_size for n in cfg.environment_counts),
                             seed=cfg.seed+rank*1000003)
         device = f"cuda:{rank}"
         super().__init__(local_cfg, device, output,

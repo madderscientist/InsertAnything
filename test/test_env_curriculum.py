@@ -11,9 +11,33 @@ import torch
 from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
                        SuccessNoiseCurriculum, TRAIN_SHAPES, bounded_stiffness_step,
                        completion_cost_terms, quat_rotvec, tip_pose)
+from insertion.curriculum import adaptive_environment_counts
 
 
 class RewardAndCurriculumUnitTests(unittest.TestCase):
+    def test_adaptive_counts_preserve_total_bounds_and_device_shards(self):
+        for unit in (1, 2, 4, 8):
+            counts = (512,) * 5
+            self.assertEqual(adaptive_environment_counts(counts, [0.] * 5, unit), counts)
+            self.assertEqual(adaptive_environment_counts(counts, [0.2] * 5, unit), counts)
+            for _ in range(20):
+                result = adaptive_environment_counts(counts, [1., 0., 0., 0., 0.], unit)
+                self.assertEqual(sum(result), 2560)
+                self.assertTrue(all(n % unit == 0 and 256 <= n <= 768 for n in result))
+                self.assertTrue(all(abs(a-b) <= 64 for a, b in zip(result, counts)))
+                counts = result
+            self.assertGreater(counts[0], counts[1])
+        for kwargs in ({"shape_env_counts": (1,)}, {"force_bias": -1},
+                       {"moment_bias": float("nan")}, {"adaptive_sampling": True},
+                       {"initial_z_min": 0.}, {"initial_z_min": 0.02},
+                       {"initial_z_max": float("nan")}, {"initial_z_max": 0.03}):
+            with self.assertRaises(ValueError):
+                InsertionCfg(**kwargs)
+        old = InsertionCfg.from_checkpoint({"envs_per_shape": 512})
+        self.assertEqual(old.force_bias, 0.)
+        self.assertEqual(old.environment_counts, (512,) * 5)
+        self.assertEqual((old.initial_z_min, old.initial_z_max), (0.004, 0.01))
+
     def terms(self, z=0.001, xy=0., depth=0.015, tilt=0., yaw=0., force=0.,
               moment=0., success=False, failure=False, timeout=False, action=0., previous=0.):
         cfg = InsertionCfg()
@@ -125,6 +149,67 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
                 if reached.all():
                     break
         self.assertTrue(bool(reached.all()))
+
+    def test_episode_wrench_bias_and_unequal_shape_layout(self):
+        cfg = replace(self.cfg, shapes=("triangle", "square"), envs_per_shape=3,
+                      shape_env_counts=(2, 4), force_bias=0.5, moment_bias=0.01,
+                      physics_cuda_graph=True, observation_cuda_graph=True)
+        env = InsertionEnv(cfg, self.device)
+        self.assertEqual([g.n for g in env.groups], [2, 4])
+        self.assertEqual(env.num_envs, 6)
+        group = env.groups[0]
+        group.noise_scale = 0.5
+        group.reset(torch.arange(group.n, device=self.device))
+        before = group.wrench_bias.clone()
+        self.assertTrue(bool((before[:, :3].abs() <= 0.25).all()))
+        self.assertTrue(bool((before[:, 3:].abs() <= 0.005).all()))
+        self.assertGreater(float(before.abs().sum()), 0.)
+        actor, critic = group.observations()
+        torch.testing.assert_close(actor[:, -6:], group.wrench + before)
+        zeros = torch.zeros_like(before)
+        clean_actor, clean_critic = group.observations_from_noise(
+            zeros, zeros[:, :3], zeros[:, :3])
+        group.wrench_bias.zero_()
+        unbiased_actor, unbiased_critic = group.observations_from_noise(
+            zeros, zeros[:, :3], zeros[:, :3])
+        torch.testing.assert_close(clean_actor[:, -6:]-unbiased_actor[:, -6:], before)
+        torch.testing.assert_close(clean_critic, unbiased_critic)
+        group.wrench_bias.copy_(before)
+        env.step(torch.zeros(6, 6, device=self.device))
+        torch.testing.assert_close(group.wrench_bias, before)
+        group.reset(torch.tensor([0], device=self.device))
+        torch.testing.assert_close(group.wrench_bias[1], before[1])
+        self.assertFalse(torch.equal(group.wrench_bias[0], before[0]))
+        group.noise_scale = 0.
+        group.reset(torch.arange(group.n, device=self.device))
+        torch.testing.assert_close(group.wrench_bias, torch.zeros_like(before))
+
+    def test_expanded_initial_true_tip_and_rotation_vector_ranges(self):
+        cfg = replace(self.cfg, shapes=("square",), envs_per_shape=512,
+                      initial_xy=0.01, initial_z_min=0.001, initial_z_max=0.01,
+                      initial_tilt=math.radians(20), initial_yaw=math.radians(20))
+        env = InsertionEnv(cfg, self.device)
+        group = env.groups[0]
+        for difficulty in (1., 0.25):
+            group.difficulty = difficulty
+            group.reset(torch.arange(group.n, device=self.device))
+            pos, q, _, _ = group.state()
+            tip = tip_pose(pos, q, group.offset)
+            rv = quat_rotvec(q)
+            for axis in (0, 1):
+                values = tip[:, axis]
+                bound = 0.01 * difficulty
+                self.assertTrue(bool((values.abs() <= bound + 1e-7).all()))
+                self.assertLess(float(values.min()), -0.9 * bound)
+                self.assertGreater(float(values.max()), 0.9 * bound)
+            self.assertTrue(bool(((tip[:, 2] >= 0.001-1e-7) & (tip[:, 2] <= 0.01+1e-7)).all()))
+            self.assertLess(float(tip[:, 2].min()), 0.0019)
+            self.assertGreater(float(tip[:, 2].max()), 0.0091)
+            for axis in range(3):
+                bound = math.radians(20) * difficulty
+                self.assertTrue(bool((rv[:, axis].abs() <= bound + 1e-6).all()))
+                self.assertLess(float(rv[:, axis].min()), -0.9 * bound)
+                self.assertGreater(float(rv[:, axis].max()), 0.9 * bound)
 
     def test_cuda_graph_equivalence_and_live_clearance_upgrade(self):
         cfg = InsertionCfg(shapes=("square",), envs_per_shape=4, episode_seconds=0.08,

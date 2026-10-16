@@ -16,6 +16,8 @@ CLEARANCE_CURRICULUM_LEVELS = (0.002, 0.001, 0.0005, 0.00025, 0.00015, 0.0001)
 class InsertionCfg:
     shapes: tuple[str, ...] = TRAIN_SHAPES
     envs_per_shape: int = 16
+    shape_env_counts: tuple[int, ...] = ()
+    adaptive_sampling: bool = False
     seed: int = 42
     physics_dt: float = 0.001
     decimation: int = 20
@@ -35,6 +37,8 @@ class InsertionCfg:
     max_moment: float = 2.0
     filter_seconds: float = 0.015
     initial_xy: float = 0.003
+    initial_z_min: float = 0.004
+    initial_z_max: float = 0.01
     initial_tilt: float = math.radians(3)
     initial_yaw: float = math.radians(15)
     position_bias: float = 0.0005
@@ -46,6 +50,8 @@ class InsertionCfg:
     rotation_noise: float = math.radians(1.5)
     force_noise: float = 0.2
     moment_noise: float = 0.001
+    force_bias: float = 0.0
+    moment_bias: float = 0.0
     noise_curriculum: bool = False
     noise_curriculum_mode: str = "steps"
     noise_zero_steps: int = 25600
@@ -83,6 +89,15 @@ class InsertionCfg:
             raise ValueError("duplicate geometry groups are not allowed")
         if self.envs_per_shape < 1 or self.decimation < 1:
             raise ValueError("environment count and decimation must be positive")
+        self.shape_env_counts = tuple(self.shape_env_counts)
+        if self.shape_env_counts and (
+                len(self.shape_env_counts) != len(self.shapes)
+                or any(type(n) is not int or n < 1 for n in self.shape_env_counts)
+                or sum(self.shape_env_counts) != self.envs_per_shape * len(self.shapes)):
+            raise ValueError("shape_env_counts must be positive integers preserving the total environment count")
+        if self.adaptive_sampling and (not self.training or not (
+                self.clearance_curriculum or self.noise_curriculum_mode == "success")):
+            raise ValueError("adaptive sampling requires training with a success-based curriculum")
         if not math.isclose(self.physics_dt * self.decimation, 0.02, abs_tol=1e-10):
             raise ValueError("policy period must be 0.02 s (50 Hz)")
         positive = (self.clearance, self.scale, self.episode_seconds,
@@ -105,9 +120,13 @@ class InsertionCfg:
             raise ValueError("success hold and curriculum horizon must be positive")
         noise = (self.initial_xy, self.initial_tilt, self.initial_yaw, self.position_bias,
                  self.tip_calibration_error, self.grasp_position_error, self.sensor_rotation_error,
-                 self.position_noise, self.rotation_noise, self.force_noise, self.moment_noise)
+                 self.position_noise, self.rotation_noise, self.force_noise, self.moment_noise,
+                 self.force_bias, self.moment_bias)
         if any(x < 0 or not math.isfinite(x) for x in noise):
             raise ValueError("randomization magnitudes must be finite and nonnegative")
+        if (not math.isfinite(self.initial_z_min) or not math.isfinite(self.initial_z_max)
+                or not 0 < self.initial_z_min <= self.initial_z_max < 0.03 * self.scale):
+            raise ValueError("initial Z bounds must be positive, ordered and below the workspace ceiling")
         if (not isinstance(self.noise_zero_steps, int)
                 or not isinstance(self.noise_full_steps, int)
                 or not 0 <= self.noise_zero_steps < self.noise_full_steps):
@@ -170,6 +189,10 @@ class InsertionCfg:
             + 2*self.orientation_cost_per_second + self.force_cost_per_second
             + self.moment_cost_per_second + self.action_cost_per_second*math.sqrt(6)
             + self.action_change_cost_per_second*2*math.sqrt(6))
+
+    @property
+    def environment_counts(self) -> tuple[int, ...]:
+        return self.shape_env_counts or (self.envs_per_shape,) * len(self.shapes)
 
     @property
     def active_clearance_levels(self) -> tuple[float, ...]:

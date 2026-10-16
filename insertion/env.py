@@ -123,6 +123,7 @@ class PlantGroup:
         self.peak_moment = torch.zeros_like(self.peak_force)
         self.last_action = torch.zeros(self.n, 6, device=device)
         self.wrench = torch.zeros(self.n, 6, device=device)
+        self.wrench_bias = torch.zeros_like(self.wrench)
         self.raw_wrench = torch.zeros_like(self.wrench)
         self.filtered_sensor = torch.zeros_like(self.wrench)
         self.k = torch.zeros(self.n, 6, device=device)
@@ -314,11 +315,15 @@ class PlantGroup:
         self.bias[ids] = self.uniform(n, 3, -cfg.position_bias, cfg.position_bias)*self.noise_scale
         self.sensor_error[ids] = rotvec_quat(self.uniform(
             n, 3, -cfg.sensor_rotation_error, cfg.sensor_rotation_error)*self.noise_scale)
+        if cfg.force_bias or cfg.moment_bias:
+            self.wrench_bias[ids] = torch.cat((
+                self.uniform(n, 3, -cfg.force_bias, cfg.force_bias),
+                self.uniform(n, 3, -cfg.moment_bias, cfg.moment_bias)), -1) * self.noise_scale
         self.delay[ids] = torch.randint(0, 3, (n,), generator=self.generator, device=self.device)
         if cfg.dynamics == "nominal":
             self.delay[ids] = 0
         pos = self.uniform(n, 3, -cfg.initial_xy, cfg.initial_xy) * self.difficulty
-        pos[:, 2] = self.uniform(n, 1, 0.004, 0.01)[:, 0]
+        pos[:, 2] = self.uniform(n, 1, cfg.initial_z_min, cfg.initial_z_max)[:, 0]
         rv = self.uniform(n, 3, -cfg.initial_tilt, cfg.initial_tilt) * self.difficulty
         rv[:, 2] = self.uniform(n, 1, -cfg.initial_yaw, cfg.initial_yaw)[:, 0] * self.difficulty
         q = rotvec_quat(rv)
@@ -422,7 +427,7 @@ class PlantGroup:
         noisy_tip = observed_tip + position_noise
         noisy_q = quat_mul(rotvec_quat(rotation_noise), q)
         obs = actor_observation(noisy_tip, noisy_q, self.goal + self.bias,
-                                self.identity, self.wrench + noise)
+                                self.identity, self.wrench + self.wrench_bias + noise)
         clean = actor_observation(true_tip, q, self.goal, self.identity, self.raw_wrench)
         shape_id = torch.nn.functional.one_hot(
             torch.full((self.n,), ALL_SHAPES.index(self.shape), device=self.device),
@@ -610,12 +615,14 @@ class InsertionEnv(VecEnv):
         devices = (device,) if simulation_devices is None else simulation_devices
         if not devices:
             raise ValueError("simulation_devices must not be empty")
-        if cfg.envs_per_shape % len(devices):
-            raise ValueError("envs_per_shape must be divisible by the simulation device count")
+        if any(n % len(devices) for n in cfg.environment_counts):
+            raise ValueError("each shape count must be divisible by the simulation device count")
         self.groups = [
-            PlantGroup(s, replace(cfg, envs_per_shape=cfg.envs_per_shape // len(devices),
+            PlantGroup(s, replace(cfg, shapes=(s,), shape_env_counts=(),
+                                  envs_per_shape=count // len(devices),
                                   seed=cfg.seed + i*1000003), simulation_device)
-            for s in cfg.shapes for i, simulation_device in enumerate(devices)]
+            for s, count in zip(cfg.shapes, cfg.environment_counts, strict=True)
+            for i, simulation_device in enumerate(devices)]
         self.num_envs = cfg.envs_per_shape * len(cfg.shapes)
         self.num_actions = 6
         self.max_episode_length = math.ceil(cfg.episode_seconds / 0.02)
@@ -652,7 +659,7 @@ class InsertionEnv(VecEnv):
             ended = (outcomes[:, 0] == index) & outcomes[:, 1].bool()
             completed = outcomes[ended, 2].bool()
             logs[f"success/{shape}"] = (completed.float().mean() if completed.numel()
-                                        else outcomes.new_tensor(0.))
+                                        else outcomes.new_tensor(0., dtype=torch.float32))
             eligible = ended & outcomes[:, 3].bool()
             recent[shape] = outcomes[eligible, 2].bool().cpu().tolist()
         previous_scale = self.noise_curriculum.scale
@@ -674,13 +681,16 @@ class InsertionEnv(VecEnv):
             group.difficulty = self.noise_curriculum.difficulty
             if hasattr(group, "set_clearance"):
                 group.set_clearance(self.noise_curriculum.clearance)
-        logs["curriculum/clearance_mm"] = outcomes.new_tensor(self.noise_curriculum.clearance * 1000)
-        logs["curriculum/difficulty"] = outcomes.new_tensor(self.noise_curriculum.difficulty)
-        logs["curriculum/noise_scale"] = outcomes.new_tensor(self.noise_curriculum.scale)
+        logs["curriculum/clearance_mm"] = outcomes.new_tensor(
+            self.noise_curriculum.clearance * 1000, dtype=torch.float32)
+        logs["curriculum/difficulty"] = outcomes.new_tensor(
+            self.noise_curriculum.difficulty, dtype=torch.float32)
+        logs["curriculum/noise_scale"] = outcomes.new_tensor(
+            self.noise_curriculum.scale, dtype=torch.float32)
         for shape, window in self.noise_curriculum.windows.items():
             logs[f"curriculum/episodes/{shape}"] = outcomes.new_tensor(len(window))
             logs[f"curriculum/success/{shape}"] = outcomes.new_tensor(
-                sum(window)/len(window) if window else 0.)
+                sum(window)/len(window) if window else 0., dtype=torch.float32)
         return logs
 
     def get_observations(self) -> TensorDict:
