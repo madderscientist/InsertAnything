@@ -39,6 +39,7 @@ class InsertionCfg:
     initial_xy: float = 0.003
     initial_z_min: float = 0.004
     initial_z_max: float = 0.01
+    initial_plane_margin: float = 0.0
     initial_tilt: float = math.radians(3)
     initial_yaw: float = math.radians(15)
     position_bias: float = 0.0005
@@ -76,7 +77,7 @@ class InsertionCfg:
     force_cost_free_n: float = 5.0
     moment_cost_free_nm: float = 0.1
     action_cost_per_second: float = 0.05
-    action_change_cost_per_second: float = 0.1
+    action_change_cost_per_second: float = 0.05
     completion_bonus: float = 20.0
     safety_failure_penalty: float = 200.0
     timeout_penalty: float = 10.0
@@ -127,6 +128,9 @@ class InsertionCfg:
         if (not math.isfinite(self.initial_z_min) or not math.isfinite(self.initial_z_max)
                 or not 0 < self.initial_z_min <= self.initial_z_max < 0.03 * self.scale):
             raise ValueError("initial Z bounds must be positive, ordered and below the workspace ceiling")
+        if (not math.isfinite(self.initial_plane_margin)
+                or not 0 <= self.initial_plane_margin <= self.initial_z_max):
+            raise ValueError("initial plane margin must be finite and within [0, initial_z_max]")
         if (not isinstance(self.noise_zero_steps, int)
                 or not isinstance(self.noise_full_steps, int)
                 or not 0 <= self.noise_zero_steps < self.noise_full_steps):
@@ -222,6 +226,8 @@ class InsertionCfg:
     @classmethod
     def from_checkpoint(cls, environment: dict) -> "InsertionCfg":
         values = dict(environment)
+        if values.pop("load_cost_power", 2) != 2:
+            raise ValueError("linear-load experimental checkpoints require explicit reward migration")
         if "shapes" in values:
             values["shapes"] = tuple(values["shapes"])
         if "clearance_levels" in values:

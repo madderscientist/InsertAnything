@@ -2,7 +2,9 @@
 
 import argparse
 import copy
+from contextlib import redirect_stdout
 from dataclasses import asdict, replace
+import io
 import json
 import logging
 import math
@@ -17,6 +19,7 @@ import time
 
 import torch
 from rsl_rl.runners import OnPolicyRunner
+from rsl_rl.utils.logger import Logger
 
 from insertion import InsertionCfg, InsertionEnv, TRAIN_SHAPES, runner_config
 from insertion.curriculum import adaptive_environment_counts
@@ -30,8 +33,37 @@ def prepare_runner_config(config: dict) -> dict:
     return config
 
 
+class GroupedLogger(Logger):
+    def log(self, *args, **kwargs) -> None:
+        labels = {
+            f"{key}:" if "/" in key else f"Mean episode {key}:"
+            for extras in self.ep_extras for key in extras}
+        # Keep upstream metric aggregation intact; only reorder its rendered metric rows.
+        output = io.StringIO()
+        with redirect_stdout(output):
+            super().log(*args, **kwargs)
+        lines = output.getvalue().splitlines(keepends=True)
+        positions = [i for i, line in enumerate(lines)
+                     if line.strip().split(":", 1)[0] + ":" in labels]
+        ordered = sorted((lines[i] for i in positions),
+                         key=lambda line: line.strip().split(":", 1)[0])
+        for index, line in zip(positions, ordered, strict=True):
+            lines[index] = line
+        print("".join(lines), end="")
+
+
+def configure_runner_logging(runner: OnPolicyRunner) -> None:
+    runner.logger = GroupedLogger(
+        log_dir=runner.logger.log_dir, cfg=runner.cfg, env_cfg=runner.env.cfg,
+        num_envs=runner.env.num_envs, is_distributed=runner.is_distributed,
+        gpu_world_size=runner.gpu_world_size, gpu_global_rank=runner.gpu_global_rank,
+        device=runner.device)
+
+
 def make_runner(env: InsertionEnv, config: dict, log_dir: str | None = None) -> OnPolicyRunner:
-    return OnPolicyRunner(env, prepare_runner_config(config), log_dir=log_dir, device=str(env.device))
+    runner = OnPolicyRunner(env, prepare_runner_config(config), log_dir=log_dir, device=str(env.device))
+    configure_runner_logging(runner)
+    return runner
 
 
 def environment_config(args: argparse.Namespace) -> InsertionCfg:
@@ -46,6 +78,7 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         force_bias=args.force_bias, moment_bias=args.moment_bias,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
         initial_z_min=args.initial_z_min, initial_z_max=args.initial_z_max,
+        initial_plane_margin=args.initial_plane_margin,
         initial_tilt=math.radians(args.initial_tilt_deg),
         initial_yaw=math.radians(args.initial_yaw_deg),
         noise_zero_steps=100*args.steps, noise_full_steps=800*args.steps,
@@ -114,6 +147,7 @@ def contract(cfg: InsertionCfg) -> dict:
         "initial_tip_position": {
             "xy_half_range_m": cfg.initial_xy,
             "z_bounds_m": [cfg.initial_z_min, cfg.initial_z_max],
+            "whole_peg_plane_margin_m": cfg.initial_plane_margin,
             "xy_curriculum_scaled": True,
         },
         "initial_rotation_vector_half_ranges_rad": [
@@ -147,6 +181,22 @@ def atomic_json(path: Path, value: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
     temporary.replace(path)
+
+
+def archive_checkpoint(output: Path, iteration: int) -> Path | None:
+    if iteration <= 0 or iteration % 500:
+        return None
+    directory = output / "checkpoints"
+    directory.mkdir(exist_ok=True)
+    target = directory / f"checkpoint_{iteration:08d}.pt"
+    if target.exists():
+        logging.info("Retaining existing periodic checkpoint %s.", target)
+        return target
+    temporary = target.with_suffix(".pt.tmp")
+    shutil.copyfile(output / "checkpoint.pt", temporary)
+    temporary.replace(target)
+    logging.info("Archived periodic checkpoint %s.", target)
+    return target
 
 
 def health_state(exit_code: int | None, now: float, started: float,
@@ -218,9 +268,17 @@ class LiveInsertionEnv(InsertionEnv):
         self.output, self.metadata = output, metadata
         self.publish = publish
         self.last_scene_time = 0.
+        self.termination_started = time.time()
+        self.termination_counts = {
+            shape: torch.zeros(7, dtype=torch.int64, device=self.device)
+            for shape in cfg.shapes}
+        self.overload_stages = {
+            shape: torch.zeros(11, dtype=torch.int64, device=self.device)
+            for shape in cfg.shapes}
 
     def step(self, actions: torch.Tensor):
         result = super().step(actions)
+        self.record_terminations(result[2], result[3]["terminal"])
         now = time.monotonic()
         if self.publish and now-self.last_scene_time >= 0.5:
             publish_scene(self, self.output, self.metadata, {
@@ -229,12 +287,65 @@ class LiveInsertionEnv(InsertionEnv):
             self.last_scene_time = now
         return result
 
+    def record_terminations(self, dones: torch.Tensor, terminal: dict) -> None:
+        offset = 0
+        for group in self.groups:
+            section = slice(offset, offset+group.n)
+            ended = dones[section]
+            reason = terminal["reason"][section]
+            force = terminal["peak_force"][section] > group.cfg.max_force
+            moment = terminal["peak_moment"][section] > group.cfg.max_moment
+            masks = (ended, ended & (reason == 1),
+                     ended & (reason == 2) & force & ~moment,
+                     ended & (reason == 2) & moment & ~force,
+                     ended & (reason == 2) & force & moment,
+                     ended & (reason == 3), ended & (reason == 4))
+            self.termination_counts[group.shape].add_(
+                torch.stack(masks).sum(dim=1).to(self.device))
+            overload = ended & (reason == 2)
+            z = terminal["tip_z_m"][section]
+            length = terminal["length"][section]
+            tilt = terminal["tilt_rad"][section]
+            stages = (
+                z > 0.001, (z >= -0.001) & (z <= 0.001),
+                (z < -0.001) & (z >= -0.005), z < -0.005,
+                length <= 5, (length > 5) & (length <= 25),
+                (length > 25) & (length <= 100), length > 100,
+                tilt < math.radians(5),
+                (tilt >= math.radians(5)) & (tilt < math.radians(15)),
+                tilt >= math.radians(15))
+            self.overload_stages[group.shape].add_(
+                (torch.stack(stages) & overload).sum(dim=1).to(self.device))
+            offset += group.n
+
+    def termination_report(self) -> dict:
+        names = ("episodes", "success", "force_limit_only", "moment_limit_only",
+                 "force_and_moment_limit", "workspace_or_tilt", "timeout")
+        stage_names = (
+            "above_1mm", "mouth_plus_minus_1mm", "inserted_1_to_5mm", "inserted_beyond_5mm",
+            "time_le_0.1s", "time_0.1_to_0.5s", "time_0.5_to_2s", "time_gt_2s",
+            "tilt_lt_5deg", "tilt_5_to_15deg", "tilt_ge_15deg")
+        return {
+            "started": self.termination_started, "timestamp": time.time(),
+            "scope": "local worker since restart; all completed episodes, not curriculum window",
+            "distributed_rank_zero_only": self.curriculum_distributed,
+            "overload_stage_definition": "20ms terminal-step end state, before reset; "
+                "depth, time and tilt are separate partitions, not first-impact root causes",
+            "overload_stages": {
+                shape: dict(zip(stage_names, counts.cpu().tolist(), strict=True))
+                for shape, counts in self.overload_stages.items()},
+            "shapes": {
+                shape: dict(zip(names, counts.cpu().tolist(), strict=True))
+                for shape, counts in self.termination_counts.items()},
+        }
+
 
 class ContinuousRunner(OnPolicyRunner):
     env: InsertionEnv
 
     def __init__(self, env: InsertionEnv, config: dict, output: Path, metadata: dict):
         super().__init__(env, prepare_runner_config(config), str(output), str(env.device))
+        configure_runner_logging(self)
         self.env = env
         self.output, self.metadata = output, metadata
         self.env.curriculum_rollout_steps = config["num_steps_per_env"]
@@ -274,6 +385,7 @@ class ContinuousRunner(OnPolicyRunner):
             shutil.copyfile(checkpoint, previous)
             previous.replace(self.output / "previous.pt")
         temporary.replace(checkpoint)
+        archive_checkpoint(self.output, self.current_learning_iteration)
         reward = list(self.logger.rewbuffer)
         memory = self.release_update_cache()
         progress = {
@@ -293,6 +405,11 @@ class ContinuousRunner(OnPolicyRunner):
             "adaptive_sampling": cfg.adaptive_sampling,
         }
         atomic_json(self.output / "heartbeat.json", progress)
+        if isinstance(self.env, LiveInsertionEnv):
+            atomic_json(self.output / "termination_counts.json", {
+                **self.env.termination_report(),
+                "iteration": self.current_learning_iteration,
+            })
         publish_scene(self.env, self.output, self.metadata, progress)
         self.last_saved = progress_key
         if self.stop_requested:
@@ -342,7 +459,8 @@ def worker(output: Path, device: str, attempt: int) -> None:
     except TrainingStopped:
         if runner.logger.writer is not None:
             runner.logger.stop_logging_writer()
-        logging.info("Stopped with an atomic checkpoint.")
+        logging.info("Worker stopped after a stop request; atomic checkpoint saved. "
+                     "Routine checkpoint saves do not stop training.")
 
 
 def resume_training(runner: ContinuousRunner, cfg: InsertionCfg, attempt: int,
@@ -372,7 +490,8 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                 defaults = InsertionCfg()
                 if any(source_cfg.get(key, getattr(defaults, key)) != getattr(cfg, key)
                        for key in ("force_bias", "moment_bias", "initial_xy",
-                                   "initial_z_min", "initial_z_max", "initial_tilt", "initial_yaw")):
+                                   "initial_z_min", "initial_z_max", "initial_tilt", "initial_yaw",
+                                   "initial_plane_margin")):
                     for window in env.noise_curriculum.windows.values():
                         window.clear()
                     logging.warning("Initial pose or wrench bias distribution changed; retaining curriculum level, clearing windows.")
@@ -639,6 +758,8 @@ def main() -> None:
     parser.add_argument("--initial-xy", type=float, default=0.003,
                         help="initial true tip X/Y uniform half range in meters")
     parser.add_argument("--initial-z-min", type=float, default=0.004)
+    parser.add_argument("--initial-plane-margin", type=float, default=0.,
+                        help="minimum whole-peg height above hole plane in meters; zero disables")
     parser.add_argument("--initial-z-max", type=float, default=0.01)
     parser.add_argument("--initial-tilt-deg", type=float, default=3.,
                         help="initial rotation-vector X/Y component half range in degrees")

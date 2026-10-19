@@ -44,7 +44,7 @@ $$
 | `force_cost_free_n` | 5.0 N | 力成本死区（按三维范数） |
 | `moment_cost_free_nm` | 0.1 N·m | 力矩成本死区（按三维范数） |
 | `action_cost_per_second` | 0.05 | $w_a$，动作幅度成本系数 |
-| `action_change_cost_per_second` | 0.1 | $w_{\Delta a}$，相邻步动作变化成本系数 |
+| `action_change_cost_per_second` | 0.05 | $w_{\Delta a}$，相邻步动作变化成本系数 |
 | `completion_bonus` | 20.0 | $B$，达标保持 5 步后的一次性成功奖励 |
 | `safety_failure_penalty` | 200.0 | $P_X$，安全超限或逃出工作空间的一次性惩罚 |
 | `timeout_penalty` | 10.0 | $P_T$，超时未完成的一次性惩罚 |
@@ -95,8 +95,12 @@ r_a=-\Delta t\,w_a\|\bar a_t\|_2,
 r_{\Delta a}=-\Delta t\,w_{\Delta a}\|\bar a_t-\bar a_{t-1}\|_2
 $$
 
+载荷成本固定使用平方形式，不提供形状选项。
+兼容读取平方版检查点中已废弃的 `load_cost_power=2` 字段；
+线性实验检查点会明确拒绝加载，需先显式迁移奖励配置。
+
 ## 6. 终止条件与防自杀边界
 
 - **成功终止（+20）**：真实尖端连续 **5 个策略步**（100 ms）满足 $z_t\le-d+0.0002\text{ m}$、$e_{xy}<0.4\,\text{clearance}$、$\theta<0.4\,\text{clearance}/L_{\mathrm{peg}}$、$\psi<0.4\,\text{clearance}/R$，且未触发安全越界。
 - **安全失败（−200）**：未滤波峰值力 $>30\text{ N}$、峰值力矩 $>2\text{ N}\cdot\text{m}$、逃出工作空间或倾角 $>35^\circ$。
-- **防自杀约束**：单步运行成本理论上界 $C_{\mathrm{step,max}}\approx0.19225$，折扣因子 $\gamma=0.9985$ 下无穷步累计运行成本上界为 $\frac{C_{\mathrm{step,max}}}{1-\gamma}\approx128.17 < P_X=200$，确保策略永远不会通过故意触发安全失败来逃避后续运行或超时惩罚。验证测试见 [test/test_env_curriculum.py](./test/test_env_curriculum.py)。
+- **防自杀约束**：默认单步运行成本理论上界 $C_{\mathrm{step,max}}\approx0.18735$，折扣因子 $\gamma=0.9985$ 下无穷步累计运行成本上界为 $\frac{C_{\mathrm{step,max}}}{1-\gamma}\approx124.90 < P_X=200$。配置同时检查安全罚分大于单步上界加超时罚分，以避免安全终止成为逃避运行成本的廉价选择；这不是策略绝不会违规的保证。验证测试见 [test/test_env_curriculum.py](./test/test_env_curriculum.py)。

@@ -113,6 +113,8 @@ class PlantGroup:
         self.peg_geom_ids = self.peg_ids.tolist()
         self.default_geom_pos = torch.tensor(self.model.geom_pos, device=device,
                                               dtype=torch.float32)
+        self.peg_polygon = torch.tensor(
+            self.geometry.peg_polygon, dtype=torch.float32, device=device)
         self.sensor_offset = torch.tensor([0, 0, 0.03 * cfg.scale],
                                           device=device).expand(self.n, 3)
         self.identity = torch.tensor([1., 0, 0, 0], device=device).expand(self.n, 4)
@@ -201,6 +203,8 @@ class PlantGroup:
         self.peg_geom_ids = self.peg_ids.tolist()
         self.default_geom_pos = torch.tensor(self.model.geom_pos, device=self.device,
                                               dtype=torch.float32)
+        self.peg_polygon = torch.tensor(
+            self.geometry.peg_polygon, dtype=torch.float32, device=self.device)
         self.sim.model.body_mass[:, self.body_id] = self.mass[:, 0]
         self.sim.model.body_inertia[:, self.body_id] = self.inertia
         self.sim.model.geom_friction[:, :, 0] = friction
@@ -324,9 +328,21 @@ class PlantGroup:
             self.delay[ids] = 0
         pos = self.uniform(n, 3, -cfg.initial_xy, cfg.initial_xy) * self.difficulty
         pos[:, 2] = self.uniform(n, 1, cfg.initial_z_min, cfg.initial_z_max)[:, 0]
-        rv = self.uniform(n, 3, -cfg.initial_tilt, cfg.initial_tilt) * self.difficulty
-        rv[:, 2] = self.uniform(n, 1, -cfg.initial_yaw, cfg.initial_yaw)[:, 0] * self.difficulty
-        q = rotvec_quat(rv)
+        q = self.sample_initial_orientation(n)
+        if cfg.initial_plane_margin:
+            for attempt in range(16):
+                minimum_z = self.initial_minimum_tip_height(q)
+                invalid = minimum_z > cfg.initial_z_max
+                if not bool(invalid.any()):
+                    break
+                if attempt == 15:
+                    raise RuntimeError("Cannot sample collision-free initial pose within Z bounds after 16 attempts")
+                q[invalid] = self.sample_initial_orientation(int(invalid.sum()))
+            height_fraction = torch.zeros_like(pos[:, 2])
+            if cfg.initial_z_max > cfg.initial_z_min:
+                height_fraction = (pos[:, 2]-cfg.initial_z_min) / (
+                    cfg.initial_z_max-cfg.initial_z_min)
+            pos[:, 2] = minimum_z + height_fraction * (cfg.initial_z_max-minimum_z)
         self.sim.data.qpos[ids, :3] = pos - rotate(q, self.offset[ids])
         self.sim.data.qpos[ids, 3:7] = q
         self.sim.data.qvel[ids] = 0
@@ -339,6 +355,24 @@ class PlantGroup:
         for buffer in (self.length, self.hold, self.peak_force, self.peak_moment,
                        self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor):
             buffer[ids] = 0
+
+    def sample_initial_orientation(self, n: int) -> torch.Tensor:
+        cfg = self.cfg
+        rv = self.uniform(n, 3, -cfg.initial_tilt, cfg.initial_tilt) * self.difficulty
+        rv[:, 2] = self.uniform(n, 1, -cfg.initial_yaw, cfg.initial_yaw)[:, 0] * self.difficulty
+        return rotvec_quat(rv)
+
+    def initial_minimum_tip_height(self, q: torch.Tensor) -> torch.Tensor:
+        vertical = torch.zeros_like(q[:, 1:])
+        vertical[:, 2] = 1.
+        local_vertical = rotate(quat_inv(q), vertical)
+        if self.shape == "circle":
+            radial_minimum = -(self.geometry.radius-self.clearance/2) * torch.linalg.vector_norm(
+                local_vertical[:, :2], dim=-1)
+        else:
+            radial_minimum = (local_vertical[:, :2] @ self.peg_polygon.T).amin(dim=-1)
+        lowest = radial_minimum + (local_vertical[:, 2]*self.geometry.peg_length).clamp_max(0)
+        return (self.cfg.initial_plane_margin-lowest).clamp_min(self.cfg.initial_z_min)
 
     def state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         pos = self.sim.data.qpos[:, :3]
@@ -601,6 +635,7 @@ class PlantGroup:
         reason = torch.where(success, 1, torch.where(excessive, 2, torch.where(escaped, 3,
                              torch.where(timeout, 4, 0))))
         info = {"reason": reason, "length": self.length.clone(),
+                "tip_z_m": tip[:, 2].clone(), "tilt_rad": tilt.clone(),
                 "target_depth_m": -self.goal[:, 2].clone(),
                 "peak_force": self.peak_force.clone(), "peak_moment": self.peak_moment.clone(),
                 "time_outs": timeout & ~success & ~excessive & ~escaped}

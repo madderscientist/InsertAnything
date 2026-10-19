@@ -5,13 +5,16 @@ from dataclasses import replace
 from itertools import product
 from typing import Any
 import unittest
+from unittest.mock import patch
 
+import mujoco
 import torch
 
 from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
                        SuccessNoiseCurriculum, TRAIN_SHAPES, bounded_stiffness_step,
                        completion_cost_terms, quat_rotvec, tip_pose)
 from insertion.curriculum import adaptive_environment_counts
+from insertion.transforms import rotvec_quat
 
 
 class RewardAndCurriculumUnitTests(unittest.TestCase):
@@ -52,6 +55,16 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
 
     def reward(self, **values):
         return float(sum(self.terms(**values).values()))
+
+    def test_quadratic_load_cost_and_retired_checkpoint_field(self):
+        self.assertAlmostEqual(float(self.terms(force=20.)["force_penalty"]), -0.0072)
+        self.assertAlmostEqual(float(self.terms(force=17.5)["force_penalty"]),
+                               0.25 * float(self.terms(force=30.)["force_penalty"]))
+        self.assertAlmostEqual(float(self.terms(moment=1.05)["moment_penalty"]), -0.005)
+        legacy = InsertionCfg.from_checkpoint({"load_cost_power": 2})
+        self.assertFalse(hasattr(legacy, "load_cost_power"))
+        with self.assertRaisesRegex(ValueError, "explicit reward migration"):
+            InsertionCfg.from_checkpoint({"load_cost_power": 1})
 
     def test_reward_shaping_mouth_gradient_and_safety_bound(self):
         cfg = InsertionCfg()
@@ -211,6 +224,43 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
                 self.assertLess(float(rv[:, axis].min()), -0.9 * bound)
                 self.assertGreater(float(rv[:, axis].max()), 0.9 * bound)
 
+    def test_initial_plane_clearance_all_shapes_and_grasp_offsets(self):
+        cfg = replace(self.cfg, shapes=TRAIN_SHAPES+("circle",), envs_per_shape=64,
+                      initial_xy=0.01, initial_z_min=0.001, initial_z_max=0.01,
+                      initial_plane_margin=0.001, initial_tilt=math.radians(20),
+                      initial_yaw=math.radians(20), grasp_position_error=0.00125)
+        env = InsertionEnv(cfg, self.device)
+        for group in env.groups:
+            pos, q, _, _ = group.state()
+            tip = tip_pose(pos, q, group.offset)
+            minimum = group.initial_minimum_tip_height(q)
+            self.assertTrue(bool((tip[:, 2] >= minimum-1e-7).all()))
+            self.assertTrue(bool((tip[:, 2] <= 0.01+1e-7).all()))
+            before = group.sim.data.qpos.clone()
+            group.reset(torch.tensor([0], device=self.device))
+            torch.testing.assert_close(group.sim.data.qpos[1:], before[1:])
+            # Independent MuJoCo forward validates the actual collision model, including grasp offsets.
+            for i in range(8):
+                grasp = (group.offset[i]-group.nominal_offset[i]).cpu().numpy()
+                for geom_id in group.peg_geom_ids:
+                    group.model.geom_pos[geom_id] = group.default_geom_pos[geom_id].cpu().numpy()+grasp
+                data = mujoco.MjData(group.model)
+                data.qpos[:] = group.sim.data.qpos[i].cpu().numpy()
+                mujoco.mj_forward(group.model, data)
+                self.assertFalse(any(data.contact[j].dist < 0 for j in range(data.ncon)))
+            tilted = rotvec_quat(torch.tensor(
+                [[math.radians(20), math.radians(20), math.radians(20)]], device=self.device))
+            self.assertLess(float(group.initial_minimum_tip_height(tilted)[0]), cfg.initial_z_max)
+        group = env.groups[0]
+        with patch.object(group, "initial_minimum_tip_height",
+                          return_value=torch.full((1,), 0.02, device=self.device)):
+            with self.assertRaisesRegex(RuntimeError, "16 attempts"):
+                group.reset(torch.tensor([0], device=self.device))
+        self.assertEqual(InsertionCfg.from_checkpoint({}).initial_plane_margin, 0.)
+        for value in (-1., float("nan"), 0.02):
+            with self.assertRaises(ValueError):
+                replace(cfg, initial_plane_margin=value)
+
     def test_cuda_graph_equivalence_and_live_clearance_upgrade(self):
         cfg = InsertionCfg(shapes=("square",), envs_per_shape=4, episode_seconds=0.08,
                            clearance_curriculum=True, noise_curriculum=True,
@@ -233,6 +283,8 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         self.assertIsNone(group.action_graph)
         self.assertIsNone(group.outcome_graph)
         self.assertAlmostEqual(group.difficulty, 0.40)
+        torch.testing.assert_close(group.peg_polygon, torch.tensor(
+            group.geometry.peg_polygon, dtype=torch.float32, device=self.device))
         self.assertAlmostEqual(float(logs["curriculum/clearance_mm"]), 1.0)
         for _ in range(4):
             obs, rewards, _, _ = env.step(torch.zeros(4, 6, device=self.device))

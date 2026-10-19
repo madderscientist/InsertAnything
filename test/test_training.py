@@ -1,13 +1,14 @@
 """策略导出、检查点恢复、多卡分布式训练与可视化场景测试"""
 
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 from dataclasses import asdict
+import io
 import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -17,9 +18,10 @@ from rsl_rl.models import RNNModel
 from export_policy import OfflinePolicy
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv, SuccessNoiseCurriculum, runner_config
 from insertion.distributed import run_distributed, validate_layout
-from train import (ContinuousRunner, TrainingStopped, atomic_json, contract,
-                   adapt_training_layout, environment_config, health_state, load_recovery_checkpoint,
-                   main, prepare_runner_config, restore_environment_progress, resume_training)
+from train import (ContinuousRunner, GroupedLogger, LiveInsertionEnv, TrainingStopped,
+                   adapt_training_layout, archive_checkpoint, atomic_json, contract,
+                   environment_config, health_state, load_recovery_checkpoint, main,
+                   prepare_runner_config, restore_environment_progress, resume_training)
 from viser_view import SnapshotScene, replay_config, replay_index
 
 
@@ -92,6 +94,75 @@ class PolicyAndViewerTests(unittest.TestCase):
 
 
 class RuntimeAndDistributedTests(unittest.TestCase):
+    def test_console_metrics_sorted_without_changing_aggregation(self):
+        config = prepare_runner_config(runner_config(4))
+        config["algorithm"]["rnd_cfg"] = None
+        logger = GroupedLogger(None, config, {}, 4, False, 1, 0, "cpu")
+        logger.writer = Mock()
+        values = {"reward/time_penalty": -0.02, "curriculum/success/square": 0.8,
+                  "curriculum/noise_scale": 0.2, "reward/action_penalty": -0.001,
+                  "curriculum/success/triangle": 0.9, "curriculum/difficulty": 1.}
+        for order in (list(values), list(reversed(values))):
+            logger.ep_extras = [{key: torch.tensor(values[key]) for key in order},
+                                {"curriculum/success/square": torch.tensor(0.6)}]
+            logger.writer.reset_mock()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                logger.log(it=0, start_it=0, total_it=1, collect_time=1., learn_time=1.,
+                           loss_dict={}, learning_rate=0.001, action_std=torch.ones(1),
+                           rnd_weight=None)
+            rows = [line.strip().split(":", 1)[0] for line in output.getvalue().splitlines()
+                    if line.strip().split(":", 1)[0] in values]
+            self.assertEqual(rows, sorted(values))
+            calls = {call.args[0]: call.args[1] for call in logger.writer.add_scalar.call_args_list}
+            self.assertAlmostEqual(float(calls["curriculum/success/square"]), 0.7, places=6)
+            self.assertEqual(logger.ep_extras, [])
+        logger.ep_extras = [{"reward/time_penalty": -0.02}]
+        with redirect_stdout(io.StringIO()) as output:
+            logger.log(it=0, start_it=0, total_it=1, collect_time=1., learn_time=1.,
+                       loss_dict={}, learning_rate=0.001, action_std=torch.ones(1),
+                       rnd_weight=None, print_minimal=True)
+        self.assertNotIn("reward/time_penalty:", output.getvalue())
+
+    def test_periodic_checkpoint_every_500_iterations_and_preserves_old_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            source = output / "checkpoint.pt"
+            torch.save({"iter": 500, "optimizer_state_dict": {"step": 7}}, source)
+            for iteration in (0, 1, 499, 501, 999):
+                self.assertIsNone(archive_checkpoint(output, iteration))
+            target = archive_checkpoint(output, 500)
+            self.assertEqual(target.name, "checkpoint_00000500.pt")
+            self.assertEqual(torch.load(target, weights_only=True)["iter"], 500)
+            torch.save({"iter": 1000}, source)
+            archive_checkpoint(output, 500)
+            self.assertEqual(torch.load(target, weights_only=True)["iter"], 500)
+            newer = archive_checkpoint(output, 1000)
+            self.assertEqual(torch.load(newer, weights_only=True)["iter"], 1000)
+            self.assertFalse(list((output / "checkpoints").glob("*.tmp")))
+
+    def test_training_termination_counts_ignore_unfinished_and_partition_failures(self):
+        env = LiveInsertionEnv.__new__(LiveInsertionEnv)
+        env.device = "cpu"
+        env.groups = [SimpleNamespace(shape="square", n=7, cfg=InsertionCfg())]
+        env.termination_counts = {"square": torch.zeros(7, dtype=torch.int64)}
+        env.overload_stages = {"square": torch.zeros(11, dtype=torch.int64)}
+        env.termination_started = 1.
+        env.curriculum_distributed = False
+        terminal = {"reason": torch.tensor([1, 2, 2, 2, 3, 4, 0]),
+                    "tip_z_m": torch.tensor([0., 0.002, 0., -0.006, 0., 0., 0.]),
+                    "length": torch.tensor([1, 5, 25, 101, 1, 1, 1]),
+                    "tilt_rad": torch.tensor([0., 0., 0.2, 0.4, 0., 0., 0.]),
+                    "peak_force": torch.tensor([0., 31., 0., 31., 0., 0., 99.]),
+                    "peak_moment": torch.tensor([0., 0., 3., 3., 0., 0., 99.])}
+        env.record_terminations(torch.tensor([True]*6+[False]), terminal)
+        counts = env.termination_report()["shapes"]["square"]
+        self.assertEqual(list(counts.values()), [6, 1, 1, 1, 1, 1, 1])
+        stages = env.termination_report()["overload_stages"]["square"]
+        self.assertEqual(list(stages.values()), [1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1])
+        env.record_terminations(torch.zeros(7, dtype=torch.bool), terminal)
+        self.assertEqual(env.termination_report()["shapes"]["square"], counts)
+
     def test_finite_and_continuous_share_environment_config(self):
         argv = ["train.py", "--initial-xy", "0.01", "--initial-z-min", "0.001",
                 "--initial-tilt-deg", "20", "--initial-yaw-deg", "20",
@@ -175,7 +246,7 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
         for key, value in (("initial_xy", 0.01), ("initial_tilt", 0.35),
                            ("initial_yaw", 0.35), ("initial_z_min", 0.001),
-                           ("initial_z_max", 0.02)):
+                           ("initial_z_max", 0.02), ("initial_plane_margin", 0.001)):
             changed = InsertionCfg.from_checkpoint({**asdict(cfg), key: value})
             with self.assertLogs(level="WARNING"):
                 restore_environment_progress(env, changed, saved, 2)
@@ -216,6 +287,13 @@ class RuntimeAndDistributedTests(unittest.TestCase):
             heartbeat = json.loads((output / "heartbeat.json").read_text())
             self.assertEqual(list(heartbeat["shape_environment_counts"].values()), [6, 4, 4, 4, 2])
             self.assertTrue(heartbeat["adaptive_sampling"])
+            resumed.current_learning_iteration = 500
+            resumed.save("unused")
+            archived = torch.load(output / "checkpoints" / "checkpoint_00000500.pt",
+                                  weights_only=True, map_location="cpu")
+            self.assertEqual(archived["iter"], 500)
+            self.assertTrue(archived["optimizer_state_dict"]["state"])
+            self.assertEqual(archived["infos"]["environment"]["force_cost_per_second"], 1.)
 
     def test_nonuniform_distributed_layout_validation_without_second_gpu(self):
         cfg = InsertionCfg(envs_per_shape=8, shape_env_counts=(12, 8, 8, 8, 4))
