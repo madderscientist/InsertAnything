@@ -157,6 +157,9 @@ def contract(cfg: InsertionCfg) -> dict:
         "target_depth_bounds_m": list(cfg.target_depth_bounds_m),
         "target_depth_sampling": "uniform per episode" if cfg.fixed_target_depth_m is None else "fixed",
         "depth_success": "reach or exceed target, with existing 0.2 mm tolerance",
+        "success_alignment_required": cfg.success_alignment_required,
+        "success_hold_steps": cfg.success_hold_steps,
+        "success_safety_priority": True,
         "preinsertion_tilt_weight": cfg.preinsertion_tilt_weight,
         "xy_cost_radius_fraction": cfg.xy_cost_radius_fraction,
         "reward_adaptations": (
@@ -488,13 +491,15 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     and source_cfg.get("clearance_curriculum", False) == cfg.clearance_curriculum):
                 env.noise_curriculum.load_state_dict(saved["infos"]["noise_curriculum_state"])
                 defaults = InsertionCfg()
-                if any(source_cfg.get(key, getattr(defaults, key)) != getattr(cfg, key)
+                if (source_cfg.get("success_alignment_required", True) != cfg.success_alignment_required
+                        or source_cfg.get("success_hold_steps", defaults.success_hold_steps) != cfg.success_hold_steps
+                        or any(source_cfg.get(key, getattr(defaults, key)) != getattr(cfg, key)
                        for key in ("force_bias", "moment_bias", "initial_xy",
                                    "initial_z_min", "initial_z_max", "initial_tilt", "initial_yaw",
-                                   "initial_plane_margin")):
+                                   "initial_plane_margin"))):
                     for window in env.noise_curriculum.windows.values():
                         window.clear()
-                    logging.warning("Initial pose or wrench bias distribution changed; retaining curriculum level, clearing windows.")
+                    logging.warning("Initial pose, wrench bias or success criteria changed; retaining curriculum level, clearing windows.")
             else:
                 logging.info("Resetting success curriculum to level 0 for updated curriculum config.")
         else:

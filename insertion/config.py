@@ -60,6 +60,7 @@ class InsertionCfg:
     dynamics: str = "train"
     training: bool = True
     success_hold_steps: int = 5
+    success_alignment_required: bool = False
     curriculum_steps: int = 256000
     impedance_walk_fraction: float = 0.1
     impedance_walk_rate_per_second: float = 0.05
@@ -226,6 +227,7 @@ class InsertionCfg:
     @classmethod
     def from_checkpoint(cls, environment: dict) -> "InsertionCfg":
         values = dict(environment)
+        values.setdefault("success_alignment_required", True)
         if values.pop("load_cost_power", 2) != 2:
             raise ValueError("linear-load experimental checkpoints require explicit reward migration")
         if "shapes" in values:

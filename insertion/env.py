@@ -612,10 +612,11 @@ class PlantGroup:
         xy = torch.linalg.vector_norm(tip[:, :2], dim=-1)
         tilt, yaw = self.alignment(q)
         z_disp = tip[:, 2] - self.goal[:, 2]
-        success = ((tip[:, 2] <= self.goal[:, 2] + 0.0002)
-                   & (xy < self.clearance * 0.4)
-                   & (tilt < self.clearance / self.geometry.peg_length * 0.4)
-                   & (yaw < self.clearance / self.geometry.radius * 0.4))
+        success = tip[:, 2] <= self.goal[:, 2] + 0.0002
+        if cfg.success_alignment_required:
+            success = (success & (xy < self.clearance * 0.4)
+                       & (tilt < self.clearance / self.geometry.peg_length * 0.4)
+                       & (yaw < self.clearance / self.geometry.radius * 0.4))
         self.hold.copy_(torch.where(success, self.hold + 1, torch.zeros_like(self.hold)))
         success = self.hold >= cfg.success_hold_steps
         excessive = (self.peak_force > cfg.max_force) | (self.peak_moment > cfg.max_moment)

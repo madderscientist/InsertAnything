@@ -246,7 +246,8 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
         for key, value in (("initial_xy", 0.01), ("initial_tilt", 0.35),
                            ("initial_yaw", 0.35), ("initial_z_min", 0.001),
-                           ("initial_z_max", 0.02), ("initial_plane_margin", 0.001)):
+                           ("initial_z_max", 0.02), ("initial_plane_margin", 0.001),
+                           ("success_alignment_required", True), ("success_hold_steps", 6)):
             changed = InsertionCfg.from_checkpoint({**asdict(cfg), key: value})
             with self.assertLogs(level="WARNING"):
                 restore_environment_progress(env, changed, saved, 2)
@@ -256,6 +257,12 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         del saved["infos"]["environment"]["initial_z_max"]
         restore_environment_progress(env, cfg, saved, 3)
         self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
+
+        saved["infos"]["environment"].pop("success_alignment_required")
+        with self.assertLogs(level="WARNING"):
+            restore_environment_progress(env, cfg, saved, 4)
+        self.assertEqual(curriculum.level, 4)
+        self.assertTrue(all(not w for w in curriculum.windows.values()))
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_biased_nonuniform_ppo_checkpoint_resume(self):

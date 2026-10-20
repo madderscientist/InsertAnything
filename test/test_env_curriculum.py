@@ -4,6 +4,7 @@ import math
 from dataclasses import replace
 from itertools import product
 from typing import Any
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -15,9 +16,57 @@ from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
                        completion_cost_terms, quat_rotvec, tip_pose)
 from insertion.curriculum import adaptive_environment_counts
 from insertion.transforms import rotvec_quat
+from insertion.env import PlantGroup
 
 
 class RewardAndCurriculumUnitTests(unittest.TestCase):
+    def test_depth_success_hold_reset_safety_and_legacy_alignment(self):
+        cfg = InsertionCfg()
+        self.assertFalse(cfg.success_alignment_required)
+        self.assertTrue(InsertionCfg.from_checkpoint({}).success_alignment_required)
+        group = SimpleNamespace(
+            cfg=cfg, geometry=SimpleNamespace(peg_length=0.035, radius=0.01, depth=0.025),
+            clearance=0.0001, offset=torch.zeros(1, 3),
+            goal=torch.tensor([[0., 0., -0.015]]),
+            hold=torch.zeros(1, dtype=torch.long), length=torch.zeros(1, dtype=torch.long),
+            peak_force=torch.zeros(1), peak_moment=torch.zeros(1),
+            wrench=torch.zeros(1, 6), last_action=torch.zeros(1, 6),
+            alignment=lambda q: (torch.tensor([0.01]), torch.tensor([0.02])),
+        )
+        position = torch.tensor([[0.0001, 0., -0.015]])
+        quaternion = torch.tensor([[1., 0., 0., 0.]])
+        group.state = lambda: (position, quaternion, torch.zeros(1, 3), torch.zeros(1, 3))
+        actions = torch.zeros(1, 6)
+        for _ in range(4):
+            _, done, _ = PlantGroup.step_outcome(group, actions)
+            self.assertFalse(done.item())
+        _, done, info = PlantGroup.step_outcome(group, actions)
+        self.assertTrue(done.item())
+        self.assertEqual(info["reason"].item(), 1)
+        self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 20)
+        position[:, 2] = -0.0147
+        PlantGroup.step_outcome(group, actions)
+        self.assertEqual(group.hold.item(), 0)
+        position[:, 2] = -0.01481
+        PlantGroup.step_outcome(group, actions)
+        self.assertEqual(group.hold.item(), 1)
+        group.cfg = replace(cfg, success_alignment_required=True)
+        PlantGroup.step_outcome(group, actions)
+        self.assertEqual(group.hold.item(), 0)
+        group.cfg = cfg
+        for field, value, reason in (("peak_force", 31., 2), ("peak_moment", 2.1, 2)):
+            group.hold.fill_(4)
+            getattr(group, field).fill_(value)
+            _, done, info = PlantGroup.step_outcome(group, actions)
+            self.assertTrue(done.item())
+            self.assertEqual(info["reason"].item(), reason)
+            self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
+            getattr(group, field).zero_()
+        group.hold.fill_(4)
+        position[:, 0] = 0.026
+        _, _, info = PlantGroup.step_outcome(group, actions)
+        self.assertEqual(info["reason"].item(), 3)
+
     def test_adaptive_counts_preserve_total_bounds_and_device_shards(self):
         for unit in (1, 2, 4, 8):
             counts = (512,) * 5
