@@ -23,6 +23,7 @@ from rsl_rl.utils.logger import Logger
 
 from insertion import InsertionCfg, InsertionEnv, TRAIN_SHAPES, runner_config
 from insertion.curriculum import adaptive_environment_counts
+from insertion.env import capture_graph
 
 
 def prepare_runner_config(config: dict) -> dict:
@@ -278,10 +279,13 @@ class LiveInsertionEnv(InsertionEnv):
         self.overload_stages = {
             shape: torch.zeros(11, dtype=torch.int64, device=self.device)
             for shape in cfg.shapes}
+        self.termination_graph = None
+        self.termination_inputs = None
+        self.capture_termination_stats = cfg.physics_cuda_graph
 
     def step(self, actions: torch.Tensor):
         result = super().step(actions)
-        self.record_terminations(result[2], result[3]["terminal"])
+        self.update_termination_stats(result[2], result[3]["terminal"])
         now = time.monotonic()
         if self.publish and now-self.last_scene_time >= 0.5:
             publish_scene(self, self.output, self.metadata, {
@@ -289,6 +293,24 @@ class LiveInsertionEnv(InsertionEnv):
             })
             self.last_scene_time = now
         return result
+
+    def update_termination_stats(self, dones: torch.Tensor, terminal: dict) -> None:
+        if not self.capture_termination_stats:
+            self.record_terminations(dones, terminal)
+            return
+        fields = ("reason", "peak_force", "peak_moment", "tip_z_m", "length", "tilt_rad")
+        if self.termination_inputs is None:
+            self.termination_inputs = (dones.clone(), {key: terminal[key].clone() for key in fields})
+            self.record_terminations(*self.termination_inputs)
+            with capture_graph(self.device) as graph:
+                self.record_terminations(*self.termination_inputs)
+            self.termination_graph = graph
+            return
+        target_dones, target_terminal = self.termination_inputs
+        target_dones.copy_(dones)
+        for key in fields:
+            target_terminal[key].copy_(terminal[key])
+        self.termination_graph.replay()
 
     def record_terminations(self, dones: torch.Tensor, terminal: dict) -> None:
         offset = 0

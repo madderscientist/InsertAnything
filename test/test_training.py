@@ -94,6 +94,35 @@ class PolicyAndViewerTests(unittest.TestCase):
 
 
 class RuntimeAndDistributedTests(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_captured_termination_statistics_match_eager_without_double_counting(self):
+        environments = []
+        for capture in (False, True):
+            env = LiveInsertionEnv.__new__(LiveInsertionEnv)
+            env.device = "cuda:0"
+            env.groups = [SimpleNamespace(shape="square", n=7, cfg=InsertionCfg())]
+            env.termination_counts = {"square": torch.zeros(7, dtype=torch.int64, device=env.device)}
+            env.overload_stages = {"square": torch.zeros(11, dtype=torch.int64, device=env.device)}
+            env.capture_termination_stats = capture
+            env.termination_inputs = env.termination_graph = None
+            environments.append(env)
+        for step in range(3):
+            terminal = {
+                "reason": torch.tensor([1, 2, 2, 2, 3, 4, 0], device="cuda:0"),
+                "peak_force": torch.tensor([0., 31., 0., 31., 0., 0., 99.], device="cuda:0"),
+                "peak_moment": torch.tensor([0., 0., 3., 3., 0., 0., 99.], device="cuda:0"),
+                "tip_z_m": torch.full((7,), 0.003-step*0.004, device="cuda:0"),
+                "length": torch.full((7,), 1+step*100, device="cuda:0"),
+                "tilt_rad": torch.full((7,), step*0.2, device="cuda:0"),
+            }
+            dones = torch.tensor([True]*6+[False], device="cuda:0")
+            for env in environments:
+                env.update_termination_stats(dones, terminal)
+            for field in ("termination_counts", "overload_stages"):
+                torch.testing.assert_close(getattr(environments[0], field)["square"],
+                                           getattr(environments[1], field)["square"])
+            self.assertEqual(int(environments[1].termination_counts["square"][0]), 6*(step+1))
+
     def test_console_metrics_sorted_without_changing_aggregation(self):
         config = prepare_runner_config(runner_config(4))
         config["algorithm"]["rnd_cfg"] = None
