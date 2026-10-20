@@ -67,18 +67,24 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         _, _, info = PlantGroup.step_outcome(group, actions)
         self.assertEqual(info["reason"].item(), 3)
 
-    def test_adaptive_counts_preserve_total_bounds_and_device_shards(self):
+    def test_adaptive_counts_preserve_total_mixture_and_device_shards(self):
         for unit in (1, 2, 4, 8):
             counts = (512,) * 5
             self.assertEqual(adaptive_environment_counts(counts, [0.] * 5, unit), counts)
             self.assertEqual(adaptive_environment_counts(counts, [0.2] * 5, unit), counts)
-            for _ in range(20):
-                result = adaptive_environment_counts(counts, [1., 0., 0., 0., 0.], unit)
-                self.assertEqual(sum(result), 2560)
-                self.assertTrue(all(n % unit == 0 and 256 <= n <= 768 for n in result))
-                self.assertTrue(all(abs(a-b) <= 64 for a, b in zip(result, counts)))
-                counts = result
-            self.assertGreater(counts[0], counts[1])
+            result = adaptive_environment_counts(counts, [1., 0., 0., 0., 0.], unit)
+            self.assertEqual(sum(result), 2560)
+            self.assertTrue(all(n % unit == 0 and n >= unit for n in result))
+            targets = [0.3*512 + 0.7*2560] + [0.3*512]*4
+            self.assertTrue(all(abs(n-t) <= unit for n, t in zip(result, targets)))
+            self.assertGreater(result[0], 768)
+            self.assertLess(result[1], 256)
+            self.assertEqual(adaptive_environment_counts(result, [0.] * 5, unit), counts)
+            mixed = adaptive_environment_counts(counts, [0.1, 0.2, 0.3, 0.4, 0.5], unit)
+            targets = [0.3*512 + 0.7*2560*f/1.5 for f in (0.1, 0.2, 0.3, 0.4, 0.5)]
+            self.assertEqual(sum(mixed), 2560)
+            self.assertTrue(all(abs(n-t) <= unit for n, t in zip(mixed, targets)))
+        self.assertEqual(adaptive_environment_counts((1, 1, 1), [1., 0., 0.]), (1, 1, 1))
         for kwargs in ({"shape_env_counts": (1,)}, {"force_bias": -1},
                        {"moment_bias": float("nan")}, {"adaptive_sampling": True},
                        {"initial_z_min": 0.}, {"initial_z_min": 0.02},

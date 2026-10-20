@@ -572,7 +572,7 @@ def adapt_training_layout(output: Path, iteration: int) -> bool:
     if not cfg.adaptive_sampling:
         return False
     state = metadata.get("adaptive_sampling_state") or {}
-    if iteration - state.get("iteration", -100) < 100:
+    if iteration - state.get("iteration", -30) < 30:
         return False
     saved = load_recovery_checkpoint(output, "cpu")
     curriculum = saved["infos"]["noise_curriculum_state"]

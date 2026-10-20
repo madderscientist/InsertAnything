@@ -202,28 +202,38 @@ class RuntimeAndDistributedTests(unittest.TestCase):
             with (patch("train.registered_worker_pid", return_value=123),
                   patch("train.os.kill") as kill):
                 self.assertFalse(adapt_training_layout(output, 10))
-                self.assertFalse(adapt_training_layout(output, 109))
+                self.assertFalse(adapt_training_layout(output, 39))
                 with self.assertLogs(level="WARNING"):
-                    self.assertTrue(adapt_training_layout(output, 110))
+                    self.assertTrue(adapt_training_layout(output, 40))
                 kill.assert_called_once()
                 updated = json.loads((output / "config.json").read_text())
                 counts = updated["environment"]["shape_env_counts"]
                 self.assertEqual(sum(counts), 2560)
                 self.assertTrue(all(n % 2 == 0 for n in counts))
                 self.assertGreater(counts[0], counts[1])
-                self.assertTrue((output / "sampling_110.json").exists())
-                self.assertFalse(adapt_training_layout(output, 110))
+                self.assertGreater(counts[0] - 512, 64)
+                self.assertTrue((output / "sampling_40.json").exists())
+                self.assertFalse(adapt_training_layout(output, 69))
+                curriculum["windows"] = {
+                    s: [True] * n + [False] * (1000-n)
+                    for s, n in zip(cfg.shapes, (900, 600, 600, 600, 600), strict=True)}
+                torch.save(saved, output / "checkpoint.pt")
+                with self.assertLogs(level="WARNING"):
+                    self.assertTrue(adapt_training_layout(output, 70))
+                state = json.loads((output / "config.json").read_text())["adaptive_sampling_state"]
+                for actual, expected in zip(state["failures"], (0.34, 0.24, 0.24, 0.24, 0.24)):
+                    self.assertAlmostEqual(actual, expected)
                 curriculum["level"] = 5
                 for values in curriculum["windows"].values():
                     values.clear()
                 torch.save(saved, output / "checkpoint.pt")
-                self.assertFalse(adapt_training_layout(output, 210))
+                self.assertFalse(adapt_training_layout(output, 100))
                 state = json.loads((output / "config.json").read_text())["adaptive_sampling_state"]
-                self.assertEqual(state, {"level": 5, "iteration": 210})
-                self.assertFalse(adapt_training_layout(output, 310))
+                self.assertEqual(state, {"level": 5, "iteration": 100})
+                self.assertFalse(adapt_training_layout(output, 130))
                 state = json.loads((output / "config.json").read_text())["adaptive_sampling_state"]
-                self.assertEqual(state["iteration"], 310)
-                self.assertEqual(kill.call_count, 1)
+                self.assertEqual(state["iteration"], 130)
+                self.assertEqual(kill.call_count, 2)
 
     def test_changed_sensor_bias_retains_level_but_invalidates_old_windows(self):
         cfg = InsertionCfg(noise_curriculum=True, noise_curriculum_mode="success",
