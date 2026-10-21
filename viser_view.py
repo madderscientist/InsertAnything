@@ -152,6 +152,25 @@ def geom_mesh(model: MjModel, index: int) -> trimesh.Trimesh:
     raise ValueError(f"unsupported insertion geom type: {kind}")
 
 
+def vector_arrow(vector: np.ndarray) -> np.ndarray:
+    length = np.linalg.norm(vector)
+    if length < 1e-12:
+        return np.zeros((3, 2, 3), dtype=np.float32)
+    direction = vector/length
+    basis = np.eye(3)[np.argmin(np.abs(direction))]
+    side = np.cross(direction, basis)
+    side /= np.linalg.norm(side)
+    head = min(length*0.3, 0.008)
+    base = vector-head*direction
+    return np.asarray([[np.zeros(3), vector],
+                       [vector, base+head*0.5*side],
+                       [vector, base-head*0.5*side]], dtype=np.float32)
+
+
+def visible_wrench_vector(value: np.ndarray, reference: float) -> np.ndarray:
+    return value*(0.03/reference)
+
+
 class SnapshotScene:
     def __init__(self, server: viser.ViserServer | Any, shape: str, cfg: InsertionCfg):
         self.server = server
@@ -177,8 +196,19 @@ class SnapshotScene:
         self.tip = server.scene.add_frame(f"{self.root.name}/actual_tip", axes_length=0.006, axes_radius=0.0002)
         self.goal = server.scene.add_frame(f"{self.root.name}/true_goal", axes_length=0.006, axes_radius=0.0002)
         self.hole = server.scene.add_frame(f"{self.root.name}/hole", axes_length=0.015, axes_radius=0.0002)
+        self.wrench_frame = server.scene.add_frame(
+            f"{self.root.name}/wrench", show_axes=False)
+        self.wrench_vectors = []
+        for name, color in (("force", (255, 80, 60)), ("torque", (80, 140, 255))):
+            self.wrench_vectors.append(server.scene.add_line_segments(
+                f"{self.wrench_frame.name}/{name}", vector_arrow(np.zeros(3)),
+                color, thickness=6., thickness_units="screen",
+                position=(0., 0.008 if name == "force" else -0.008, 0.)))
 
     def update(self, plant: dict) -> None:
+        wrench = np.asarray(plant["wrench"], dtype=float)
+        if wrench.shape != (6,) or not np.isfinite(wrench).all():
+            raise ValueError("viewer wrench must contain six finite components")
         self.data.qpos[:] = plant["qpos"]
         self.model.geom_pos[:] = self.base_geom_pos
         self.model.geom_pos[self.peg_ids] += np.asarray(plant["grasp_offset"])
@@ -195,6 +225,13 @@ class SnapshotScene:
             self.tip.position = self.data.qpos[:3]+rotated
             self.tip.wxyz = self.data.qpos[3:7]
             self.goal.position = np.asarray(plant["goal"])
+            mju_rotVecQuat(rotated, self.nominal_tip, self.data.qpos[3:7])
+            # 偏移显示避免不透明插头遮挡；只表达载荷方向，不代表实际作用点
+            self.wrench_frame.position = self.data.qpos[:3]+rotated+np.array([0.03, 0., 0.02])
+            self.wrench_frame.wxyz = self.data.qpos[3:7]
+            for handle, value, reference in zip(
+                    self.wrench_vectors, (wrench[:3], wrench[3:]), (5., 0.1), strict=True):
+                handle.points = vector_arrow(visible_wrench_vector(value, reference))
 
     def remove(self) -> None:
         self.root.remove()
@@ -334,7 +371,6 @@ def main() -> None:
                     f"Target depth: {-plant['goal'][2]*1000:.2f} mm  \n"
                     f"K [N/m, Nm/rad]: {np.round(plant['stiffness'], 3).tolist()}  \n"
                     f"D [Ns/m, Nms/rad]: {np.round(plant['damping'], 3).tolist()}  \n"
-                    f"Tip wrench [N, Nm]: {np.round(plant['wrench'], 4).tolist()}  \n"
                     f"Fixed grasp offset [mm]: "
                     f"{np.round(np.asarray(plant['grasp_offset'])*1000, 3).tolist()}"
                 )

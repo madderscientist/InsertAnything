@@ -25,10 +25,13 @@ from train import (ContinuousRunner, GroupedLogger, LiveInsertionEnv, TrainingSt
                    adapt_training_layout, archive_checkpoint, atomic_json, contract,
                    environment_config, health_state, load_recovery_checkpoint, main,
                    prepare_runner_config, restore_environment_progress, resume_training)
-from viser_view import SnapshotScene, replay_config, replay_index
+from viser_view import SnapshotScene, replay_config, replay_index, vector_arrow, visible_wrench_vector
 
 
 class FakeScene:
+    def add_line_segments(self, name, points, colors, **kwargs):
+        return SimpleNamespace(name=name, points=points, colors=colors)
+
     def add_mesh_simple(self, name, vertices, faces, **kwargs):
         del kwargs
         return SimpleNamespace(name=name, vertices=vertices, faces=faces, remove=lambda: None)
@@ -39,6 +42,21 @@ class FakeScene:
 
 
 class PolicyAndViewerTests(unittest.TestCase):
+    def test_vector_arrow_geometry(self):
+        np.testing.assert_array_equal(vector_arrow(np.zeros(3)), np.zeros((3, 2, 3)))
+        for vector in np.eye(3)*0.01:
+            points = vector_arrow(vector)
+            np.testing.assert_allclose(points[0, 1], vector)
+            np.testing.assert_allclose(points[1:, 0], np.tile(vector, (2, 1)))
+            self.assertTrue(np.isfinite(points).all())
+        np.testing.assert_array_equal(visible_wrench_vector(np.zeros(3), 5.), np.zeros(3))
+        np.testing.assert_allclose(visible_wrench_vector(np.array([3., -4., 0.]), 5.),
+                                   [0.018, -0.024, 0.])
+        self.assertAlmostEqual(np.linalg.norm(
+            visible_wrench_vector(np.array([1000., 0., 0.]), 5.)), 6.)
+        np.testing.assert_allclose(visible_wrench_vector(np.array([0.05, 0., 0.]), 5.),
+                                   [0.0003, 0., 0.])
+
     def setUp(self):
         torch.set_num_threads(1)
         torch.manual_seed(1)
@@ -206,10 +224,16 @@ class PolicyAndViewerTests(unittest.TestCase):
             scene = SnapshotScene(server, shape, cfg)
             grasp = np.array([0.00125, -0.002, 0.0005])
             plant = {"qpos": [0.001, -0.002, 0.06, 1., 0., 0., 0.],
-                     "grasp_offset": grasp.tolist(), "goal": [0., 0., -0.015]}
+                     "grasp_offset": grasp.tolist(), "goal": [0., 0., -0.015],
+                     "wrench": [3., -4., 0., 0., 0., 0.2]}
             scene.update(plant)
             np.testing.assert_allclose(scene.tip.position,
                                        np.array(plant["qpos"][:3]) + scene.nominal_tip + grasp)
+            np.testing.assert_allclose(scene.wrench_frame.position,
+                                       np.array(plant["qpos"][:3])+scene.nominal_tip+[0.03, 0., 0.02])
+            np.testing.assert_allclose(scene.wrench_vectors[0].points[0, 1], [0.018, -0.024, 0.])
+            np.testing.assert_allclose(scene.wrench_vectors[1].points[0, 1],
+                                       [0., 0., 0.06])
             scene.remove()
         zero = replay_config(asdict(cfg), "square", True)
         self.assertEqual(zero.force_noise, 0.)

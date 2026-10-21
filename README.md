@@ -76,6 +76,11 @@ micromamba run -n mj python train.py \
   --resume --output runs/continuous_dual
 
 # Viser 网页实时查看训练快照（CPU 正向运动学，不占用 GPU 采样）
+# 力/力矩为滤波传感器值，含惯性负载、标定和坐标变换误差；
+# 不含策略观测额外添加的随机力噪声和固定力偏差，也不是安全判定的原始子步峰值。
+# 三维场景插头旁：红色为力，蓝色为力矩轴向量（右手定则），偏移原点不代表实际作用点。
+# 箭头随工具旋转，无数值标签；长度严格线性：5 N / 0.1 N·m 对应 30 mm，
+# 不做平方根放大或长度截断；两种载荷的箭头长度不能直接比较。
 micromamba run -n mj python viser_view.py \
   --run-dir runs/continuous_dual --host 127.0.0.1 --port 8080
 
