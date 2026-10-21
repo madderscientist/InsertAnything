@@ -51,8 +51,8 @@ def completion_cost_terms(
 ) -> dict[str, torch.Tensor]:
     dt = cfg.physics_dt*cfg.decimation
     remaining = z_disp.clamp_min(0)/target_depth
-    # 平面误差与剩余深度相加后再饱和，保持孔口附近亚毫米 XY 对齐的线性梯度
-    distance = xy/(radius*cfg.xy_cost_radius_fraction) + remaining
+    # XY 单独平方以放宽中心附近探索，剩余深度保持线性
+    distance = (xy/(radius*cfg.xy_cost_radius_fraction)).square() + remaining
     distance = cfg.position_cost_cap*torch.tanh(distance/cfg.position_cost_cap)
     reference = math.radians(cfg.orientation_cost_reference_deg)
     tilt_error, yaw_error = (tilt/reference).square(), (yaw/reference).square()

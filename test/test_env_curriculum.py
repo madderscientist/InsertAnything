@@ -215,10 +215,12 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         complete_return = sum(PPO_DISCOUNT ** i * self.reward(z=-0.015, success=(i == 4))
                               for i in range(5))
         self.assertGreater(complete_return, hover_return)
-        # 孔口表面 0.2 mm 的平面修正收益必须显著大于动作成本
+        # 孔口附近保留居中收益，但平方 XY 比原线性 XY 更宽松
         mouth_delta = (float(self.terms(z=0., xy=0.)["position_penalty"])
                        - float(self.terms(z=0., xy=0.0002)["position_penalty"]))
-        self.assertGreater(mouth_delta, 0.002)
+        self.assertGreater(mouth_delta, 0.)
+        linear_delta = 0.08*(math.tanh(1.08/2)-math.tanh(1./2))
+        self.assertLess(mouth_delta, linear_delta)
         self.assertEqual(self.reward(z=0.001, tilt=5.), hover)
         self.assertLess(self.reward(z=0.001, yaw=5.), self.reward(z=0.001, tilt=5.))
         self.assertLess(float(self.terms(z=-0.013, tilt=3.)["orientation_penalty"]),
@@ -229,6 +231,15 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
                             force=1000., moment=1000., action=100., previous=-100.)
         self.assertGreaterEqual(worst, -cfg.completion_step_cost_bound)
         self.assertLess(self.reward(failure=True), -cfg.completion_step_cost_bound / (1 - PPO_DISCOUNT))
+
+    def test_squared_xy_and_linear_remaining_depth(self):
+        for xy in (0., 0.0002, 0.001, 0.0025, 0.005):
+            for z in (0.004, 0., -0.0075, -0.015, -0.02):
+                with self.subTest(xy=xy, z=z):
+                    metric = (xy/0.0025)**2 + max(z+0.015, 0.)/0.015
+                    expected = -0.08*math.tanh(metric/2.)
+                    self.assertAlmostEqual(
+                        float(self.terms(xy=xy, z=z)["position_penalty"]), expected)
 
     def test_bounded_stiffness_walk_math(self):
         initial = torch.tensor([[300., 1500., 2500., 4., 8., 12.]], dtype=torch.float64)
