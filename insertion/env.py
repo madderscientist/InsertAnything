@@ -54,12 +54,11 @@ def completion_cost_terms(
     # 平面误差与剩余深度相加后再饱和，保持孔口附近亚毫米 XY 对齐的线性梯度
     distance = xy/(radius*cfg.xy_cost_radius_fraction) + remaining
     distance = cfg.position_cost_cap*torch.tanh(distance/cfg.position_cost_cap)
-    insertion_fraction = (1-remaining).clamp(0, 1)
     reference = math.radians(cfg.orientation_cost_reference_deg)
     tilt_error, yaw_error = (tilt/reference).square(), (yaw/reference).square()
-    depth_weight = insertion_fraction.square()
-    # 入孔前保留基础倾角权重防止大倾角卡死，入孔后随深度平方增强回正约束
-    tilt_weight = cfg.preinsertion_tilt_weight + (1-cfg.preinsertion_tilt_weight)*depth_weight
+    # 倾角权重在最低点进入前 4 mm 内线性增强，与最终目标深度无关
+    tilt_progress = ((target_depth-z_disp)/0.004).clamp(0, 1)
+    tilt_weight = cfg.preinsertion_tilt_weight + (1-cfg.preinsertion_tilt_weight)*tilt_progress
     tilt_cost, yaw_cost = tilt_error/(1+tilt_error), yaw_error/(1+yaw_error)
     orientation = tilt_weight*tilt_cost + yaw_cost
     force = ((torch.linalg.vector_norm(wrench[:, :3], dim=-1)-cfg.force_cost_free_n)
@@ -348,16 +347,20 @@ class PlantGroup:
         rv[:, 2] = self.uniform(n, 1, -cfg.initial_yaw, cfg.initial_yaw)[:, 0] * self.difficulty
         return rotvec_quat(rv)
 
-    def initial_minimum_tip_height(self, q: torch.Tensor) -> torch.Tensor:
-        vertical = torch.zeros_like(q[:, 1:])
-        vertical[:, 2] = 1.
-        local_vertical = rotate(quat_inv(q), vertical)
+    def minimum_peg_height_offset(self, q: torch.Tensor) -> torch.Tensor:
+        # 单位四元数旋转矩阵的第三行，即孔 Z 轴在插头坐标系中的方向
+        w, x, y, z = q.unbind(dim=-1)
+        local_vertical = torch.stack((2*(x*z-w*y), 2*(y*z+w*x),
+                                      1-2*(x.square()+y.square())), dim=-1)
         if self.shape == "circle":
             radial_minimum = -(self.geometry.radius-self.clearance/2) * torch.linalg.vector_norm(
                 local_vertical[:, :2], dim=-1)
         else:
             radial_minimum = (local_vertical[:, :2] @ self.peg_polygon.T).amin(dim=-1)
-        lowest = radial_minimum + (local_vertical[:, 2]*self.geometry.peg_length).clamp_max(0)
+        return radial_minimum + (local_vertical[:, 2]*self.geometry.peg_length).clamp_max(0)
+
+    def initial_minimum_tip_height(self, q: torch.Tensor) -> torch.Tensor:
+        lowest = self.minimum_peg_height_offset(q)
         return (self.cfg.initial_plane_margin-lowest).clamp_min(self.cfg.initial_z_min)
 
     def state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -597,7 +600,8 @@ class PlantGroup:
         tip = tip_pose(pos, q, self.offset)
         xy = torch.linalg.vector_norm(tip[:, :2], dim=-1)
         tilt, yaw = self.alignment(q)
-        z_disp = tip[:, 2] - self.goal[:, 2]
+        lowest_z = tip[:, 2] + self.minimum_peg_height_offset(q)
+        z_disp = lowest_z - self.goal[:, 2]
         success = tip[:, 2] <= self.goal[:, 2] + 0.0002
         if cfg.success_alignment_required:
             success = (success & (xy < self.clearance * 0.4)

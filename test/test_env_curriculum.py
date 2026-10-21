@@ -13,7 +13,7 @@ import torch
 
 from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
                        SuccessNoiseCurriculum, TRAIN_SHAPES, bounded_stiffness_step,
-                       completion_cost_terms, quat_rotvec, tip_pose)
+                       completion_cost_terms, geometry, quat_rotvec, tip_pose)
 from insertion.curriculum import adaptive_environment_counts
 from insertion.transforms import rotvec_quat
 from insertion.env import PlantGroup
@@ -61,6 +61,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             peak_force=torch.zeros(1), peak_moment=torch.zeros(1),
             wrench=torch.zeros(1, 6), last_action=torch.zeros(1, 6),
             alignment=lambda q: (torch.tensor([0.01]), torch.tensor([0.02])),
+            minimum_peg_height_offset=lambda q: torch.zeros(q.shape[0]),
         )
         position = torch.tensor([[0.0001, 0., -0.015]])
         quaternion = torch.tensor([[1., 0., 0., 0.]])
@@ -95,6 +96,17 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         position[:, 0] = 0.026
         _, _, info = PlantGroup.step_outcome(group, actions)
         self.assertEqual(info["reason"].item(), 3)
+        position[:, 0] = 0
+        position[:, 2] = -0.0147
+        group.hold.zero_()
+        group.minimum_peg_height_offset = lambda q: torch.full((q.shape[0],), -0.001)
+        _, done, _ = PlantGroup.step_outcome(group, actions)
+        self.assertFalse(done.item())
+        self.assertEqual(group.hold.item(), 0)
+        self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
+        expected = self.terms(z=-0.0157, tilt=math.degrees(0.01), yaw=math.degrees(0.02))
+        for key in ("position_penalty", "orientation_penalty"):
+            self.assertAlmostEqual(float(group.last_reward_terms[key]), float(expected[key]))
 
     def test_adaptive_counts_preserve_total_mixture_and_device_shards(self):
         for unit in (1, 2, 4, 8):
@@ -140,6 +152,51 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
     def reward(self, **values):
         return float(sum(self.terms(**values).values()))
 
+    def test_zero_preinsertion_tilt_cost_and_depth_ramp(self):
+        self.assertEqual(InsertionCfg().preinsertion_tilt_weight, 0.)
+        for z in (0.004, 0.):
+            self.assertEqual(float(self.terms(z=z, tilt=10.)["orientation_penalty"]), 0.)
+        for depth in (0.005, 0.015, 0.0225):
+            for inserted_mm in (0., 1., 2., 3., 4., 6.):
+                with self.subTest(depth=depth, inserted_mm=inserted_mm):
+                    penalty = self.terms(
+                        z=-inserted_mm*0.001, depth=depth, tilt=5.)["orientation_penalty"]
+                    weight = min(inserted_mm/4., 1.)
+                    self.assertAlmostEqual(float(penalty), -0.01*weight)
+            expected = -0.02*2.*2.*math.tanh(((depth-0.002)/depth)/2.)
+            self.assertAlmostEqual(
+                float(self.terms(z=-0.002, depth=depth)["position_penalty"]), expected)
+        for z in (0.004, 0., -0.0075, -0.015):
+            self.assertAlmostEqual(
+                float(self.terms(z=z, yaw=5.)["orientation_penalty"]), -0.01)
+        saved = InsertionCfg.from_checkpoint({"preinsertion_tilt_weight": 0.25})
+        self.assertEqual(saved.preinsertion_tilt_weight, 0.25)
+
+    def test_minimum_peg_height_matches_geometry(self):
+        q = rotvec_quat(torch.tensor([
+            [0., 0., 0.], [0.2, -0.3, 0.4], [math.pi, 0., 0.]],
+            dtype=torch.float64))
+        for shape in (*TRAIN_SHAPES, "circle"):
+            with self.subTest(shape=shape):
+                g = geometry(shape)
+                group = SimpleNamespace(
+                    shape=shape, geometry=g, clearance=g.clearance,
+                    peg_polygon=torch.tensor(g.peg_polygon, dtype=q.dtype))
+                actual = PlantGroup.minimum_peg_height_offset(group, q)
+                if shape == "circle":
+                    angles = torch.arange(8192, dtype=q.dtype)*2*math.pi/8192
+                    polygon = (g.radius-g.clearance/2)*torch.stack(
+                        (angles.cos(), angles.sin()), dim=-1)
+                else:
+                    polygon = group.peg_polygon
+                bottom = torch.cat((polygon, torch.zeros(len(polygon), 1, dtype=q.dtype)), dim=-1)
+                vertices = torch.cat((bottom, bottom + bottom.new_tensor([0., 0., g.peg_length])))
+                expected = tip_pose(
+                    torch.zeros_like(vertices), q[:, None, :], vertices[None, :, :])[:, :, 2].amin(-1)
+                torch.testing.assert_close(actual, expected, atol=1e-9, rtol=0)
+                self.assertAlmostEqual(float(actual[0]), 0.)
+                self.assertLess(float(actual[1]), 0.)
+
     def test_quadratic_load_cost_and_retired_checkpoint_field(self):
         self.assertAlmostEqual(float(self.terms(force=20.)["force_penalty"]), -0.0072)
         self.assertAlmostEqual(float(self.terms(force=17.5)["force_penalty"]),
@@ -162,7 +219,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         mouth_delta = (float(self.terms(z=0., xy=0.)["position_penalty"])
                        - float(self.terms(z=0., xy=0.0002)["position_penalty"]))
         self.assertGreater(mouth_delta, 0.002)
-        self.assertLess(self.reward(z=0.001, tilt=5.), hover)
+        self.assertEqual(self.reward(z=0.001, tilt=5.), hover)
         self.assertLess(self.reward(z=0.001, yaw=5.), self.reward(z=0.001, tilt=5.))
         self.assertLess(float(self.terms(z=-0.013, tilt=3.)["orientation_penalty"]),
                         float(self.terms(z=-0.002, tilt=3.)["orientation_penalty"]))

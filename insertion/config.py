@@ -73,7 +73,7 @@ class InsertionCfg:
     xy_cost_radius_fraction: float = 0.25
     orientation_cost_per_second: float = 1.0
     orientation_cost_reference_deg: float = 5.0
-    preinsertion_tilt_weight: float = 0.25
+    preinsertion_tilt_weight: float = 0.0
     force_cost_per_second: float = 1.0
     moment_cost_per_second: float = 1.0
     force_cost_free_n: float = 5.0
