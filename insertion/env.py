@@ -88,17 +88,8 @@ class PlantGroup:
         self.cfg, self.device, self.n = cfg, device, cfg.envs_per_shape
         self.last_reward_terms: dict[str, torch.Tensor] = {}
         self.clearance = cfg.active_clearance_levels[0]
-        self.geometry = geometry(shape, self.clearance, cfg.scale)
         self.shape = shape
-        self.model = build_model(self.geometry)
-        self.body_id = self.model.body("tool").id
-        self.sim = Simulation(
-            self.n, SimulationCfg(nconmax=128, njmax=512,
-                                 mujoco=MujocoCfg(timestep=cfg.physics_dt, gravity=(0, 0, 0),
-                                                 iterations=50, ls_iterations=20)),
-            model=self.model, device=device,
-        )
-        self.sim.expand_model_fields(("body_mass", "body_inertia", "geom_friction", "geom_pos"))
+        self._build_simulation()
         self.generator = torch.Generator(device=device).manual_seed(
             cfg.seed + ALL_SHAPES.index(shape) * 10007)
         self.difficulty = 0.25 if cfg.training else 1.0
@@ -108,13 +99,6 @@ class PlantGroup:
         self.nominal_offset = torch.tensor([0, 0, -0.05 * cfg.scale],
                                            device=device).expand(self.n, 3)
         self.offset = self.nominal_offset.clone()
-        self.peg_ids = torch.as_tensor(
-            (self.model.geom_bodyid == self.body_id).nonzero()[0], device=device)
-        self.peg_geom_ids = self.peg_ids.tolist()
-        self.default_geom_pos = torch.tensor(self.model.geom_pos, device=device,
-                                              dtype=torch.float32)
-        self.peg_polygon = torch.tensor(
-            self.geometry.peg_polygon, dtype=torch.float32, device=device)
         self.sensor_offset = torch.tensor([0, 0, 0.03 * cfg.scale],
                                           device=device).expand(self.n, 3)
         self.identity = torch.tensor([1., 0, 0, 0], device=device).expand(self.n, 4)
@@ -172,6 +156,24 @@ class PlantGroup:
         self.physics_graph_signature: tuple[int, float, str, float, float, float, float] | None = None
         self.reset(torch.arange(self.n, device=device))
 
+    def _build_simulation(self) -> None:
+        cfg = self.cfg
+        self.geometry = geometry(self.shape, self.clearance, cfg.scale, cfg.circle_sides)
+        self.model = build_model(self.geometry)
+        self.body_id = self.model.body("tool").id
+        self.sim = Simulation(
+            self.n, SimulationCfg(nconmax=64, njmax=256,
+                                 mujoco=MujocoCfg(timestep=cfg.physics_dt, gravity=(0, 0, 0),
+                                                 iterations=50, ls_iterations=20)),
+            model=self.model, device=self.device,
+        )
+        self.sim.expand_model_fields(("body_mass", "body_inertia", "geom_friction", "geom_pos"))
+        self.peg_geom_ids = (self.model.geom_bodyid == self.body_id).nonzero()[0].tolist()
+        self.default_geom_pos = torch.tensor(
+            self.model.geom_pos, device=self.device, dtype=torch.float32)
+        self.peg_polygon = torch.tensor(
+            self.geometry.peg_polygon, dtype=torch.float32, device=self.device)
+
     def uniform(self, n: int, columns: int, low: float, high: float) -> torch.Tensor:
         return low + (high - low) * torch.rand(n, columns, generator=self.generator,
                                              device=self.device)
@@ -188,23 +190,7 @@ class PlantGroup:
         qvel = self.sim.data.qvel[:].clone()
         friction = self.sim.model.geom_friction[:, :, 0].clone()
         self.clearance = clearance
-        self.geometry = geometry(self.shape, clearance, self.cfg.scale)
-        self.model = build_model(self.geometry)
-        self.body_id = self.model.body("tool").id
-        self.sim = Simulation(
-            self.n, SimulationCfg(nconmax=128, njmax=512,
-                                 mujoco=MujocoCfg(timestep=self.cfg.physics_dt, gravity=(0, 0, 0),
-                                                 iterations=50, ls_iterations=20)),
-            model=self.model, device=self.device,
-        )
-        self.sim.expand_model_fields(("body_mass", "body_inertia", "geom_friction", "geom_pos"))
-        self.peg_ids = torch.as_tensor(
-            (self.model.geom_bodyid == self.body_id).nonzero()[0], device=self.device)
-        self.peg_geom_ids = self.peg_ids.tolist()
-        self.default_geom_pos = torch.tensor(self.model.geom_pos, device=self.device,
-                                              dtype=torch.float32)
-        self.peg_polygon = torch.tensor(
-            self.geometry.peg_polygon, dtype=torch.float32, device=self.device)
+        self._build_simulation()
         self.sim.model.body_mass[:, self.body_id] = self.mass[:, 0]
         self.sim.model.body_inertia[:, self.body_id] = self.inertia
         self.sim.model.geom_friction[:, :, 0] = friction
@@ -673,6 +659,8 @@ class InsertionEnv(VecEnv):
             SuccessNoiseCurriculum(cfg.shapes, cfg.active_clearance_levels, noise_levels)
             if use_success_curriculum else None)
         self.curriculum_pending: list[torch.Tensor] = []
+        self.curriculum_cohort: torch.Tensor | None = None
+        self.curriculum_cohort_seen: torch.Tensor | None = None
         self.curriculum_distributed = False
         self.curriculum_rollout_steps = 256
         self.curriculum_shape_ids = torch.cat([
@@ -686,8 +674,22 @@ class InsertionEnv(VecEnv):
         if self.noise_curriculum is None or not self.curriculum_pending:
             return {}
         # 每个 rollout 边界统一汇总一次回合结果，不在单步内频繁同步
-        outcomes = torch.cat(self.curriculum_pending)
+        batches = tuple(self.curriculum_pending)
+        outcomes = torch.cat(batches)
         self.curriculum_pending.clear()
+        if self.curriculum_cohort is None:
+            self.curriculum_cohort = torch.zeros_like(batches[0])
+            self.curriculum_cohort_seen = torch.zeros(
+                len(batches[0]), dtype=torch.bool, device=outcomes.device)
+        cohort = self.curriculum_cohort
+        seen = self.curriculum_cohort_seen
+        assert seen is not None
+        # Each environment contributes once; wait for slow failures as well as fast successes.
+        for batch in batches:
+            selected = batch[:, 1].bool() & batch[:, 3].bool() & ~seen
+            cohort[selected] = batch[selected]
+            seen |= selected
+        complete = bool(seen.all())
         shapes = tuple(self.noise_curriculum.windows)
         recent = {}
         logs = {}
@@ -696,12 +698,14 @@ class InsertionEnv(VecEnv):
             completed = outcomes[ended, 2].bool()
             logs[f"success/{shape}"] = (completed.float().mean() if completed.numel()
                                         else outcomes.new_tensor(0., dtype=torch.float32))
-            eligible = ended & outcomes[:, 3].bool()
-            recent[shape] = outcomes[eligible, 2].bool().cpu().tolist()
+            eligible = (cohort[:, 0] == index) & seen
+            recent[shape] = cohort[eligible, 2].bool().cpu().tolist() if complete else []
         previous_scale = self.noise_curriculum.scale
         previous_clearance = self.noise_curriculum.clearance
         previous_difficulty = self.noise_curriculum.difficulty
-        upgraded = self.noise_curriculum.update(recent)
+        upgraded = self.noise_curriculum.update(recent) if complete else False
+        if complete:
+            seen.zero_()
         if upgraded:
             logging.info(
                 "Success curriculum level %d: clearance %.2f -> %.2f mm, "

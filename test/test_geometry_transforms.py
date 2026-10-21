@@ -60,11 +60,57 @@ class GeometryAndTransformTests(unittest.TestCase):
             {"decimation": 10}, {"target_depth_min_m": 0},
             {"target_depth_max_fraction": 1}, {"target_depth_min_m": 0.023},
             {"scale": 0.1}, {"fixed_target_depth_m": 0.025},
+            {"circle_sides": 2}, {"circle_sides": 64.5},
             {"clearance_curriculum": True, "clearance": 0.003},
         )
         for values in invalid_cases:
             with self.subTest(values=values), self.assertRaises(ValueError):
                 InsertionCfg(**values)
+
+    def test_square_uses_boxes_with_exact_inner_clearance(self):
+        for scale, clearance in ((1., 0.0001), (0.8, 0.0005), (1.2, 0.002)):
+            with self.subTest(scale=scale, clearance=clearance):
+                g = geometry("square", clearance, scale)
+                model = build_model(g)
+                self.assertEqual(model.ngeom, 5)
+                self.assertEqual(model.nmesh, 0)
+                self.assertTrue(np.all(model.geom_type == mjtGeom.mjGEOM_BOX))
+                np.testing.assert_allclose(
+                    model.geom("peg").size,
+                    [g.radius/math.sqrt(2)-clearance/2]*2 + [g.peg_length/2])
+                data = MjData(model)
+                data.qpos[:3] = [0, 0, 0.04*scale]
+                data.qpos[3:] = [1, 0, 0, 0]
+                mj_forward(model, data)
+                self.assertEqual(data.ncon, 0)
+                for angle in np.arange(4)*math.pi/2 + math.pi/4:
+                    direction = np.array([math.cos(angle), math.sin(angle)])
+                    for penetration in (-2e-6, 2e-6):
+                        data.qpos[:2] = direction*(clearance/2 + penetration)
+                        mj_forward(model, data)
+                        if penetration < 0:
+                            self.assertEqual(data.ncon, 0)
+                        else:
+                            self.assertGreater(data.ncon, 0)
+                            self.assertAlmostEqual(
+                                min(c.dist for c in data.contact), -penetration, places=9)
+
+    def test_explicit_circle_resolution(self):
+        g = geometry("circle", 0.0002, circle_sides=64)
+        self.assertEqual(len(g.hole_polygon), 64)
+        self.assertAlmostEqual(g.circle_error, 0.01 * (1 - math.cos(math.pi / 64)))
+        self.assertAlmostEqual((g.clearance / 2 - g.circle_error) * 1e6, 87.954562, places=5)
+        model = build_model(g)
+        self.assertAlmostEqual(model.geom("peg").size[0], 0.0099)
+        data = MjData(model)
+        data.qpos[:3] = [0, 0, 0.04]
+        data.qpos[3:] = [1, 0, 0, 0]
+        mj_forward(model, data)
+        self.assertEqual(data.ncon, 0)
+        with self.assertRaisesRegex(ValueError, "closes"):
+            geometry("circle", 0.00002, circle_sides=64)
+        with self.assertRaises(ValueError):
+            geometry("circle", circle_sides=2)
 
     def test_quaternion_rotvec_and_tip_pivot(self):
         q = rotvec_quat(torch.tensor([[0.2, -0.4, 0.5], [0., math.pi, 0.]], dtype=torch.float64))

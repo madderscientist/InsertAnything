@@ -20,6 +20,35 @@ from insertion.env import PlantGroup
 
 
 class RewardAndCurriculumUnitTests(unittest.TestCase):
+    def test_curriculum_waits_for_full_cohort_including_slow_failures(self):
+        curriculum = SuccessNoiseCurriculum(("square",))
+        env = SimpleNamespace(
+            noise_curriculum=curriculum, curriculum_pending=[], groups=[],
+            curriculum_cohort=None, curriculum_cohort_seen=None)
+        batch = torch.zeros(1000, 4)
+        batch[:, 3] = 1
+        batch[:799, 1:3] = 1
+        env.curriculum_pending.append(batch.clone())
+        InsertionEnv.advance_noise_curriculum(env)
+        self.assertEqual(len(curriculum.windows["square"]), 0)
+        # Repeated successes from fast environments must not displace slow failures.
+        env.curriculum_pending.append(batch.clone())
+        InsertionEnv.advance_noise_curriculum(env)
+        self.assertEqual(len(curriculum.windows["square"]), 0)
+        batch[:, 1:3] = 0
+        batch[799:, 1] = 1
+        env.curriculum_pending.append(batch.clone())
+        InsertionEnv.advance_noise_curriculum(env)
+        self.assertEqual(len(curriculum.windows["square"]), 1000)
+        self.assertEqual(sum(curriculum.windows["square"]), 799)
+        self.assertEqual(curriculum.level, 0)
+        self.assertFalse(env.curriculum_cohort_seen.any())
+        batch[:, 1:3] = 1
+        env.curriculum_pending.append(batch.clone())
+        InsertionEnv.advance_noise_curriculum(env)
+        self.assertEqual(curriculum.level, 1)
+        self.assertEqual(len(curriculum.windows["square"]), 0)
+
     def test_depth_success_hold_reset_safety_and_legacy_alignment(self):
         cfg = InsertionCfg()
         self.assertFalse(cfg.success_alignment_required)
@@ -324,15 +353,20 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         env = InsertionEnv(cfg, self.device)
         group = env.groups[0]
         self.assertEqual(group.clearance, 0.002)
+        self.assertEqual(group.sim.wp_data.naconmax, group.n * 64)
+        self.assertEqual(group.sim.wp_data.njmax, 256)
         self.assertAlmostEqual(group.difficulty, 0.25)
         env.step(torch.zeros(4, 6, device=self.device))
         self.assertIsNotNone(group.physics_rollout_graph)
         self.assertIsNotNone(group.reset_constants_graph)
         self.assertIsNotNone(group.action_graph)
         self.assertIsNotNone(group.outcome_graph)
-        env.record_curriculum_outcomes(torch.tensor([[0., 1., 1., 1.]] * 1000, device=self.device))
+        env.noise_curriculum.windows["square"].extend([True] * 996)
+        env.record_curriculum_outcomes(torch.tensor([[0, 1, 1, 1]] * 4, device=self.device))
         logs = env.advance_noise_curriculum()
         self.assertEqual(group.clearance, 0.001)
+        self.assertEqual(group.sim.wp_data.naconmax, group.n * 64)
+        self.assertEqual(group.sim.wp_data.njmax, 256)
         self.assertIsNone(group.physics_rollout_graph)
         self.assertIsNone(group.reset_constants_graph)
         self.assertIsNone(group.action_graph)

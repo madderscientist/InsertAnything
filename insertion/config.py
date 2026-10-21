@@ -25,6 +25,7 @@ class InsertionCfg:
     observation_cuda_graph: bool = False
     episode_seconds: float = 8.0
     clearance: float = 0.0001
+    circle_sides: int | None = None
     clearance_curriculum: bool = False
     clearance_levels: tuple[float, ...] = CLEARANCE_CURRICULUM_LEVELS
     scale: float = 1.0
@@ -84,6 +85,9 @@ class InsertionCfg:
     timeout_penalty: float = 10.0
 
     def __post_init__(self) -> None:
+        if self.circle_sides is not None and (
+                type(self.circle_sides) is not int or self.circle_sides < 3):
+            raise ValueError("circle_sides must be an integer >= 3 or None")
         self.shapes = tuple(self.shapes)
         if not self.shapes or any(s not in ALL_SHAPES for s in self.shapes):
             raise ValueError(f"shapes must belong to {ALL_SHAPES}")

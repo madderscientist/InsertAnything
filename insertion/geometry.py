@@ -33,7 +33,8 @@ def inset_polygon(p: np.ndarray, distance: float) -> np.ndarray:
                      for i in range(len(p))])
 
 
-def geometry(shape: str, clearance: float = 0.0001, scale: float = 1) -> Geometry:
+def geometry(shape: str, clearance: float = 0.0001, scale: float = 1,
+             circle_sides: int | None = None) -> Geometry:
     if shape not in ALL_SHAPES:
         raise ValueError(f"unsupported shape {shape}")
     r, c = 0.01 * scale, clearance / 2
@@ -49,8 +50,14 @@ def geometry(shape: str, clearance: float = 0.0001, scale: float = 1) -> Geometr
         n = sides.get(shape, 0)
         if shape == "circle":
             # 控制圆形多边形孔壁的弦高误差不超过单侧间隙的 5%
-            n = max(128, math.ceil(math.pi / math.acos(1 - c * 0.05 / r)))
+            if circle_sides is not None and (
+                    type(circle_sides) is not int or circle_sides < 3):
+                raise ValueError("circle_sides must be an integer >= 3 or None")
+            n = (circle_sides if circle_sides is not None else
+                 max(128, math.ceil(math.pi / math.acos(1 - c * 0.05 / r))))
             error = r * (1 - math.cos(math.pi / n))
+            if error >= c:
+                raise ValueError("circle polygon approximation closes the radial clearance")
         angles = np.arange(n) * 2 * math.pi / n + math.pi / 2
         p = r * np.column_stack((np.cos(angles), np.sin(angles)))
         peg = inset_polygon(p, c)
@@ -58,11 +65,15 @@ def geometry(shape: str, clearance: float = 0.0001, scale: float = 1) -> Geometr
 
 
 def _box(parent: ET.Element, name: str, low: np.ndarray, high: np.ndarray,
-         z_low: float, z_high: float, color: str) -> None:
+         z_low: float, z_high: float, color: str, yaw: float = 0.0) -> None:
     center = np.r_[(low + high) / 2, (z_low + z_high) / 2]
     size = np.r_[(high - low) / 2, (z_high - z_low) / 2]
+    x, y = center[:2]
+    center[:2] = (math.cos(yaw)*x - math.sin(yaw)*y,
+                  math.sin(yaw)*x + math.cos(yaw)*y)
     ET.SubElement(parent, "geom", name=name, type="box",
                   pos=" ".join(map(str, center)), size=" ".join(map(str, size)),
+                  quat=f"{math.cos(yaw/2)} 0 0 {math.sin(yaw/2)}",
                   rgba=color)
 
 
@@ -85,7 +96,19 @@ def model_xml(g: Geometry) -> str:
     ET.SubElement(world, "light", pos="0 0 0.2")
     hole = ET.SubElement(world, "body", name="hole")
     r, outer = g.radius, g.radius * 2
-    if g.shape == "l":
+    if g.shape == "square":
+        a = r / math.sqrt(2)
+        # Tile the square annulus without overlapping wall volumes.
+        bounds = (
+            ([-2*a, -2*a], [-a, 2*a]),
+            ([a, -2*a], [2*a, 2*a]),
+            ([-a, -2*a], [a, -a]),
+            ([-a, a], [a, 2*a]),
+        )
+        for i, (low, high) in enumerate(bounds):
+            _box(hole, f"wall_{i}", np.array(low), np.array(high),
+                 -g.depth, 0, "0.5 0.5 0.6 1", yaw=math.pi/4)
+    elif g.shape == "l":
         _box(hole, "wall_left", np.array([-outer, -outer]), np.array([-r, outer]),
              -g.depth, 0, "0.5 0.5 0.6 1")
         _box(hole, "wall_right", np.array([r, -outer]), np.array([outer, outer]),
@@ -109,7 +132,11 @@ def model_xml(g: Geometry) -> str:
                   diaginertia="0.003 0.003 0.002")
     # 刚体原点为等效质心，位于名义插头尖端上方 50 mm
     tip_z = -0.05 * g.radius / 0.01
-    if g.shape == "l":
+    if g.shape == "square":
+        a = r / math.sqrt(2) - g.clearance / 2
+        _box(body, "peg", np.array([-a, -a]), np.array([a, a]),
+             tip_z, tip_z + g.peg_length, "0.8 0.6 0.1 1", yaw=math.pi/4)
+    elif g.shape == "l":
         c = g.clearance / 2
         _box(body, "peg_bottom", np.array([-r+c, -r+c]), np.array([r-c, -c]),
              tip_z, tip_z + g.peg_length, "0.8 0.6 0.1 1")

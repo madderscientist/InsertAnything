@@ -155,7 +155,7 @@ def geom_mesh(model: MjModel, index: int) -> trimesh.Trimesh:
 class SnapshotScene:
     def __init__(self, server: viser.ViserServer | Any, shape: str, cfg: InsertionCfg):
         self.server = server
-        self.model = build_model(geometry(shape, cfg.clearance, cfg.scale))
+        self.model = build_model(geometry(shape, cfg.clearance, cfg.scale, cfg.circle_sides))
         self.data = MjData(self.model)
         self.base_geom_pos = self.model.geom_pos.copy()
         self.tool_id = self.model.body("tool").id

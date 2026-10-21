@@ -1,9 +1,11 @@
-"""导出确定性有状态 TorchScript 策略并验证序列数值等价性与推理延迟"""
+"""导出确定性 TorchScript / ONNX 策略并验证序列数值等价性与推理延迟"""
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
+import shutil
 import time
 
 import numpy as np
@@ -12,6 +14,93 @@ from tensordict import TensorDict
 
 from evaluate import load_checkpoint
 from insertion import action_target, actor_observation, rotate, transform_wrench
+from insertion.transforms import rotvec_quat
+
+
+@torch.inference_mode()
+def export_onnx(checkpoint: Path, output: Path, samples: int = 500) -> dict:
+    import onnx
+    import onnxruntime as ort
+
+    if samples < 100:
+        raise ValueError("at least 100 samples required for sequence and latency validation")
+    metadata, actor = load_checkpoint(checkpoint, "cpu")
+    actor.eval()
+    model = actor.as_onnx().eval()
+    output.mkdir(parents=True, exist_ok=False)
+    path = output / "actor.onnx"
+    torch.onnx.export(
+        model, model.get_dummy_inputs(), str(path), input_names=model.input_names,
+        output_names=model.output_names, opset_version=17, dynamo=False,
+    )
+    onnx.checker.check_model(onnx.load(str(path)))
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    session = ort.InferenceSession(str(path), sess_options=options,
+                                   providers=["CPUExecutionProvider"])
+    rng = np.random.default_rng(17)
+    hidden = np.zeros((2, 1, 128), dtype=np.float32)
+    actor.reset()
+    max_action_error = max_hidden_error = 0.
+    elapsed = []
+    test_observations, test_actions, test_states = [], [], []
+    for index in range(samples):
+        if index % 37 == 0:
+            hidden.fill(0)
+            actor.reset()
+        position = torch.from_numpy(rng.uniform(-0.01, 0.01, (1, 3)).astype(np.float32))
+        quaternion = rotvec_quat(torch.from_numpy(
+            rng.uniform(-0.35, 0.35, (1, 3)).astype(np.float32)))
+        goal_quaternion = torch.tensor([[1., 0., 0., 0.]])
+        goal = torch.tensor([[0., 0., -0.015]])
+        wrench = torch.from_numpy((rng.normal(size=(1, 6)) *
+                                  [2., 2., 2., 0.05, 0.05, 0.05]).astype(np.float32))
+        obs = actor_observation(position, quaternion, goal, goal_quaternion, wrench)
+        expected = actor(TensorDict({"actor": obs}, [1])).numpy()
+        expected_hidden = actor.get_hidden_state().numpy()
+        start = time.perf_counter_ns()
+        actions, hidden = session.run(None, {"obs": obs.numpy(), "h_in": hidden})
+        elapsed.append((time.perf_counter_ns()-start)/1e6)
+        np.testing.assert_allclose(actions, expected, rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(hidden, expected_hidden, rtol=1e-4, atol=1e-5)
+        max_action_error = max(max_action_error, float(np.max(np.abs(actions-expected))))
+        max_hidden_error = max(max_hidden_error, float(np.max(np.abs(hidden-expected_hidden))))
+        test_observations.append(obs.numpy().copy())
+        test_actions.append(expected.copy())
+        test_states.append(expected_hidden.copy())
+    source = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    contract = {
+        **metadata["contract"],
+        "onnx": {
+            "inputs": {"obs": [1, 13], "h_in": [2, 1, 128]},
+            "outputs": {"actions": [1, 6], "h_out": [2, 1, 128]},
+            "dtype": "float32", "batch_size": 1, "deterministic": True,
+            "normalization_in_model": True, "action_clipping_in_model": False,
+            "preprocessing_in_model": False, "safety_checks_in_model": False,
+        },
+        "source": {
+            "checkpoint": str(checkpoint.resolve()), "iteration": source["iter"],
+            "sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            "curriculum_level": metadata.get("noise_curriculum_state", {}).get("level"),
+            "environment": metadata["environment"],
+        },
+    }
+    report = {
+        "sequence_samples": samples, "resets_every": 37,
+        "action_max_absolute_error": max_action_error,
+        "hidden_max_absolute_error": max_hidden_error,
+        "p50_ms": float(np.median(elapsed)), "p99_ms": float(np.percentile(elapsed, 99)),
+        "includes_robot_io": False, "device": "cpu",
+        "onnx_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    (output / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
+    (output / "validation.json").write_text(json.dumps(report, indent=2) + "\n")
+    np.savez_compressed(
+        output / "test_vectors.npz", obs=np.stack(test_observations),
+        actions=np.stack(test_actions), h_out=np.stack(test_states),
+        reset=(np.arange(samples) % 37 == 0))
+    shutil.copy2(Path(__file__).with_name("DEPLOYMENT_ONNX.md"), output / "DEPLOYMENT_ONNX.md")
+    return report
 
 
 class OfflinePolicy:
@@ -114,9 +203,12 @@ def main() -> None:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--output", type=Path, default=Path("runs/export"))
     parser.add_argument("--samples", type=int, default=500)
+    parser.add_argument("--onnx", action="store_true",
+                        help="export deterministic batch-one ONNX with explicit GRU state")
     args = parser.parse_args()
     torch.set_num_threads(1)
-    print(json.dumps(export(args.checkpoint, args.output, args.samples), indent=2))
+    exporter = export_onnx if args.onnx else export
+    print(json.dumps(exporter(args.checkpoint, args.output, args.samples), indent=2))
 
 
 if __name__ == "__main__":

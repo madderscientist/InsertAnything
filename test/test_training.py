@@ -3,6 +3,7 @@
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import asdict
 import io
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -15,7 +16,7 @@ import torch
 from tensordict import TensorDict
 from rsl_rl.models import RNNModel
 
-from export_policy import OfflinePolicy
+from export_policy import OfflinePolicy, export_onnx
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv, SuccessNoiseCurriculum, runner_config
 from insertion.distributed import run_distributed, validate_layout
 from train import (ContinuousRunner, GroupedLogger, LiveInsertionEnv, TrainingStopped,
@@ -43,6 +44,29 @@ class PolicyAndViewerTests(unittest.TestCase):
         cfg.pop("class_name")
         obs = TensorDict({"actor": torch.zeros(2, 13)}, [2])
         self.actor = RNNModel(obs, {"actor": ["actor"]}, "actor", 6, **cfg).eval()
+
+    @unittest.skipUnless(importlib.util.find_spec("onnx") and importlib.util.find_spec("onnxruntime"),
+                         "requires optional ONNX export dependencies")
+    def test_onnx_export_contract_recurrent_equivalence_and_vectors(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cfg = InsertionCfg()
+            checkpoint = root / "checkpoint.pt"
+            torch.save({"iter": 42, "actor_state_dict": self.actor.state_dict(),
+                        "infos": {"environment": asdict(cfg), "runner": runner_config(),
+                                  "contract": contract(cfg)}}, checkpoint)
+            output = root / "onnx"
+            report = export_onnx(checkpoint, output, 100)
+            self.assertLess(report["action_max_absolute_error"], 1e-5)
+            manifest = json.loads((output / "contract.json").read_text())
+            self.assertEqual(manifest["source"]["iteration"], 42)
+            self.assertEqual(manifest["onnx"]["inputs"], {"obs": [1, 13], "h_in": [2, 1, 128]})
+            self.assertFalse(manifest["onnx"]["safety_checks_in_model"])
+            with np.load(output / "test_vectors.npz") as vectors:
+                self.assertEqual(vectors["obs"].shape, (100, 1, 13))
+                self.assertEqual(vectors["h_out"].shape, (100, 2, 1, 128))
+                self.assertEqual(np.flatnonzero(vectors["reset"]).tolist(), [0, 37, 74])
+            self.assertTrue((output / "DEPLOYMENT_ONNX.md").is_file())
 
     @torch.inference_mode()
     def test_masked_reset_and_exported_guards(self):
