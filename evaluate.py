@@ -1,6 +1,7 @@
 """冻结策略的多条件泛化评估，不按测试条件缩放动作幅度"""
 
 import argparse
+import copy
 import csv
 from dataclasses import replace
 import json
@@ -21,7 +22,7 @@ def load_checkpoint(path: Path, device: str) -> tuple[dict, RNNModel]:
     metadata = saved["infos"]
     if metadata["contract"]["version"] != 1:
         raise ValueError("unsupported policy contract")
-    config = dict(metadata["runner"]["actor"])
+    config = copy.deepcopy(metadata["runner"]["actor"])
     config.pop("class_name")
     config.pop("cnn_cfg", None)
     dummy = TensorDict({"actor": torch.zeros(1, 13, device=device)}, [1])

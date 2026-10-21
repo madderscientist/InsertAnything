@@ -251,7 +251,7 @@ def runner_config(steps: int = 256) -> dict:
             class_name="RNNModel", rnn_type="gru", rnn_hidden_dim=128,
             rnn_num_layers=2, hidden_dims=(128, 64), activation="elu",
             obs_normalization=True,
-            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.4,
+            distribution_cfg={"class_name": "HeteroscedasticGaussianDistribution", "init_std": 0.4,
                               "std_type": "log", "std_range": (0.02, 1.0)},
         ),
         critic=RslRlModelCfg(

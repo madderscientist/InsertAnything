@@ -220,9 +220,29 @@ X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
   2. 规范化相对四元数 `inverse(current) * target`（4 维，消除 `q/-q` 双重覆盖）
   3. `T` 系中关于名义尖端的重力补偿后滤波力旋量 `wrench`（6 维）
 - **Critic 特权输入（57 维）**：包含无噪真实状态、线速度/角速度、6 轴刚度与阻尼、质量/主惯量、下游质量/惯量、标定误差、夹持偏移及几何类别独热编码。
-- **循环策略网络**：观测经验归一化 → 两层 `GRU(128)` → `ELU MLP(128, 64)` → 6 维动作输出。
+- **循环策略网络**：观测经验归一化 → 两层 `GRU(128)` → `ELU MLP(128, 64)` → 每个动作的均值和 `log_std`（各 6 维）。采用 rsl_rl 原生 `HeteroscedasticGaussianDistribution`，各维独立采样，标准差限制为 `[0.02, 1.0]`；根据观测与循环历史学习探索强度，不硬编码入孔阶段。评估和 TorchScript/ONNX 导出仍只使用 6 维均值动作。
+  不再维护独立的全局 std 参数；`init_std` 只用于新网络的输出层初始化。日志 `Mean action std` 是最后一次策略分布计算中 std 张量的整体均值，不是按入孔阶段统计的 rollout 均值。
 - **动作语义**：输出 `H` 系下的三维平移增量（限幅 `±1 mm/步`）与三维旋转向量增量（限幅 `±0.5°/步`），以估计名义尖端为旋转中心合成下一策略周期的阻抗目标：
   $$p_{\mathrm{target}} = p_{\mathrm{current}} + \Delta p, \qquad q_{\mathrm{target}} = \mathrm{Exp}(\Delta r) \otimes q_{\mathrm{current}}$$
+
+旧运行不会自动切换分布。安全停止后，可迁移到**新的输出目录**，保留原运行用于对照和回退：
+
+```bash
+python migrate_policy_std.py runs/continuous_single/checkpoint.pt \
+  --output runs/continuous_state_std
+python train.py --resume --output runs/continuous_state_std --device cuda:0
+```
+
+迁移保留均值策略、GRU、归一化、价值网络、训练步数及未改变参数的优化器状态；
+新增 std 输出权重初始化为零，偏置为旧各维有效 `log_std`，因此初始动作分布不变。
+输出层优化器矩保留原均值部分，新增 std 部分从零开始；原全局 std 参数及其优化器状态移除。
+标准差上下限沿用源运行配置，课程归零并清空成功窗口、自适应采样历史，环境数恢复各形状均分。
+这不是从随机权重重训；新分布可能过早收缩探索，收益仍需通过成功率、超限率和确定性评估验证。
+
+可选 `--initial-std 0.1 --noise-level 1`：保留均值策略，将六维 std 初始化为 0.1，
+从目标间隙、10% 噪声幅度开始（仍按幅度线性递增，不采用平方根缩放）。
+省略这些参数则继承旧有效 std 并从完整课程 0 开始。std 输出权重为零不妨碍该层
+权重和偏置获得梯度；初次反传中共享网络仍由均值分支训练，之后 std 分支也可向共享层传播梯度。
 
 ### 4.2 参数化凸几何与物理模型
 - **几何构建**（[insertion/geometry.py](./insertion/geometry.py)）：无需外部 USD 资产，程序化生成正三角形、方形、正五边形、正六边形、L 形及测试用圆形。正多边形外接圆半径 `10 mm`，L 形包络 `20 mm`，孔深 `25 mm`，插头长 `35 mm`。孔壁拆分为独立凸棱柱以保持中心孔贯通，L 形插头拆分为双盒体保留凹口。
