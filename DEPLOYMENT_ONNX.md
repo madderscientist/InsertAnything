@@ -4,13 +4,13 @@
 
 This package is an inference interface, NOT a robot controller or a validated
 real-robot safety system. The policy has only been trained/evaluated in simulation.
-The exported checkpoint has not completed the noise curriculum. Check the exact
+Check the exported model's exact
 iteration, curriculum level, environment parameters and SHA256 in `contract.json`.
 Do not interpret passing ONNX equivalence tests as successful sim-to-real validation.
 
-The requested export is the backup immediately BEFORE the std reset to 0.15:
-iteration 13574, curriculum level 7/15 (0.1 mm clearance, 20% noise).
-The Gaussian std was approximately 0.048, but ONNX returns the deterministic mean:
+Historical exports included iteration 13574 at 20% noise; this is not the
+configuration of every subsequent export. The current model's source iteration
+and environment are recorded in `contract.json`. ONNX returns the deterministic mean:
 no action sampling, no std input, no artificial exploration on the robot.
 This file describes the interface for any export; `contract.json` is authoritative
 for the particular file. Robot dimensions, sensor calibration, sign convention,
@@ -44,6 +44,9 @@ All observations/states are finite `float32`, C-contiguous arrays. Fixed batch o
 | `h_out` output | `[2,1,128]` | state for next policy tick |
 
 Normalization statistics are embedded: DO NOT normalize/clamp observations again.
+Export with `--onnx --prune-std` to physically remove the six unused log-std
+rows and their biases from the final head. The interface and mean actions remain
+unchanged; `contract.json` records `onnx.std_head_pruned`.
 The network does NOT perform pose transforms, filtering, action clipping,
 workspace checks, success detection or safety-stop handling.
 
@@ -87,6 +90,13 @@ obs[0,10:13]= filtered, gravity-compensated moment about nominal tip, expressed 
 ```
 
 Position error is in **fixed H**, NOT in the moving tool frame.
+New training can set `position_observation_delay=true`: each episode independently
+selects 0 or 1 policy frame (0/20 ms), affecting only the complete noisy position
+error, never orientation or wrench. The simulator retains historical position
+noise and initializes history from the new episode; this is NOT implemented inside
+ONNX. Consult `contract.json` for the particular model. Legacy checkpoints missing
+the field retain immediate observations. Do not inject artificial noise or choose
+robot latency blindly; measure and validate the external sensor adapter.
 Relative orientation uses **inverse(current) * goal**, not the opposite order.
 Canonical quaternion: normalize, then choose sign so the first component whose
 absolute value exceeds 1e-8 in w,x,y,z order is positive. Usually this means w>=0.
@@ -151,8 +161,9 @@ the tip: after the shift, moment about that same tip should be near zero.
 No added white noise, artificial zero bias, mounting error or curriculum scaling
 is needed on the robot. The simulation's per-episode force/moment biases affect
 actor observations only; they are not a preprocessing correction to apply.
-Do not assume robustness to the full configured training noise: this checkpoint
-was only at 20% noise.
+Do not assume validated robustness from training configuration alone. Check this
+export's source configuration and independent evaluation; historical checkpoints
+may have been trained at only a fraction of the configured noise amplitude.
 
 ## 4. Actions and external impedance controller
 
@@ -236,14 +247,25 @@ embedded in this file. The hardware integration must provide independently:
 - Proper gravity/sign/extrinsic calibration and a force-at-tip lever-arm test.
 - Verified compliant controller and conservative hardware motion/force envelopes.
 
-Simulation workspace uses horizontal radial distance <=25 mm, tip Z in
+New simulation configs use horizontal radial distance <=35 mm, explicitly
+containing independent +/-20 mm X/Y starts (square corner radius 28.28 mm).
+Legacy checkpoints missing `workspace_xy_radius_m` retain 25 mm times saved scale;
+read `workspace_xy_m` in the exported contract, not a hardcoded new default.
+`workspace_xy_geometry=radial_disk` makes the offline target guard radial as well;
+legacy exported contracts without this field retain their previous per-axis guard.
+Simulation tip Z remains in
 [-25 mm,30 mm], tilt <=35 degrees, and 8 s episode timeout. Treat these as training
 semantics, not as hardware approval. Match geometries and scale; simulation has
 no robot kinematics, backlash, cable forces, sensor saturation or controller faults.
 
 The legacy iteration-13574 checkpoint uses the strict success rule below.
-New training defaults to target depth reached for 100 ms without additional
-XY/tilt/yaw success gates; safety limits and shaping costs remain unchanged.
+New training defaults to target depth reached for 100 ms with the true bottom-face
+center inside the opening on every hold tick (`success_opening_required=true`).
+This rejects off-plate descents, not a fine XY/tilt/yaw alignment gate. Concave L
+openings use inclusive polygon membership; circles use their analytic radius.
+Legacy checkpoints missing this field retain their historical success semantics.
+New plates have minimum outer inradius 80 mm (`plate_outer_radius_m=.080`);
+legacy missing fields retain the original footprint, encoded as zero.
 See `success_alignment_required` in the source environment (missing means legacy).
 Legacy training success is NOT "looks inserted": target depth within 0.2 mm, XY error
 <0.4*clearance, tilt <0.4*clearance/peg_length, symmetry-aware yaw

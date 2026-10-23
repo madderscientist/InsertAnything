@@ -17,8 +17,26 @@ from insertion import action_target, actor_observation, rotate, transform_wrench
 from insertion.transforms import rotvec_quat
 
 
+def prune_mean_head(model: torch.nn.Module) -> None:
+    layers = list(model.mlp)
+    if (len(layers) < 2 or not isinstance(layers[-2], torch.nn.Linear)
+            or not isinstance(layers[-1], torch.nn.Unflatten)
+            or tuple(layers[-1].unflattened_size) != (2, 6)
+            or layers[-2].out_features != 12):
+        raise ValueError("mean-head pruning requires a six-action mean/log_std MLP")
+    head = layers[-2]
+    mean_head = torch.nn.Linear(head.in_features, 6, device=head.weight.device,
+                                dtype=head.weight.dtype)
+    with torch.no_grad():
+        mean_head.weight.copy_(head.weight[:6])
+        mean_head.bias.copy_(head.bias[:6])
+    model.mlp = torch.nn.Sequential(*layers[:-2], mean_head)
+    model.deterministic_output = torch.nn.Identity()
+
+
 @torch.inference_mode()
-def export_onnx(checkpoint: Path, output: Path, samples: int = 500) -> dict:
+def export_onnx(checkpoint: Path, output: Path, samples: int = 500,
+                prune_std: bool = False) -> dict:
     import onnx
     import onnxruntime as ort
 
@@ -27,6 +45,8 @@ def export_onnx(checkpoint: Path, output: Path, samples: int = 500) -> dict:
     metadata, actor = load_checkpoint(checkpoint, "cpu")
     actor.eval()
     model = actor.as_onnx().eval()
+    if prune_std:
+        prune_mean_head(model)
     output.mkdir(parents=True, exist_ok=False)
     path = output / "actor.onnx"
     torch.onnx.export(
@@ -77,6 +97,7 @@ def export_onnx(checkpoint: Path, output: Path, samples: int = 500) -> dict:
             "dtype": "float32", "batch_size": 1, "deterministic": True,
             "normalization_in_model": True, "action_clipping_in_model": False,
             "preprocessing_in_model": False, "safety_checks_in_model": False,
+            "std_head_pruned": prune_std,
         },
         "source": {
             "checkpoint": str(checkpoint.resolve()), "iteration": source["iter"],
@@ -208,10 +229,15 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=500)
     parser.add_argument("--onnx", action="store_true",
                         help="export deterministic batch-one ONNX with explicit GRU state")
+    parser.add_argument("--prune-std", action="store_true",
+                        help="physically remove unused log_std head weights from ONNX")
     args = parser.parse_args()
     torch.set_num_threads(1)
-    exporter = export_onnx if args.onnx else export
-    print(json.dumps(exporter(args.checkpoint, args.output, args.samples), indent=2))
+    if args.prune_std and not args.onnx:
+        parser.error("--prune-std requires --onnx")
+    report = (export_onnx(args.checkpoint, args.output, args.samples, args.prune_std)
+              if args.onnx else export(args.checkpoint, args.output, args.samples))
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
