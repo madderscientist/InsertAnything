@@ -50,7 +50,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(len(curriculum.windows["square"]), 0)
 
     def test_depth_success_hold_reset_safety_and_legacy_alignment(self):
-        cfg = InsertionCfg()
+        cfg = InsertionCfg(success_opening_required=False)
         self.assertFalse(cfg.success_alignment_required)
         self.assertTrue(InsertionCfg.from_checkpoint({}).success_alignment_required)
         group = SimpleNamespace(
@@ -93,7 +93,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
             getattr(group, field).zero_()
         group.hold.fill_(4)
-        position[:, 0] = 0.026
+        position[:, 0] = cfg.workspace_xy_radius_m + 0.001
         _, _, info = PlantGroup.step_outcome(group, actions)
         self.assertEqual(info["reason"].item(), 3)
         position[:, 0] = 0

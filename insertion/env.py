@@ -16,7 +16,7 @@ from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
 from .config import ALL_SHAPES, InsertionCfg
 from .curriculum import SuccessNoiseCurriculum
-from .geometry import build_model, geometry, symmetry_count
+from .geometry import build_model, geometry, points_in_polygon, symmetry_count
 from .transforms import (action_target, actor_observation, canonical_quat,
                          quat_inv, quat_mul, quat_rotvec, rotate,
                          rotvec_quat, tip_pose, transform_wrench)
@@ -48,6 +48,8 @@ def completion_cost_terms(
     target_depth: torch.Tensor, radius: float, tilt: torch.Tensor, yaw: torch.Tensor,
     wrench: torch.Tensor, actions: torch.Tensor, previous_actions: torch.Tensor,
     success: torch.Tensor, safety_failure: torch.Tensor, timeout: torch.Tensor,
+    *, tip_center_z: torch.Tensor | None = None,
+    hole_force: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     dt = cfg.physics_dt*cfg.decimation
     remaining = z_disp.clamp_min(0)/target_depth
@@ -65,6 +67,14 @@ def completion_cost_terms(
              / (cfg.max_force-cfg.force_cost_free_n)).clamp(0, 1)
     moment = ((torch.linalg.vector_norm(wrench[:, 3:], dim=-1)-cfg.moment_cost_free_nm)
               / (cfg.max_moment-cfg.moment_cost_free_nm)).clamp(0, 1)
+    if cfg.inserted_load_cost and tip_center_z is not None and hole_force is not None:
+        inserted = tip_center_z < -cfg.inserted_load_depth_m
+        lateral_force = (torch.linalg.vector_norm(hole_force[:, :2], dim=-1)
+                         / cfg.max_force).clamp(0, 1)
+        full_moment = (torch.linalg.vector_norm(wrench[:, 3:], dim=-1)
+                       / cfg.max_moment).clamp(0, 1)
+        force = torch.where(inserted, lateral_force, force)
+        moment = torch.where(inserted, full_moment, moment)
     applied = actions.clamp(-1, 1)
     previous = previous_actions.clamp(-1, 1)
     return {
@@ -103,6 +113,9 @@ class PlantGroup:
         self.identity = torch.tensor([1., 0, 0, 0], device=device).expand(self.n, 4)
         self.goal = torch.zeros(self.n, 3, device=device)
         self.length = torch.zeros(self.n, device=device, dtype=torch.long)
+        self.position_delay_frames = torch.zeros_like(self.length)
+        self.position_history = torch.zeros(self.n, 2, 3, device=device)
+        self.position_history_length = torch.full_like(self.length, -1)
         self.hold = torch.zeros_like(self.length)
         self.peak_force = torch.zeros(self.n, device=device)
         self.peak_moment = torch.zeros_like(self.peak_force)
@@ -157,7 +170,8 @@ class PlantGroup:
 
     def _build_simulation(self) -> None:
         cfg = self.cfg
-        self.geometry = geometry(self.shape, self.clearance, cfg.scale, cfg.circle_sides)
+        self.geometry = geometry(self.shape, self.clearance, cfg.scale, cfg.circle_sides,
+                                 cfg.plate_outer_radius_m)
         self.model = build_model(self.geometry)
         self.body_id = self.model.body("tool").id
         self.sim = Simulation(
@@ -172,6 +186,8 @@ class PlantGroup:
             self.model.geom_pos, device=self.device, dtype=torch.float32)
         self.peg_polygon = torch.tensor(
             self.geometry.peg_polygon, dtype=torch.float32, device=self.device)
+        self.hole_polygon = torch.tensor(
+            self.geometry.hole_polygon, dtype=torch.float32, device=self.device)
 
     def uniform(self, n: int, columns: int, low: float, high: float) -> torch.Tensor:
         return low + (high - low) * torch.rand(n, columns, generator=self.generator,
@@ -340,6 +356,17 @@ class PlantGroup:
         for buffer in (self.length, self.hold, self.peak_force, self.peak_moment,
                        self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor):
             buffer[ids] = 0
+        if cfg.position_observation_delay:
+            self.reset_position_observation(ids, nominal_tip)
+
+    def reset_position_observation(self, ids: torch.Tensor, observed_tip: torch.Tensor) -> None:
+        n = len(ids)
+        self.position_delay_frames[ids] = torch.randint(
+            0, 2, (n,), generator=self.generator, device=self.device)
+        position_noise = self.normal(n, 3, self.cfg.position_noise)*self.noise_scale
+        error = self.goal[ids] + self.bias[ids] - observed_tip - position_noise
+        self.position_history[ids] = error[:, None, :].expand(-1, 2, -1)
+        self.position_history_length[ids] = self.length[ids]
 
     def sample_initial_orientation(self, n: int) -> torch.Tensor:
         cfg = self.cfg
@@ -426,6 +453,7 @@ class PlantGroup:
                             device=self.device) * noise_scale*self.noise_scale
         position_noise = self.normal(self.n, 3, self.cfg.position_noise)*self.noise_scale
         rotation_noise = self.normal(self.n, 3, self.cfg.rotation_noise)*self.noise_scale
+        self.record_position_observation(position_noise)
         if not self.cfg.observation_cuda_graph:
             return self.observations_from_noise(noise, position_noise, rotation_noise)
         for target, value in zip(self.observation_noise,
@@ -442,6 +470,18 @@ class PlantGroup:
         actor, critic = self.observation_outputs
         return actor.clone(), critic.clone()
 
+    def record_position_observation(self, position_noise: torch.Tensor) -> None:
+        if not self.cfg.position_observation_delay:
+            return
+        pos, q, _, _ = self.state()
+        observed_tip = tip_pose(pos, q, self.nominal_offset + self.calibration)
+        error = self.goal + self.bias - observed_tip - position_noise
+        advanced = self.length != self.position_history_length
+        history = torch.cat((error[:, None, :], self.position_history[:, :1]), dim=1)
+        self.position_history.copy_(torch.where(
+            advanced[:, None, None], history, self.position_history))
+        self.position_history_length.copy_(self.length)
+
     def observations_from_noise(self, noise: torch.Tensor, position_noise: torch.Tensor,
                                 rotation_noise: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos, q, v, omega = self.state()
@@ -451,6 +491,10 @@ class PlantGroup:
         noisy_q = quat_mul(rotvec_quat(rotation_noise), q)
         obs = actor_observation(noisy_tip, noisy_q, self.goal + self.bias,
                                 self.identity, self.wrench + self.wrench_bias + noise)
+        if self.cfg.position_observation_delay:
+            delayed = self.position_history.gather(
+                1, self.position_delay_frames[:, None, None].expand(-1, 1, 3)).squeeze(1)
+            obs = torch.cat((delayed, obs[:, 3:]), dim=-1)
         clean = actor_observation(true_tip, q, self.goal, self.identity, self.raw_wrench)
         shape_id = torch.nn.functional.one_hot(
             torch.full((self.n,), ALL_SHAPES.index(self.shape), device=self.device),
@@ -603,6 +647,10 @@ class PlantGroup:
         lowest_z = tip[:, 2] + self.minimum_peg_height_offset(q)
         z_disp = lowest_z - self.goal[:, 2]
         success = tip[:, 2] <= self.goal[:, 2] + 0.0002
+        if cfg.success_opening_required:
+            inside = ((tip[:, :2].square().sum(-1) <= self.geometry.radius**2)
+                      if self.shape == "circle" else points_in_polygon(tip[:, :2], self.hole_polygon))
+            success = success & inside
         if cfg.success_alignment_required:
             success = (success & (xy < self.clearance * 0.4)
                        & (tilt < self.clearance / self.geometry.peg_length * 0.4)
@@ -610,7 +658,7 @@ class PlantGroup:
         self.hold.copy_(torch.where(success, self.hold + 1, torch.zeros_like(self.hold)))
         success = self.hold >= cfg.success_hold_steps
         excessive = (self.peak_force > cfg.max_force) | (self.peak_moment > cfg.max_moment)
-        escaped = ((xy > 0.025 * cfg.scale) | (tip[:, 2] > 0.03 * cfg.scale)
+        escaped = ((xy > cfg.workspace_xy_radius_m) | (tip[:, 2] > 0.03 * cfg.scale)
                    | (tip[:, 2] < -self.geometry.depth) | (tilt > math.radians(35)))
         self.length += 1
         timeout = self.length >= math.ceil(cfg.episode_seconds / 0.02)
@@ -618,7 +666,8 @@ class PlantGroup:
         success = success & ~excessive & ~escaped
         terms = completion_cost_terms(
             cfg, xy, z_disp, -self.goal[:, 2], self.geometry.radius, tilt, yaw,
-            self.wrench, actions, self.last_action, success, excessive | escaped, timeout)
+            self.wrench, actions, self.last_action, success, excessive | escaped, timeout,
+            tip_center_z=tip[:, 2], hole_force=rotate(q, self.wrench[:, :3]))
         self.last_reward_terms = terms
         reward = torch.stack(list(terms.values())).sum(0)
         self.last_action.copy_(actions)

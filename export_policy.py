@@ -140,7 +140,10 @@ class OfflinePolicy:
         p, q = action_target(tip_position, tool_quaternion, action,
                              self.metadata["translation_limit_m"],
                              self.metadata["rotation_component_limit_rad"])
-        if (p[:, :2].abs() > self.metadata["workspace_xy_m"]).any() or (
+        lateral = (torch.linalg.vector_norm(p[:, :2], dim=-1)
+                   if self.metadata.get("workspace_xy_geometry") == "radial_disk"
+                   else p[:, :2].abs())
+        if (lateral > self.metadata["workspace_xy_m"]).any() or (
             p[:, 2] < self.metadata["workspace_z_low_m"]).any() or (
             p[:, 2] > self.metadata["workspace_z_high_m"]).any():
             raise RuntimeError("offline target leaves configured workspace")

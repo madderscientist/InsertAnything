@@ -23,6 +23,9 @@ class InsertionCfg:
     decimation: int = 20
     physics_cuda_graph: bool = False
     observation_cuda_graph: bool = False
+    position_observation_delay: bool = True
+    inserted_load_cost: bool = True
+    inserted_load_depth_m: float = 0.004
     episode_seconds: float = 8.0
     clearance: float = 0.0001
     circle_sides: int | None = None
@@ -37,7 +40,9 @@ class InsertionCfg:
     max_force: float = 30.0
     max_moment: float = 2.0
     filter_seconds: float = 0.015
-    initial_xy: float = 0.003
+    initial_xy: float = 0.020
+    workspace_xy_radius_m: float = 0.035
+    plate_outer_radius_m: float = 0.080
     initial_z_min: float = 0.004
     initial_z_max: float = 0.01
     initial_plane_margin: float = 0.0
@@ -62,6 +67,7 @@ class InsertionCfg:
     training: bool = True
     success_hold_steps: int = 5
     success_alignment_required: bool = False
+    success_opening_required: bool = True
     curriculum_steps: int = 256000
     impedance_walk_fraction: float = 0.1
     impedance_walk_rate_per_second: float = 0.05
@@ -85,6 +91,8 @@ class InsertionCfg:
     timeout_penalty: float = 10.0
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.inserted_load_depth_m) or self.inserted_load_depth_m < 0:
+            raise ValueError("inserted_load_depth_m must be finite and nonnegative")
         if self.circle_sides is not None and (
                 type(self.circle_sides) is not int or self.circle_sides < 3):
             raise ValueError("circle_sides must be an integer >= 3 or None")
@@ -130,6 +138,15 @@ class InsertionCfg:
                  self.force_bias, self.moment_bias)
         if any(x < 0 or not math.isfinite(x) for x in noise):
             raise ValueError("randomization magnitudes must be finite and nonnegative")
+        if (not math.isfinite(self.workspace_xy_radius_m) or self.workspace_xy_radius_m <= 0
+                or math.sqrt(2)*self.initial_xy > self.workspace_xy_radius_m):
+            raise ValueError("lateral workspace radius must be positive and contain the full initial X/Y square")
+        if not math.isfinite(self.plate_outer_radius_m) or self.plate_outer_radius_m < 0:
+            raise ValueError("plate outer radius must be finite and nonnegative; zero selects legacy geometry")
+        footprint = self.scale*(math.sqrt(2)*.01 + .035*math.sin(math.radians(35)))
+        if (self.plate_outer_radius_m and self.plate_outer_radius_m
+                < self.workspace_xy_radius_m + footprint + .001*self.scale):
+            raise ValueError("plate must cover workspace plus tilted peg footprint and 1 mm margin")
         if (not math.isfinite(self.initial_z_min) or not math.isfinite(self.initial_z_max)
                 or not 0 < self.initial_z_min <= self.initial_z_max < 0.03 * self.scale):
             raise ValueError("initial Z bounds must be positive, ordered and below the workspace ceiling")
@@ -232,6 +249,13 @@ class InsertionCfg:
     def from_checkpoint(cls, environment: dict) -> "InsertionCfg":
         values = dict(environment)
         values.setdefault("success_alignment_required", True)
+        values.setdefault("position_observation_delay", False)
+        values.setdefault("inserted_load_cost", False)
+        values.setdefault("inserted_load_depth_m", 0.0)
+        values.setdefault("initial_xy", 0.003)
+        values.setdefault("workspace_xy_radius_m", 0.025*values.get("scale", 1.0))
+        values.setdefault("plate_outer_radius_m", 0.0)
+        values.setdefault("success_opening_required", False)
         if values.pop("load_cost_power", 2) != 2:
             raise ValueError("linear-load experimental checkpoints require explicit reward migration")
         if "shapes" in values:

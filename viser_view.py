@@ -174,7 +174,8 @@ def visible_wrench_vector(value: np.ndarray, reference: float) -> np.ndarray:
 class SnapshotScene:
     def __init__(self, server: viser.ViserServer | Any, shape: str, cfg: InsertionCfg):
         self.server = server
-        self.model = build_model(geometry(shape, cfg.clearance, cfg.scale, cfg.circle_sides))
+        self.model = build_model(geometry(shape, cfg.clearance, cfg.scale, cfg.circle_sides,
+                                          cfg.plate_outer_radius_m))
         self.data = MjData(self.model)
         self.base_geom_pos = self.model.geom_pos.copy()
         self.tool_id = self.model.body("tool").id

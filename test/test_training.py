@@ -215,6 +215,13 @@ class PolicyAndViewerTests(unittest.TestCase):
             wrench[0, 0] = 31
             with self.assertRaisesRegex(RuntimeError, "force limit"):
                 policy.step(p, q, goal, q, wrench)
+            wrench.zero_()
+            p[:, :2] = 0.03
+            with self.assertRaisesRegex(RuntimeError, "workspace"):
+                policy.step(p, q, goal, q, wrench)
+            policy.metadata.pop("workspace_xy_geometry")
+            policy.reset()
+            policy.step(p, q, goal, q, wrench)
 
     def test_viser_scene_and_replay_helpers(self):
         server = SimpleNamespace(scene=FakeScene(), atomic=nullcontext)
@@ -356,6 +363,9 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         self.assertEqual(configs[0], configs[1])
         cfg = configs[0]
         self.assertEqual(cfg.initial_xy, 0.01)
+        self.assertEqual(cfg.workspace_xy_radius_m, .035)
+        self.assertTrue(cfg.position_observation_delay)
+        self.assertTrue(cfg.inserted_load_cost)
         self.assertEqual(cfg.initial_z_min, 0.001)
         self.assertAlmostEqual(cfg.initial_tilt, np.deg2rad(20))
         self.assertEqual(cfg.initial_tilt, cfg.initial_yaw)
@@ -436,7 +446,11 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         for key, value in (("initial_xy", 0.01), ("initial_tilt", 0.35),
                            ("initial_yaw", 0.35), ("initial_z_min", 0.001),
                            ("initial_z_max", 0.02), ("initial_plane_margin", 0.001),
-                           ("success_alignment_required", True), ("success_hold_steps", 6)):
+                           ("success_alignment_required", True), ("success_hold_steps", 6),
+                           ("position_observation_delay", False), ("inserted_load_cost", False),
+                           ("inserted_load_depth_m", .006),
+                           ("workspace_xy_radius_m", .04), ("plate_outer_radius_m", 0.),
+                           ("success_opening_required", False)):
             changed = InsertionCfg.from_checkpoint({**asdict(cfg), key: value})
             with self.assertLogs(level="WARNING"):
                 restore_environment_progress(env, changed, saved, 2)

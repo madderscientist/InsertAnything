@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 
 from mujoco._structs import MjModel
 import numpy as np
+import torch
 
 from .config import ALL_SHAPES, HOLE_DEPTH_M
 
@@ -20,6 +21,24 @@ class Geometry:
     hole_polygon: np.ndarray
     peg_polygon: np.ndarray
     circle_error: float = 0.0
+    plate_outer_radius_m: float = 0.0
+
+
+def points_in_polygon(points: torch.Tensor, polygon: torch.Tensor) -> torch.Tensor:
+    """Inclusive ray crossing, including concave polygons and their boundary."""
+    start, end = polygon, torch.roll(polygon, -1, 0)
+    edge = end-start
+    relative = points[:, None, :]-start
+    cross = edge[None, :, 0]*relative[..., 1]-edge[None, :, 1]*relative[..., 0]
+    along = (relative*edge).sum(-1)
+    boundary = ((cross.abs() <= 1e-10) & (along >= 0)
+                & (along <= edge.square().sum(-1))).any(-1)
+    crosses = (start[:, 1] > points[:, None, 1]) != (end[:, 1] > points[:, None, 1])
+    dy = edge[:, 1]
+    safe_dy = torch.where(dy != 0, dy, torch.ones_like(dy))
+    intersection = start[:, 0] + (points[:, None, 1]-start[:, 1])*edge[:, 0]/safe_dy
+    inside = ((crosses & (points[:, None, 0] < intersection)).sum(-1) % 2) == 1
+    return inside | boundary
 
 
 def inset_polygon(p: np.ndarray, distance: float) -> np.ndarray:
@@ -34,7 +53,7 @@ def inset_polygon(p: np.ndarray, distance: float) -> np.ndarray:
 
 
 def geometry(shape: str, clearance: float = 0.0001, scale: float = 1,
-             circle_sides: int | None = None) -> Geometry:
+             circle_sides: int | None = None, plate_outer_radius_m: float = 0.0) -> Geometry:
     if shape not in ALL_SHAPES:
         raise ValueError(f"unsupported shape {shape}")
     r, c = 0.01 * scale, clearance / 2
@@ -61,7 +80,10 @@ def geometry(shape: str, clearance: float = 0.0001, scale: float = 1,
         angles = np.arange(n) * 2 * math.pi / n + math.pi / 2
         p = r * np.column_stack((np.cos(angles), np.sin(angles)))
         peg = inset_polygon(p, c)
-    return Geometry(shape, r, clearance, HOLE_DEPTH_M * scale, 0.035 * scale, p, peg, error)
+    if not math.isfinite(plate_outer_radius_m) or plate_outer_radius_m < 0:
+        raise ValueError("plate outer radius must be finite and nonnegative")
+    return Geometry(shape, r, clearance, HOLE_DEPTH_M * scale, 0.035 * scale,
+                    p, peg, error, plate_outer_radius_m)
 
 
 def _box(parent: ET.Element, name: str, low: np.ndarray, high: np.ndarray,
@@ -95,15 +117,16 @@ def model_xml(g: Geometry) -> str:
     world = ET.SubElement(root, "worldbody")
     ET.SubElement(world, "light", pos="0 0 0.2")
     hole = ET.SubElement(world, "body", name="hole")
-    r, outer = g.radius, g.radius * 2
+    r, outer = g.radius, g.plate_outer_radius_m or g.radius * 2
     if g.shape == "square":
         a = r / math.sqrt(2)
+        b = g.plate_outer_radius_m or 2*a
         # Tile the square annulus without overlapping wall volumes.
         bounds = (
-            ([-2*a, -2*a], [-a, 2*a]),
-            ([a, -2*a], [2*a, 2*a]),
-            ([-a, -2*a], [a, -a]),
-            ([-a, a], [a, 2*a]),
+            ([-b, -b], [-a, b]),
+            ([a, -b], [b, b]),
+            ([-a, -b], [a, -a]),
+            ([-a, a], [a, b]),
         )
         for i, (low, high) in enumerate(bounds):
             _box(hole, f"wall_{i}", np.array(low), np.array(high),
@@ -122,6 +145,11 @@ def model_xml(g: Geometry) -> str:
     else:
         # 孔壁拆分为独立凸棱柱，避免整体凸包将中心孔封死
         p, out = g.hole_polygon, g.hole_polygon * 2
+        if g.plate_outer_radius_m:
+            edges = np.roll(p, -1, axis=0)-p
+            inradius = np.min(np.abs(edges[:, 0]*p[:, 1]-edges[:, 1]*p[:, 0])
+                              / np.linalg.norm(edges, axis=1))
+            out = p*(g.plate_outer_radius_m/inradius)
         for i in range(len(p)):
             j = (i + 1) % len(p)
             _prism(hole, assets, f"wall_{i}", np.array([p[i], out[i], out[j], p[j]]),

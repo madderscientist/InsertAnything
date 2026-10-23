@@ -76,8 +76,13 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         noise_curriculum_mode="success" if args.success_noise_curriculum else "steps",
         physics_cuda_graph=args.physics_cuda_graph,
         observation_cuda_graph=args.observation_cuda_graph,
+        position_observation_delay=args.position_observation_delay,
+        inserted_load_cost=args.inserted_load_cost,
         force_bias=args.force_bias, moment_bias=args.moment_bias,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
+        workspace_xy_radius_m=args.workspace_xy_radius_m,
+        plate_outer_radius_m=args.plate_outer_radius_m,
+        success_opening_required=args.success_opening_required,
         initial_z_min=args.initial_z_min, initial_z_max=args.initial_z_max,
         initial_plane_margin=args.initial_plane_margin,
         initial_tilt=math.radians(args.initial_tilt_deg),
@@ -94,7 +99,19 @@ def contract(cfg: InsertionCfg) -> dict:
         "policy_period_seconds": 0.02, "quaternion_order": "wxyz",
         "physics_cuda_graph": cfg.physics_cuda_graph,
         "observation_cuda_graph": cfg.observation_cuda_graph,
-        "position_error": "target minus current, in fixed hole axes",
+        "position_observation_delay": {
+            "enabled": cfg.position_observation_delay,
+            "frames": [0, 1] if cfg.position_observation_delay else [0],
+            "sampling": "independent uniform per episode; fixed until reset",
+            "channels": "actor dx/dy/dz only; historical full noisy error in fixed hole axes",
+            "reset": "replicate initial noisy position error; no history across episodes",
+            "clock": "policy-step length only; reads and graph capture do not advance history",
+            "quaternion_and_wrench": "current",
+            "critic": "clean and current; 57 dimensions",
+        },
+        "position_error": (
+            "historical target minus estimated tip, in fixed hole axes; see position_observation_delay"
+            if cfg.position_observation_delay else "target minus current, in fixed hole axes"),
         "relative_orientation": "inverse(current) * target; canonical unit quaternion",
         "wrench": "gravity-compensated downstream load, in nominal tool axes about nominal tip",
         "inertia_compensated": False,
@@ -130,7 +147,11 @@ def contract(cfg: InsertionCfg) -> dict:
             "force_bias_half_range_n": cfg.force_bias,
             "moment_bias_half_range_nm": cfg.moment_bias,
             "wrench_bias_sampling": "independent uniform per axis at reset, fixed per episode; actor only",
-            "pose_sampling": "independent Gaussian per observation; current tip pose only",
+            "pose_sampling": (
+                "position Gaussian sampled at each policy frame, retained with historical error; "
+                "rotation Gaussian per observation, current tip orientation"
+                if cfg.position_observation_delay else
+                "independent Gaussian per observation; current tip pose only"),
             "wrench_sampling": "independent Gaussian per observation after tip transform/filter",
             "grasp_distribution": cfg.grasp_error_distribution,
             "grasp_component_scale_m": cfg.grasp_position_error,
@@ -139,7 +160,10 @@ def contract(cfg: InsertionCfg) -> dict:
         },
         "force_limit_n": cfg.max_force,
         "moment_limit_nm": cfg.max_moment,
-        "workspace_xy_m": 0.025 * cfg.scale,
+        "workspace_xy_m": cfg.workspace_xy_radius_m,
+        "workspace_xy_geometry": "radial_disk",
+        "plate_outer_radius_m": cfg.plate_outer_radius_m,
+        "plate_coverage": "minimum outer inradius; zero retains legacy footprint",
         "workspace_z_low_m": -0.025 * cfg.scale,
         "workspace_z_high_m": 0.03 * cfg.scale,
         "max_tilt_rad": 0.6108652381980153,
@@ -159,10 +183,23 @@ def contract(cfg: InsertionCfg) -> dict:
         "target_depth_sampling": "uniform per episode" if cfg.fixed_target_depth_m is None else "fixed",
         "depth_success": "reach or exceed target, with existing 0.2 mm tolerance",
         "success_alignment_required": cfg.success_alignment_required,
+        "success_opening_required": cfg.success_opening_required,
+        "success_opening": "true physical bottom-center XY inside hole outline, inclusive boundary; circle analytic",
         "success_hold_steps": cfg.success_hold_steps,
         "success_safety_priority": True,
         "preinsertion_tilt_weight": cfg.preinsertion_tilt_weight,
         "xy_cost_radius_fraction": cfg.xy_cost_radius_fraction,
+        "inserted_load_cost": {
+            "enabled": cfg.inserted_load_cost,
+            "activation": f"true physical tip center z < {-cfg.inserted_load_depth_m:g} m; not lowest point",
+            "depth_m": cfg.inserted_load_depth_m,
+            "force": "filtered nominal-tool force rotated into hole axes, Fx/Fy norm / max_force",
+            "moment": "all three filtered nominal-tip moments, norm / max_moment",
+            "dead_zones": False,
+            "cost": "existing coefficients times squared clamped [0,1] normalized loads",
+            "before_insertion": "existing full force/moment norms with configured dead zones",
+            "safety": "unchanged full raw force/moment substep peaks",
+        },
         "reward_adaptations": (
             "negative dt-scaled running costs; decoupled XY/Z distance; "
             "continuous yaw cost; depth-blended tilt; terminal completion bonus"
@@ -512,16 +549,18 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
             if ("noise_curriculum_state" in saved["infos"]
                     and source_cfg.get("clearance_curriculum", False) == cfg.clearance_curriculum):
                 env.noise_curriculum.load_state_dict(saved["infos"]["noise_curriculum_state"])
-                defaults = InsertionCfg()
-                if (source_cfg.get("success_alignment_required", True) != cfg.success_alignment_required
-                        or source_cfg.get("success_hold_steps", defaults.success_hold_steps) != cfg.success_hold_steps
-                        or any(source_cfg.get(key, getattr(defaults, key)) != getattr(cfg, key)
-                       for key in ("force_bias", "moment_bias", "initial_xy",
-                                   "initial_z_min", "initial_z_max", "initial_tilt", "initial_yaw",
-                                   "initial_plane_margin"))):
+                previous_cfg = InsertionCfg.from_checkpoint(source_cfg)
+                changed_fields = (
+                    "success_alignment_required", "success_hold_steps", "success_opening_required",
+                    "position_observation_delay", "inserted_load_cost", "inserted_load_depth_m",
+                    "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
+                    "force_bias", "moment_bias", "initial_z_min", "initial_z_max",
+                    "initial_tilt", "initial_yaw", "initial_plane_margin",
+                )
+                if any(getattr(previous_cfg, key) != getattr(cfg, key) for key in changed_fields):
                     for window in env.noise_curriculum.windows.values():
                         window.clear()
-                    logging.warning("Initial pose, wrench bias or success criteria changed; retaining curriculum level, clearing windows.")
+                    logging.warning("Initial pose, observation/reward contract or success criteria changed; retaining curriculum level, clearing windows.")
             else:
                 logging.info("Resetting success curriculum to level 0 for updated curriculum config.")
         else:
@@ -784,8 +823,15 @@ def main() -> None:
     parser.add_argument("--success-noise-curriculum", action="store_true")
     parser.add_argument("--force-bias", type=float, default=0.,
                         help="per-episode force zero-bias half range per axis in N")
-    parser.add_argument("--initial-xy", type=float, default=0.003,
+    parser.add_argument("--initial-xy", type=float, default=0.020,
                         help="initial true tip X/Y uniform half range in meters")
+    parser.add_argument("--workspace-xy-radius-m", type=float, default=0.035,
+                        help="lateral radial safety boundary in meters; must contain the initial X/Y square")
+    parser.add_argument("--plate-outer-radius-m", type=float, default=0.080,
+                        help="minimum plate outer inradius in meters; zero retains legacy footprint")
+    parser.add_argument("--success-opening-required",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="require true bottom-center XY inside actual hole opening for success")
     parser.add_argument("--initial-z-min", type=float, default=0.004)
     parser.add_argument("--initial-plane-margin", type=float, default=0.,
                         help="minimum whole-peg height above hole plane in meters; zero disables")
@@ -802,6 +848,12 @@ def main() -> None:
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--physics-cuda-graph", action="store_true")
     parser.add_argument("--observation-cuda-graph", action="store_true")
+    parser.add_argument("--position-observation-delay",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="episode-fixed uniform 0/1-policy-frame actor position delay")
+    parser.add_argument("--inserted-load-cost",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="below true tip center z=-4mm, penalize hole XY force and all moments without dead zones")
     parser.add_argument("--check-seconds", type=float, default=300)
     parser.add_argument("--stall-seconds", type=float, default=900)
     parser.add_argument("--stop-grace-seconds", type=float, default=180)
