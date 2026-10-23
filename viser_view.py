@@ -69,16 +69,16 @@ class PolicyReplay:
 
             torch.set_num_threads(1)
             env = None
-            current_shape = None
+            current_cfg = None
             while not self.stop.is_set():
                 with self.lock:
                     shape = self.shape
                 started = time.monotonic()
                 metadata, actor = load_checkpoint(self.run_dir / "checkpoint.pt", self.device)
                 cfg = replay_config(metadata["environment"], shape, self.zero_noise)
-                if env is None or current_shape != shape:
+                if env is None or current_cfg != cfg:
                     env = InsertionEnv(cfg, self.device)
-                    current_shape = shape
+                    current_cfg = cfg
                 else:
                     env.groups[0].reset(torch.arange(1, device=self.device))
                 group = env.groups[0]
