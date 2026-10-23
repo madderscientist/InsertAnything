@@ -4,6 +4,11 @@
 
 奖励函数、运行成本上界与终止判据详见 [REWARD.md](./REWARD.md)。
 
+位置与力觉的消融数据、dx/dy 合成偏差分布及当前瓶颈总结见
+[位置与力觉误差分析](./OBSERVATION_ERROR_ANALYSIS.md)。
+当前证据更支持末端参考点偏差和力/力矩固定零偏是主要观测瓶颈，
+而非当前幅度的逐步白噪声；XY 偏差与白噪声尚未完成严格独立拆分。
+
 碰撞几何：正方形使用一个旋转 box 插头和四个不重叠的 box 孔壁，
 保持原有几何边界、深度和间隙，但接触点及力响应可能与 mesh 版本不同。
 L 形也使用 box 组合，其他多边形仍使用凸 mesh。
@@ -303,6 +308,23 @@ python train.py --resume --output runs/continuous_state_std --device cuda:0
 2. **阶段二（传感器与标定噪声课程，固定 `0.10 mm` 间隙与 `1.0` 难度）**：
    在目标 `0.10 mm` 间隙下，每次达标将 `noise_scale` 提升 `0.1` 直至 `1.0`，逐步激活逐步观测噪声（位置 `0.5 mm`、姿态 `1.5°`、力 `0.2 N`、力矩 `0.001 N·m`）与回合固定误差（真实夹持偏移 `1.25 mm`、尖端标定误差 `0.5 mm`、目标位置偏差 `0.5 mm`、传感器旋转误差 `0.5°`）。
 
+
+### 4.4 当前训练与独立诊断
+
+当前续训目录为 `runs/continuous_position_delay20mm/`，继承第 19704 轮权重及 Adam
+状态，使用 0/20 ms 位置延迟、X/Y 各 ±20 mm、35 mm 横向边界及 80 mm 最小内切
+半径孔板。成功要求真实端面中心在孔口内；中心 `z < -4 mm` 后切换为无死区
+横向力/全力矩成本。满噪声、满难度、0.1 mm 间隙固定，不推进课程。
+
+默认训练不包含失败池、随机意图或恢复课程。旧失败池和随机意图尝试分别归档于
+`feat/failure-replay`、`feat/coherent-exploration`，未取得预期脱困效果，已暂停。
+独立恢复试验也未完成收益验证，协议见 [RECOVERY_EXPERIMENT.md](./RECOVERY_EXPERIMENT.md)；
+这些试验不会由普通训练入口自动启用。
+
+普通策略的观测误差诊断入口为 [evaluate_noise_ablation.py](./evaluate_noise_ablation.py)，
+支持逐项消融、夹持误差通道分解及精确 XY/力觉联合对照。结果与限制见
+[OBSERVATION_ERROR_ANALYSIS.md](./OBSERVATION_ERROR_ANALYSIS.md)。
+联合 oracle 对照的 632/640 不代表部署能力或当前训练环境的成功率。
 
 ## 5. 离线推理接口
 
