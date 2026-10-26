@@ -16,7 +16,7 @@ from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
                        completion_cost_terms, geometry, quat_rotvec, tip_pose)
 from insertion.curriculum import adaptive_environment_counts
 from insertion.transforms import rotvec_quat
-from insertion.env import PlantGroup
+from insertion.env import PlantGroup, play_hysteresis_step
 
 
 class RewardAndCurriculumUnitTests(unittest.TestCase):
@@ -128,12 +128,16 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(adaptive_environment_counts((1, 1, 1), [1., 0., 0.]), (1, 1, 1))
         for kwargs in ({"shape_env_counts": (1,)}, {"force_bias": -1},
                        {"moment_bias": float("nan")}, {"adaptive_sampling": True},
+                       {"wrench_bias_distribution": "invalid"},
                        {"initial_z_min": 0.}, {"initial_z_min": 0.02},
                        {"initial_z_max": float("nan")}, {"initial_z_max": 0.03}):
             with self.assertRaises(ValueError):
                 InsertionCfg(**kwargs)
         old = InsertionCfg.from_checkpoint({"envs_per_shape": 512})
         self.assertEqual(old.force_bias, 0.)
+        self.assertEqual(old.wrench_bias_distribution, "per_axis")
+        self.assertEqual(old.wrench_hysteresis_fraction, 0.)
+        self.assertEqual(InsertionCfg().wrench_hysteresis_fraction, 0.001)
         self.assertEqual(old.environment_counts, (512,) * 5)
         self.assertEqual((old.initial_z_min, old.initial_z_max), (0.004, 0.01))
 
@@ -151,6 +155,48 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
 
     def reward(self, **values):
         return float(sum(self.terms(**values).values()))
+
+    def test_wrench_bias_vector_amplitude_and_legacy_sampling(self):
+        group = SimpleNamespace(
+            cfg=InsertionCfg(), device="cpu", generator=torch.Generator().manual_seed(42))
+        group.uniform = lambda *args: PlantGroup.uniform(group, *args)
+        for amplitude in (0.5, 0.1):
+            samples = PlantGroup.sample_wrench_bias(group, 100000, amplitude)
+            radii = samples.norm(dim=-1)
+            self.assertLessEqual(float(radii.max()), amplitude+1e-7)
+            self.assertAlmostEqual(float(radii.mean()), amplitude/2, delta=amplitude*0.005)
+            torch.testing.assert_close(
+                torch.quantile(radii, torch.tensor([0.1, 0.5, 0.9])),
+                amplitude*torch.tensor([0.1, 0.5, 0.9]), atol=amplitude*0.005, rtol=0)
+            directions = samples/radii[:, None]
+            torch.testing.assert_close(
+                directions.mean(0), torch.zeros(3), atol=0.01, rtol=0)
+            torch.testing.assert_close(
+                directions.T@directions/len(samples), torch.eye(3)/3, atol=0.01, rtol=0)
+        torch.testing.assert_close(
+            PlantGroup.sample_wrench_bias(group, 10, 0.), torch.zeros(10, 3))
+        group.cfg = replace(group.cfg, wrench_bias_distribution="per_axis")
+        state = group.generator.get_state()
+        samples = PlantGroup.sample_wrench_bias(group, 100, 0.5)
+        group.generator.set_state(state)
+        torch.testing.assert_close(samples, group.uniform(100, 3, -0.5, 0.5), rtol=0, atol=0)
+
+    def test_play_hysteresis_tracks_direction_with_bounded_loop(self):
+        state = torch.zeros(1, 1, dtype=torch.float64)
+        half_width = torch.tensor([[0.015]], dtype=torch.float64)
+        outputs = []
+        for signal in (0., 0.03, 0.06, 0.09, 0.06, 0.03, 0.):
+            value = torch.tensor([[signal]], dtype=torch.float64)
+            state = play_hysteresis_step(state, value, half_width)
+            outputs.append(float(state))
+            self.assertLessEqual(float((state-value).abs()), float(half_width))
+        self.assertAlmostEqual(outputs[2], 0.045)
+        self.assertAlmostEqual(outputs[4], 0.075)
+        self.assertAlmostEqual(outputs[4]-outputs[2], 2*float(half_width))
+        signal = torch.tensor([[-0.1, 0., 0.1]], dtype=torch.float64)
+        torch.testing.assert_close(
+            play_hysteresis_step(torch.ones_like(signal), signal, torch.zeros_like(signal)),
+            signal, rtol=0, atol=0)
 
     def test_zero_preinsertion_tilt_cost_and_depth_ramp(self):
         self.assertEqual(InsertionCfg().preinsertion_tilt_weight, 0.)
@@ -326,8 +372,8 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         group.noise_scale = 0.5
         group.reset(torch.arange(group.n, device=self.device))
         before = group.wrench_bias.clone()
-        self.assertTrue(bool((before[:, :3].abs() <= 0.25).all()))
-        self.assertTrue(bool((before[:, 3:].abs() <= 0.005).all()))
+        self.assertTrue(bool((before[:, :3].norm(dim=-1) <= 0.25).all()))
+        self.assertTrue(bool((before[:, 3:].norm(dim=-1) <= 0.005).all()))
         self.assertGreater(float(before.abs().sum()), 0.)
         actor, critic = group.observations()
         torch.testing.assert_close(actor[:, -6:], group.wrench + before)

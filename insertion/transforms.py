@@ -63,9 +63,8 @@ def tip_pose(body_pos: Tensor, q: Tensor, body_to_tip: Tensor) -> Tensor:
 def action_target(tip_pos: Tensor, q: Tensor, action: Tensor,
                   translation_limit: float, rotation_limit: float) -> tuple[Tensor, Tensor]:
     # 在孔坐标系下叠加增量，纯旋转时保持插头尖端位置不变
-    a = action.clamp(-1, 1)
-    p_target = tip_pos + a[..., :3] * translation_limit
-    q_target = canonical_quat(quat_mul(rotvec_quat(a[..., 3:] * rotation_limit), q))
+    p_target = tip_pos + action[..., :3] * translation_limit
+    q_target = canonical_quat(quat_mul(rotvec_quat(action[..., 3:] * rotation_limit), q))
     return p_target, q_target
 
 

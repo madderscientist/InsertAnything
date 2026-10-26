@@ -124,6 +124,11 @@ class GeometryAndTransformTests(unittest.TestCase):
             0.001, math.radians(0.5))
         torch.testing.assert_close(p_target, p_tip)
         self.assertFalse(torch.allclose(q_target, q_init))
+        p_unbounded, _ = action_target(
+            p_tip, q_init, torch.tensor([[2., 0., 0., 0., 0., 0.]], dtype=torch.float64),
+            0.001, math.radians(0.5))
+        torch.testing.assert_close(p_unbounded, p_tip + torch.tensor(
+            [[0.002, 0., 0.]], dtype=torch.float64))
 
     def test_wrench_transfer_and_observation_contract(self):
         q = rotvec_quat(torch.tensor([[0.3, -0.2, 0.4]], dtype=torch.float64))

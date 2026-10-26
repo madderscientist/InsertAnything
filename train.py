@@ -79,6 +79,8 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         position_observation_delay=args.position_observation_delay,
         inserted_load_cost=args.inserted_load_cost,
         force_bias=args.force_bias, moment_bias=args.moment_bias,
+        wrench_bias_distribution=args.wrench_bias_distribution,
+        wrench_hysteresis_fraction=args.wrench_hysteresis_fraction,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
         workspace_xy_radius_m=args.workspace_xy_radius_m,
         plate_outer_radius_m=args.plate_outer_radius_m,
@@ -94,6 +96,20 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
 
 
 def contract(cfg: InsertionCfg) -> dict:
+    if cfg.wrench_bias_distribution == "uniform_magnitude":
+        bias_contract = {
+            "force_bias_max_magnitude_n": cfg.force_bias,
+            "moment_bias_max_magnitude_nm": cfg.moment_bias,
+            "wrench_bias_sampling": (
+                "independent force/moment vectors: uniform magnitude [0,A], isotropic direction "
+                "at reset; noise_scale applied; fixed per episode; actor only"),
+        }
+    else:
+        bias_contract = {
+            "force_bias_half_range_n": cfg.force_bias,
+            "moment_bias_half_range_nm": cfg.moment_bias,
+            "wrench_bias_sampling": "independent uniform per axis at reset, fixed per episode; actor only",
+        }
     return {
         "version": 1, "actor_dimension": 13, "action_dimension": 6,
         "policy_period_seconds": 0.02, "quaternion_order": "wxyz",
@@ -144,9 +160,11 @@ def contract(cfg: InsertionCfg) -> dict:
             "rotation_vector_component_std_rad": cfg.rotation_noise,
             "force_std_n": cfg.force_noise,
             "moment_std_nm": cfg.moment_noise,
-            "force_bias_half_range_n": cfg.force_bias,
-            "moment_bias_half_range_nm": cfg.moment_bias,
-            "wrench_bias_sampling": "independent uniform per axis at reset, fixed per episode; actor only",
+            "wrench_hysteresis_fraction_of_range": cfg.wrench_hysteresis_fraction,
+            "wrench_hysteresis_loop_span_n": cfg.max_force*cfg.wrench_hysteresis_fraction,
+            "wrench_hysteresis_loop_span_nm": cfg.max_moment*cfg.wrench_hysteresis_fraction,
+            **bias_contract,
+            "wrench_bias_distribution": cfg.wrench_bias_distribution,
             "pose_sampling": (
                 "position Gaussian sampled at each policy frame, retained with historical error; "
                 "rotation Gaussian per observation, current tip orientation"
@@ -554,7 +572,8 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "success_alignment_required", "success_hold_steps", "success_opening_required",
                     "position_observation_delay", "inserted_load_cost", "inserted_load_depth_m",
                     "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
-                    "force_bias", "moment_bias", "initial_z_min", "initial_z_max",
+                    "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
+                    "initial_z_min", "initial_z_max",
                     "initial_tilt", "initial_yaw", "initial_plane_margin",
                 )
                 if any(getattr(previous_cfg, key) != getattr(cfg, key) for key in changed_fields):
@@ -821,8 +840,9 @@ def main() -> None:
     parser.add_argument("--shapes", nargs="+", choices=TRAIN_SHAPES, default=list(TRAIN_SHAPES))
     parser.add_argument("--noise-curriculum", action="store_true")
     parser.add_argument("--success-noise-curriculum", action="store_true")
-    parser.add_argument("--force-bias", type=float, default=0.,
-                        help="per-episode force zero-bias half range per axis in N")
+    parser.add_argument("--force-bias", type=float, default=0.5,
+                        help="maximum force bias vector magnitude in N "
+                             "(per-axis half range in legacy per_axis mode)")
     parser.add_argument("--initial-xy", type=float, default=0.020,
                         help="initial true tip X/Y uniform half range in meters")
     parser.add_argument("--workspace-xy-radius-m", type=float, default=0.035,
@@ -840,8 +860,14 @@ def main() -> None:
                         help="initial rotation-vector X/Y component half range in degrees")
     parser.add_argument("--initial-yaw-deg", type=float, default=15.,
                         help="initial rotation-vector Z component half range in degrees")
-    parser.add_argument("--moment-bias", type=float, default=0.,
-                        help="per-episode moment zero-bias half range per axis in Nm")
+    parser.add_argument("--moment-bias", type=float, default=0.1,
+                        help="maximum moment bias vector magnitude in Nm "
+                             "(per-axis half range in legacy per_axis mode)")
+    parser.add_argument("--wrench-bias-distribution", choices=("uniform_magnitude", "per_axis"),
+                        default="uniform_magnitude",
+                        help="uniform vector magnitude and isotropic direction, or legacy independent axes")
+    parser.add_argument("--wrench-hysteresis-fraction", type=float, default=0.001,
+                        help="force/moment sensor hysteresis loop span as a fraction of configured range")
     parser.add_argument("--adaptive-sampling", action="store_true",
                         help="supervised continuous training: gently rebalance shape environments")
     parser.add_argument("--clearance-curriculum",

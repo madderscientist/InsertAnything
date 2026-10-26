@@ -43,6 +43,11 @@ def bounded_stiffness_step(current: torch.Tensor, target: torch.Tensor, initial:
     return torch.maximum(lower, torch.minimum(upper, current + delta.clamp(-max_delta, max_delta)))
 
 
+def play_hysteresis_step(state: torch.Tensor, signal: torch.Tensor,
+                         half_width: torch.Tensor) -> torch.Tensor:
+    return torch.minimum(torch.maximum(state, signal-half_width), signal+half_width)
+
+
 def completion_cost_terms(
     cfg: InsertionCfg, xy: torch.Tensor, z_disp: torch.Tensor,
     target_depth: torch.Tensor, radius: float, tilt: torch.Tensor, yaw: torch.Tensor,
@@ -124,6 +129,11 @@ class PlantGroup:
         self.wrench_bias = torch.zeros_like(self.wrench)
         self.raw_wrench = torch.zeros_like(self.wrench)
         self.filtered_sensor = torch.zeros_like(self.wrench)
+        self.hysteresis_sensor = torch.zeros_like(self.wrench)
+        self.hysteresis_half_width = torch.tensor(
+            [cfg.max_force*cfg.wrench_hysteresis_fraction/2]*3
+            + [cfg.max_moment*cfg.wrench_hysteresis_fraction/2]*3,
+            device=device)
         self.k = torch.zeros(self.n, 6, device=device)
         self.d = torch.zeros_like(self.k)
         self.initial_k = torch.zeros_like(self.k, dtype=torch.float64)
@@ -197,6 +207,15 @@ class PlantGroup:
         if std == 0:
             return torch.zeros(n, columns, device=self.device)
         return torch.randn(n, columns, generator=self.generator, device=self.device) * std
+
+    def sample_wrench_bias(self, n: int, amplitude: float) -> torch.Tensor:
+        if self.cfg.wrench_bias_distribution == "per_axis":
+            return self.uniform(n, 3, -amplitude, amplitude)
+        azimuth = self.uniform(n, 1, -math.pi, math.pi)
+        z = self.uniform(n, 1, -1., 1.)
+        xy = (1-z.square()).clamp_min(0).sqrt()
+        direction = torch.cat((xy*azimuth.cos(), xy*azimuth.sin(), z), dim=-1)
+        return direction*self.uniform(n, 1, 0., amplitude)
 
     def set_clearance(self, clearance: float) -> None:
         if math.isclose(clearance, self.clearance, rel_tol=0., abs_tol=1e-12):
@@ -322,8 +341,10 @@ class PlantGroup:
             n, 3, -cfg.sensor_rotation_error, cfg.sensor_rotation_error)*self.noise_scale)
         if cfg.force_bias or cfg.moment_bias:
             self.wrench_bias[ids] = torch.cat((
-                self.uniform(n, 3, -cfg.force_bias, cfg.force_bias),
-                self.uniform(n, 3, -cfg.moment_bias, cfg.moment_bias)), -1) * self.noise_scale
+                self.sample_wrench_bias(n, cfg.force_bias),
+                self.sample_wrench_bias(n, cfg.moment_bias)), -1) * self.noise_scale
+        else:
+            self.wrench_bias[ids] = 0
         self.delay[ids] = torch.randint(0, 3, (n,), generator=self.generator, device=self.device)
         if cfg.dynamics == "nominal":
             self.delay[ids] = 0
@@ -354,7 +375,8 @@ class PlantGroup:
         self.targets_p[:, ids] = nominal_tip.unsqueeze(0)
         self.targets_q[:, ids] = q.unsqueeze(0)
         for buffer in (self.length, self.hold, self.peak_force, self.peak_moment,
-                       self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor):
+                       self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor,
+                       self.hysteresis_sensor):
             buffer[ids] = 0
         if cfg.position_observation_delay:
             self.reset_position_observation(ids, nominal_tip)
@@ -439,9 +461,11 @@ class PlantGroup:
         wrist = transform_wrench(f, m_com, quat_inv(q), self.sensor_offset)
         alpha = 1 - math.exp(-self.cfg.physics_dt / self.cfg.filter_seconds)
         self.filtered_sensor += alpha * (wrist - self.filtered_sensor)
+        self.hysteresis_sensor.copy_(play_hysteresis_step(
+            self.hysteresis_sensor, self.filtered_sensor, self.hysteresis_half_width))
         r_st = self.nominal_offset + self.calibration - self.sensor_offset
-        self.wrench.copy_(transform_wrench(self.filtered_sensor[:, :3],
-                                          self.filtered_sensor[:, 3:],
+        self.wrench.copy_(transform_wrench(self.hysteresis_sensor[:, :3],
+                                          self.hysteresis_sensor[:, 3:],
                                           self.sensor_error, rotate(self.sensor_error, r_st)))
         self.raw_wrench.copy_(transform_wrench(wrist[:, :3], wrist[:, 3:],
                                               self.identity, self.offset - self.sensor_offset))

@@ -40,6 +40,7 @@ class InsertionCfg:
     max_force: float = 30.0
     max_moment: float = 2.0
     filter_seconds: float = 0.015
+    wrench_hysteresis_fraction: float = 0.001
     initial_xy: float = 0.020
     workspace_xy_radius_m: float = 0.035
     plate_outer_radius_m: float = 0.080
@@ -57,8 +58,9 @@ class InsertionCfg:
     rotation_noise: float = math.radians(1.5)
     force_noise: float = 0.2
     moment_noise: float = 0.001
-    force_bias: float = 0.0
-    moment_bias: float = 0.0
+    force_bias: float = 0.5
+    moment_bias: float = 0.1
+    wrench_bias_distribution: str = "uniform_magnitude"
     noise_curriculum: bool = False
     noise_curriculum_mode: str = "steps"
     noise_zero_steps: int = 25600
@@ -135,9 +137,11 @@ class InsertionCfg:
         noise = (self.initial_xy, self.initial_tilt, self.initial_yaw, self.position_bias,
                  self.tip_calibration_error, self.grasp_position_error, self.sensor_rotation_error,
                  self.position_noise, self.rotation_noise, self.force_noise, self.moment_noise,
-                 self.force_bias, self.moment_bias)
+                 self.force_bias, self.moment_bias, self.wrench_hysteresis_fraction)
         if any(x < 0 or not math.isfinite(x) for x in noise):
             raise ValueError("randomization magnitudes must be finite and nonnegative")
+        if self.wrench_bias_distribution not in ("uniform_magnitude", "per_axis"):
+            raise ValueError("wrench bias distribution must be uniform_magnitude or per_axis")
         if (not math.isfinite(self.workspace_xy_radius_m) or self.workspace_xy_radius_m <= 0
                 or math.sqrt(2)*self.initial_xy > self.workspace_xy_radius_m):
             raise ValueError("lateral workspace radius must be positive and contain the full initial X/Y square")
@@ -252,6 +256,10 @@ class InsertionCfg:
         values.setdefault("position_observation_delay", False)
         values.setdefault("inserted_load_cost", False)
         values.setdefault("inserted_load_depth_m", 0.0)
+        values.setdefault("force_bias", 0.0)
+        values.setdefault("moment_bias", 0.0)
+        values.setdefault("wrench_bias_distribution", "per_axis")
+        values.setdefault("wrench_hysteresis_fraction", 0.0)
         values.setdefault("initial_xy", 0.003)
         values.setdefault("workspace_xy_radius_m", 0.025*values.get("scale", 1.0))
         values.setdefault("plate_outer_radius_m", 0.0)

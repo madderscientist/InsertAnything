@@ -1,7 +1,7 @@
 """策略导出、检查点恢复、多卡分布式训练与可视化场景测试"""
 
 from contextlib import nullcontext, redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import io
 import importlib.util
 import json
@@ -370,6 +370,13 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         self.assertAlmostEqual(cfg.initial_tilt, np.deg2rad(20))
         self.assertEqual(cfg.initial_tilt, cfg.initial_yaw)
         self.assertEqual((cfg.force_bias, cfg.moment_bias), (0.5, 0.01))
+        self.assertEqual(cfg.wrench_bias_distribution, "uniform_magnitude")
+        noise = contract(cfg)["training_noise"]
+        self.assertEqual(noise["force_bias_max_magnitude_n"], 0.5)
+        self.assertEqual(noise["moment_bias_max_magnitude_nm"], 0.01)
+        self.assertNotIn("force_bias_half_range_n", noise)
+        legacy_noise = contract(replace(cfg, wrench_bias_distribution="per_axis"))["training_noise"]
+        self.assertEqual(legacy_noise["force_bias_half_range_n"], 0.5)
         self.assertEqual((cfg.noise_zero_steps, cfg.noise_full_steps), (1600, 12800))
         self.assertTrue(cfg.noise_curriculum)
         self.assertEqual(cfg.noise_curriculum_mode, "success")
@@ -450,6 +457,8 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                            ("position_observation_delay", False), ("inserted_load_cost", False),
                            ("inserted_load_depth_m", .006),
                            ("workspace_xy_radius_m", .04), ("plate_outer_radius_m", 0.),
+                           ("wrench_bias_distribution", "per_axis"),
+                           ("wrench_hysteresis_fraction", 0.),
                            ("success_opening_required", False)):
             changed = InsertionCfg.from_checkpoint({**asdict(cfg), key: value})
             with self.assertLogs(level="WARNING"):

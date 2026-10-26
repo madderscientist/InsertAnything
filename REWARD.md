@@ -23,7 +23,7 @@ C_t=w_t+w_p D_t+w_o O_t+w_F f_t^2+w_M m_t^2
     +w_a\|\bar a_t\|_2+w_{\Delta a}\|\bar a_t-\bar a_{t-1}\|_2
 $$
 
-其中 $\bar a_t=\mathrm{clip}(a_t,-1,1)$。单步奖励为：
+其中 $\bar a_t=\mathrm{clip}(a_t,-1,1)$，仅用于保持动作成本有界，不限制送入物理目标变换的策略动作。单步奖励为：
 
 $$
 r_t=-\Delta t\,C_t+B\,\mathbf{1}_S

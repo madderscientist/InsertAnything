@@ -40,7 +40,7 @@ All observations/states are finite `float32`, C-contiguous arrays. Fixed batch o
 |---|---|---|
 | `obs` input | `[1,13]` | unnormalized SI-unit observation |
 | `h_in` input | `[2,1,128]` | previous GRU state |
-| `actions` output | `[1,6]` | deterministic, NOT yet clipped action |
+| `actions` output | `[1,6]` | deterministic, unbounded mean action |
 | `h_out` output | `[2,1,128]` | state for next policy tick |
 
 Normalization statistics are embedded: DO NOT normalize/clamp observations again.
@@ -168,18 +168,19 @@ may have been trained at only a fraction of the configured noise amplitude.
 ## 4. Actions and external impedance controller
 
 Run at **50 Hz (20 ms)** with synchronized latest pose and processed wrench.
-Always reject nonfinite output; then clamp EACH component of `actions` to [-1,1].
-With the exported scale (verify `contract.json`):
+Always reject nonfinite output. Do not clamp actions; multiply each component by
+the exported per-component scale (verify `contract.json`; its legacy field names
+contain `limit`):
 
 ```text
-dp_H = clip(actions[0,0:3], -1,1) * 0.001 m
-dr_H = clip(actions[0,3:6], -1,1) * (0.5*pi/180) rad
+dp_H = actions[0,0:3] * 0.001 m
+dr_H = actions[0,3:6] * (0.5*pi/180) rad
 p_target_H = CURRENT measured nominal-tip position_H + dp_H
 q_target_HT = canonical(ExpQuaternion(dr_H) * CURRENT q_HT)
 ```
 
 Rotation is a rotation vector expressed in H, applied by LEFT multiplication.
-0.5 degrees is a PER-COMPONENT limit, not a limit on the total rotation angle.
+The scale is per component; there is no action clamp or maximum increment.
 This is NOT a velocity command, absolute pose, force command or flange displacement.
 Do not multiply by 0.02 again, or integrate onto last cycle's commanded target.
 Pure rotation keeps the nominal tip position fixed; convert that target to the
@@ -219,7 +220,7 @@ def infer_observation(obs):
     if not np.isfinite(actions).all() or not np.isfinite(next_h).all():
         raise RuntimeError("Invalid policy output/state")
     h = next_h
-    return np.clip(actions, -1, 1)
+    return actions
 ```
 
 This example performs NO robot I/O and intentionally does NOT build a control loop.
