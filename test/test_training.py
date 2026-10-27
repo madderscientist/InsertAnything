@@ -247,6 +247,20 @@ class PolicyAndViewerTests(unittest.TestCase):
         self.assertEqual(zero.force_bias, 0.)
         self.assertEqual(zero.moment_bias, 0.)
         self.assertEqual(zero.environment_counts, (1,))
+        circle = replay_config(asdict(cfg), "circle")
+        self.assertEqual(circle.shapes, ("circle",))
+        self.assertEqual(circle.environment_counts, (1,))
+        self.assertFalse(circle.training)
+        self.assertEqual(circle.position_bias, cfg.position_bias)
+        self.assertEqual(circle.position_noise, cfg.position_noise)
+        self.assertTrue(circle.terminate_on_overload)
+        diagnostic = replay_config(asdict(cfg), "circle", ignore_overload=True)
+        self.assertFalse(diagnostic.terminate_on_overload)
+        self.assertFalse(diagnostic.training)
+        self.assertEqual(diagnostic.max_force, cfg.max_force)
+        self.assertEqual(diagnostic.max_moment, cfg.max_moment)
+        with self.assertRaisesRegex(ValueError, "simulation evaluation"):
+            replace(cfg, terminate_on_overload=False)
         self.assertEqual(replay_index(1., 400), 50)
 
 

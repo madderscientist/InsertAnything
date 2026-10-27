@@ -17,7 +17,7 @@ import numpy as np
 import trimesh
 import viser
 
-from insertion import InsertionCfg, build_model, geometry
+from insertion import ALL_SHAPES, InsertionCfg, build_model, geometry
 
 
 def replay_index(elapsed: float, count: int) -> int:
@@ -26,10 +26,11 @@ def replay_index(elapsed: float, count: int) -> int:
     return int(max(0., elapsed) / 0.02) % count
 
 
-def replay_config(environment: dict, shape: str, zero_noise: bool = False) -> InsertionCfg:
+def replay_config(environment: dict, shape: str, zero_noise: bool = False,
+                  ignore_overload: bool = False) -> InsertionCfg:
     cfg = replace(InsertionCfg.from_checkpoint(environment),
                   shapes=(shape,), shape_env_counts=(), adaptive_sampling=False,
-                  envs_per_shape=1, training=False)
+                  envs_per_shape=1, training=False, terminate_on_overload=not ignore_overload)
     if zero_noise:
         cfg = replace(cfg, noise_curriculum=False, noise_curriculum_mode="steps",
                       position_noise=0., rotation_noise=0., force_noise=0., moment_noise=0.,
@@ -41,9 +42,10 @@ def replay_config(environment: dict, shape: str, zero_noise: bool = False) -> In
 class PolicyReplay:
     """Generate complete episodes separately, then display them at real-time speed."""
 
-    def __init__(self, run_dir: Path, device: str, shape: str, zero_noise: bool = False):
+    def __init__(self, run_dir: Path, device: str, shape: str, zero_noise: bool = False,
+                 ignore_overload: bool = False):
         self.run_dir, self.device, self.shape = run_dir, device, shape
-        self.zero_noise = zero_noise
+        self.zero_noise, self.ignore_overload = zero_noise, ignore_overload
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.episode = None
@@ -75,7 +77,8 @@ class PolicyReplay:
                     shape = self.shape
                 started = time.monotonic()
                 metadata, actor = load_checkpoint(self.run_dir / "checkpoint.pt", self.device)
-                cfg = replay_config(metadata["environment"], shape, self.zero_noise)
+                cfg = replay_config(metadata["environment"], shape, self.zero_noise,
+                                    self.ignore_overload)
                 if env is None or current_cfg != cfg:
                     env = InsertionEnv(cfg, self.device)
                     current_cfg = cfg
@@ -245,36 +248,55 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--frames", type=int, default=0, help="0 runs until interrupted")
     parser.add_argument("--mode", choices=("live", "policy"), default="live")
+    parser.add_argument("--shape", choices=ALL_SHAPES,
+                        help="initial geometry; unseen shapes require policy replay")
     parser.add_argument("--device", default="cuda:1", help="independent policy replay device")
     parser.add_argument("--zero-noise", action="store_true",
                         help="disable observation noise and fixed measurement/grasp errors in policy replay")
+    parser.add_argument("--ignore-overload", action="store_true",
+                        help="simulation replay only: continue past force/moment limits")
     args = parser.parse_args()
     if args.frames < 0 or not 1 <= args.port <= 65535:
         parser.error("frames must be nonnegative and port must be valid")
-    if args.zero_noise and args.mode != "policy":
-        parser.error("--zero-noise requires --mode policy; live training snapshots cannot be altered")
+    replay_only = args.zero_noise or args.ignore_overload
+    if replay_only and args.mode != "policy":
+        parser.error("--zero-noise and --ignore-overload require --mode policy")
     logging.basicConfig(level=logging.INFO)
     metadata = json.loads((args.run_dir / "config.json").read_text())
     cfg = InsertionCfg.from_checkpoint(metadata["environment"])
+    if args.shape is not None and args.shape not in cfg.shapes and args.mode != "policy":
+        parser.error("unseen --shape requires --mode policy")
     server = viser.ViserServer(host=args.host, port=args.port, label="Insertion training")
-    selection = server.gui.add_dropdown("Geometry", options=cfg.shapes, initial_value=cfg.shapes[0])
+    selection = server.gui.add_dropdown("Geometry", options=ALL_SHAPES,
+                                       initial_value=args.shape or cfg.shapes[0])
     mode = server.gui.add_dropdown("Source", options=("Training snapshots", "Latest policy replay"),
                                   initial_value=("Latest policy replay" if args.mode == "policy"
                                                  else "Training snapshots"),
-                                  disabled=args.zero_noise)
+                                  disabled=replay_only or selection.value not in cfg.shapes)
+
+    @selection.on_update
+    def select_geometry(event) -> None:
+        del event
+        unseen = selection.value not in cfg.shapes
+        if unseen:
+            mode.value = "Latest policy replay"
+        mode.disabled = replay_only or unseen
+
     frozen = server.gui.add_checkbox("Freeze view (training continues)", initial_value=False)
     status = server.gui.add_markdown("Waiting for the first training snapshot.")
     server.gui.add_markdown(
-        "Training snapshots show actual environment 0 at its training speed. "
-        "Latest policy replay is a separate deterministic rollout, buffered and "
-        "played at 1x simulated time / 50 pose updates per second. The latest "
-        "completed episode repeats while the next is generated. It is NOT live "
-        "training and does not update the policy. Walls are translucent."
+        "Snapshots show training environment 0. Policy replay uses deterministic actions, "
+        "buffers complete episodes and plays at 1x / 50 Hz, repeating until the next is ready. "
+        "Replay does not train."
     )
     if args.zero_noise:
         server.gui.add_markdown(
-            "**Zero-noise replay:** observation noise and fixed measurement/grasp errors disabled. "
-            "Initial pose, target depth and dynamics still randomized; evaluation pose difficulty is 1."
+            "**Zero noise:** measurement/grasp errors off; pose, depth and dynamics remain randomized."
+        )
+    if args.ignore_overload:
+        server.gui.add_markdown(
+            "**SIMULATION ONLY: overload termination OFF.** Loads, workspace and timeout checks "
+            "remain active. Results do not imply safe motion."
         )
 
     @server.on_client_connect
@@ -305,12 +327,13 @@ def main() -> None:
             if path.exists():
                 snapshot = json.loads(path.read_text())
                 shape = selection.value
-                plant = snapshot["plants"][shape]
+                plant = snapshot["plants"].get(shape)
                 episode = None
                 source = "Training snapshots (2 Hz; training simulation runs slower than real time)"
                 if mode.value == "Latest policy replay":
                     if replay is None:
-                        replay = PolicyReplay(args.run_dir, args.device, shape, args.zero_noise)
+                        replay = PolicyReplay(args.run_dir, args.device, shape, args.zero_noise,
+                                              args.ignore_overload)
                     replay.select(shape)
                     episode = replay.latest()
                     if (frozen.value and displayed_episode is not None
@@ -323,16 +346,14 @@ def main() -> None:
                             last_replay_key = None
                         index = replay_index(time.monotonic()-replay_started, len(episode["frames"]))
                         plant = episode["frames"][index]
-                        source = (f"Buffered policy replay on {args.device}, 1x / 50 Hz | "
-                                  f"checkpoint policy steps {episode['policy_steps']} | "
-                                  f"episode result: {episode['reason']} | "
+                        source = (f"Replay {args.device}, 1x / 50 Hz | "
+                                  f"steps {episode['policy_steps']} | {episode['reason']} | "
                                   f"noise: {'ZERO' if episode['zero_noise'] else 'checkpoint full noise'} | "
-                                  f"generation {episode['generation_seconds']:.1f}s | "
-                                  "repeats until next episode is ready")
+                                  f"generation {episode['generation_seconds']:.1f}s")
                     else:
                         episode = None
-                        if args.zero_noise:
-                            status.content = "**Buffering zero-noise policy episode; no training snapshot displayed.**"
+                        if replay_only or plant is None:
+                            status.content = "**Buffering policy episode; no training snapshot displayed.**"
                             frames += 1
                             time.sleep(max(0., 0.02-(time.monotonic()-started)))
                             continue

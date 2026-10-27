@@ -185,7 +185,8 @@ class PlantGroup:
         self.model = build_model(self.geometry)
         self.body_id = self.model.body("tool").id
         self.sim = Simulation(
-            self.n, SimulationCfg(nconmax=64, njmax=256,
+            self.n, SimulationCfg(nconmax=512 if self.shape == "circle" else 64,
+                                 njmax=2048 if self.shape == "circle" else 256,
                                  mujoco=MujocoCfg(timestep=cfg.physics_dt, gravity=(0, 0, 0),
                                                  iterations=50, ls_iterations=20)),
             model=self.model, device=self.device,
@@ -681,7 +682,8 @@ class PlantGroup:
                        & (yaw < self.clearance / self.geometry.radius * 0.4))
         self.hold.copy_(torch.where(success, self.hold + 1, torch.zeros_like(self.hold)))
         success = self.hold >= cfg.success_hold_steps
-        excessive = (self.peak_force > cfg.max_force) | (self.peak_moment > cfg.max_moment)
+        excessive = cfg.terminate_on_overload & (
+            (self.peak_force > cfg.max_force) | (self.peak_moment > cfg.max_moment))
         escaped = ((xy > cfg.workspace_xy_radius_m) | (tip[:, 2] > 0.03 * cfg.scale)
                    | (tip[:, 2] < -self.geometry.depth) | (tilt > math.radians(35)))
         self.length += 1

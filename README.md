@@ -4,17 +4,9 @@
 
 奖励函数、运行成本上界与终止判据详见 [REWARD.md](./REWARD.md)。
 
-位置与力觉的消融数据、dx/dy 合成偏差分布及当前瓶颈总结见
-[位置与力觉误差分析](./OBSERVATION_ERROR_ANALYSIS.md)。
-当前证据更支持末端参考点偏差和力/力矩固定零偏是主要观测瓶颈，
-而非当前幅度的逐步白噪声；XY 偏差与白噪声尚未完成严格独立拆分。
-
-碰撞几何：正方形使用一个旋转 box 插头和四个不重叠的 box 孔壁，
-保持原有几何边界、深度和间隙，但接触点及力响应可能与 mesh 版本不同。
-L 形也使用 box 组合，其他多边形仍使用凸 mesh。
-
-GPU 仿真容量使用 `nconmax=64`、`njmax=256`，初始化及课程切换重建时一致。
-接触池由同组环境共享，总容量为环境数乘以 64；约束容量为每环境 256。
+观测误差消融及限制见 [OBSERVATION_ERROR_ANALYSIS.md](./OBSERVATION_ERROR_ANALYSIS.md)。
+方形和 L 形使用 box 组合，其他多边形使用凸 mesh。仿真容量
+`nconmax/njmax=64/256`，圆形为 `512/2048`；接触池按同组环境数共享。
 
 ## 1. 原始 InsertAnything 实现的缺陷与我们的方法对比
 
@@ -38,12 +30,6 @@ GPU 仿真容量使用 `nconmax=64`、`njmax=256`，初始化及课程切换重�
 micromamba create -r ~/micromamba -n mj -c conda-forge python=3.13 pip -y
 micromamba run -r ~/micromamba -n mj python -m pip install -r requirements.txt
 ```
-
-核心依赖版本（见 [requirements.txt](./requirements.txt)）：
-- `torch>=2.14.1`
-- `mujoco>=3.11.0`, `mujoco-warp>=3.11.0`, `warp-lang>=1.18.0`
-- `mjlab>=1.6.0`, `rsl-rl-lib>=5.4.2`, `tensordict>=0.14.3`
-- `numpy>=2.4.6`, `trimesh>=5.1.1`, `viser>=1.1.1`, `pillow>=12.3.0`, `tensorboard>=2.21.0`
 
 ## 3. 核心命令
 
@@ -81,11 +67,8 @@ micromamba run -n mj python train.py \
   --resume --output runs/continuous_dual
 
 # Viser 网页实时查看训练快照（CPU 正向运动学，不占用 GPU 采样）
-# 力/力矩为滤波传感器值，含惯性负载、标定和坐标变换误差；
-# 不含策略观测额外添加的随机力噪声和固定力偏差，也不是安全判定的原始子步峰值。
-# 三维场景插头旁：红色为力，蓝色为力矩轴向量（右手定则），偏移原点不代表实际作用点。
-# 箭头随工具旋转，无数值标签；长度严格线性：5 N / 0.1 N·m 对应 30 mm，
-# 不做平方根放大或长度截断；两种载荷的箭头长度不能直接比较。
+# 红/蓝箭头为滤波力/力矩（非安全峰值，不含额外白噪声和 bias）；
+# 5 N / 0.1 N·m 各对应 30 mm，箭头偏移不代表作用点。
 micromamba run -n mj python viser_view.py \
   --run-dir runs/continuous_dual --host 127.0.0.1 --port 8080
 
@@ -93,6 +76,13 @@ micromamba run -n mj python viser_view.py \
 micromamba run -n mj python viser_view.py \
   --run-dir runs/continuous_dual --mode policy --device cuda:1 \
   --host 127.0.0.1 --port 8080
+
+# Geometry 常驻包含圆形；未训练形状自动切换回放，不改变训练任务。
+# 圆柱与网格接触仍受仿真器单接触点限制。
+micromamba run -n mj python viser_view.py \
+  --run-dir runs/continuous_dual --mode policy --shape circle --device cuda:0
+
+# --ignore-overload 仅关闭仿真回放的过载终止，保留载荷/越界/超时检查，非安全评估。
 
 # 冻结策略多条件泛化评估（输出 trials.csv 与 summary.json）
 micromamba run -n mj python evaluate.py runs/continuous_dual/checkpoint.pt \
@@ -121,45 +111,20 @@ CUDA_VISIBLE_DEVICES=0 micromamba run -r ~/micromamba -n mj python -u train.py \
   --envs-per-shape 512 --steps 256 \
   --success-noise-curriculum --physics-cuda-graph --observation-cuda-graph
 
-# 已有训练在线扩容：当前轮次保存后由守护进程恢复
-micromamba run -r ~/micromamba -n mj python train.py \
-  --resize-envs --envs-per-shape 512 --output runs/continuous_single
-
-# 优雅停止
-touch runs/continuous_single/STOP
-
-# 停止后恢复（使用保存的环境数和课程配置）
-rm -f runs/continuous_single/STOP
-CUDA_VISIBLE_DEVICES=0 micromamba run -r ~/micromamba -n mj python -u train.py \
-  --resume --output runs/continuous_single --device cuda:0
 ```
 
-此配置共 2560 个环境，每轮采样 655360 条 transition。接触状态和回合长度会影响
-吞吐与峰值显存。扩容保留权重、归一化器、优化器和课程，但重置进行中的回合及
-GRU 隐藏状态，并改变 PPO 采样批量；恢复训练使用已保存的配置。
+此配置共 2560 个环境，每轮 655360 条 transition。扩容保留模型、优化器和课程，
+重置回合及 GRU 状态；恢复使用保存配置，命令行噪声参数不会覆盖它。
 
-持续训练在每轮检查点保存后释放 PyTorch 未使用的 CUDA 分配缓存，避免变长 GRU
-训练工作区长期占据显存、拖慢下一轮仿真；分布式各 rank 分别释放本卡缓存。
-这不释放存活的模型、优化器或 CUDA Graph 缓冲区，也不能降低 PPO 更新本身的峰值需求。
-`heartbeat.json` 的 `cuda_memory` 记录各设备的存活分配、释放前后保留量及剩余显存。
+每轮更新 `checkpoint.pt`、上一轮 `previous.pt`；每 500 轮归档至
+`checkpoints/checkpoint_<八位轮次>.pt`，同名不覆盖、不自动清理。
+Release 续训需要完整 checkpoint 和对应 `config.json`；ONNX 仅供推理。
+恢复保留 actor、critic、归一化器、优化器和进度，但重新初始化回合与 GRU 状态。
 
-守护式持续训练每轮更新 `checkpoint.pt`，并保留上一轮 `previous.pt`。
-控制台的环境指标按完整名称排序，同前缀（如 `curriculum/success/`、
-`curriculum/episodes/`、`reward/`）相邻且顺序固定；不改变指标汇总或 TensorBoard 数值。
-另外，每到 500 的正整数倍 PPO 轮次，独立归档完整检查点到
-`checkpoints/checkpoint_<八位轮次>.pt`；这里的步数不是物理步或 transition。
-归档包含网络、优化器、归一化器、环境配置和课程状态，不自动清理。
-回退后再次经过同名轮次时保留已有归档，不覆盖它。单卡及分布式 rank 0 共用保存路径。
-
-持续训练每轮保存 `termination_counts.json`，按形状统计当前 worker 启动以来的
-完成回合数、成功、仅力过载、仅力矩过载、两者过载、工作空间/倾角越界及超时。
-按现有终止优先级互斥计数；这不是课程的最近 1000 回合窗口，也不证明失败的物理根因。
-worker 重启后重新计数；分布式模式目前只报告 rank 0 本地样本。
-同一文件的 `overload_stages` 将过载按真实尖端高度、回合时间、倾角分别分桶；
-三组各自互斥。位置/倾角为 reset 前的 20 ms 终止步末状态，不是原始 1 ms
-过载子步瞬间或首次接触位置，不能仅据此断言初始碰撞或孔内卡死的物理根因。
-启用物理 CUDA Graph 时，终止原因及阶段计数也使用独立 CUDA Graph 批量累加，
-减少逐步统计的内核启动开销；不改变计数口径，首次捕获不重复计数。
+每轮保存后释放未使用的 CUDA 缓存，显存统计见 `heartbeat.json`。
+`termination_counts.json` 为当前 worker 启动以来的互斥终止计数，多卡仅含 rank 0。
+`overload_stages` 分别按高度、时间、倾角分桶，取 20 ms 终止步末状态，
+不是 1 ms 冲击瞬间，不能据此认定失败根因。
 
 ### 回合固定力觉偏置与柔和自适应采样
 
@@ -187,20 +152,12 @@ worker 重启后重新计数；分布式模式目前只报告 rank 0 本地样�
 恢复时若幅度或分布改变，保留课程等级但清空旧成功率窗口，避免混用不同噪声分布。
 `--resume` 使用保存配置，命令行噪声参数不会覆盖已有配置。
 
-自适应采样只支持带成功率课程的**守护式持续训练**。总环境数不变，
-每 30 个 PPO 轮次最多检查一次；当前等级每种形状的 1000 回合窗口填满后，
-将失败率用 EMA（新值权重 0.2）平滑，以 **30% 均匀 + 70% 失败率比例**分配环境。
-课程升级后重置 EMA 并等待下一检查周期。取消单次变化幅度和每形状上下限；
-均匀项提供基准的 30% 保底，按 GPU 数取整（误差不超过一个分片），每形状每卡至少一个环境。
-达到零失败率时回归均匀目标；仍按真实回合统计课程，不对成功率加权。
-课程窗口按完整环境批次更新：每个并行环境每批只贡献一个当前等级完成回合，
-等待所有环境（包括慢速超时）收齐后才入账并检查晋级，避免重启后快速成功抢先
-抬高成功率。重启保留历史窗口，但丢弃尚未完成的统计批次；训练 rollout 不受影响。
-
-布局变化通过当前轮次保存后重建环境与 CUDA Graph 生效；保留网络、优化器、
-归一化器及课程，重置进行中的回合和 GRU 状态，不改变 PPO 总采样批量。
-多卡各 rank 使用同一全局布局并等分各形状。控制器状态保存在运行配置及检查点中，
-调整记录写入 `sampling_<iteration>.json`，心跳包含 `shape_environment_counts`。
+自适应采样仅支持成功率课程的守护式持续训练：每 30 轮检查一次，窗口填满后按
+**30% 均匀 + 70% 失败率比例**重分配环境（失败率 EMA 新值权重 0.2）。
+总环境数不变，按 GPU 数取整，每形状每卡至少一个；零失败时均分，课程升级重置 EMA。
+窗口每批等待所有环境各完成一个回合，避免快速成功造成偏差；重启丢弃未完成批次。
+布局在保存后重建，保留模型、优化器及课程，重置回合和 GRU；
+调整记录见 `sampling_<iteration>.json`，心跳记录各形状环境数。
 
 ### 初始位姿范围
 
@@ -209,51 +166,20 @@ Z 在孔口上方 4–10 mm；姿态旋转向量 X/Y 分量各 ±3°，Z 分量 
 X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
 旋转向量分量不是独立欧拉角，也不是总转角上限。
 
-这不是半径 20 mm 的圆盘：初始正方形角点半径为 28.28 mm。新训练显式使用
-`workspace_xy_radius_m=0.035`（`--workspace-xy-radius-m 0.035`）的横向安全圆盘，
-不改变 Z、倾角或力/力矩安全限制。配置会验证完整初始正方形位于安全圆盘内。
-半径以米表示，不再隐式随 `scale` 缩放；旧检查点缺失该字段仍按原 `0.025 * scale` m 恢复。
-旧检查点的 `initial_xy` 原样保留；该字段也缺失时使用历史默认 0.003 m。
-**冻结的 iteration 19610 检查点实际保存 `initial_xy=0.01`，即每轴 ±10 mm，
-不是历史代码默认的 ±3 mm，也不是新训练默认的 ±20 mm。**
+横向安全圆盘半径为 `workspace_xy_radius_m=0.035`，配置验证初始正方形完全位于其中。
+该半径不随 `scale` 缩放；旧检查点缺字段时沿用 `0.025*scale`，
+缺 `initial_xy` 时沿用 3 mm。实际运行范围以保存配置为准。
 
-以下显式参数对应此前扩大后的范围（已有训练恢复时使用保存配置）：
+`initial_plane_margin>0` 时根据实际外形抬高 Z 下界，确保整个插头高于孔板。
+仅在 reset 计算；不可行姿态最多重采样 16 次，仍失败则报错，不突破 Z 上限。
+默认零保持旧采样方式。
 
-```bash
---initial-xy 0.01 --initial-z-min 0.001 --initial-z-max 0.01 \
---initial-tilt-deg 20 --initial-yaw-deg 20
-```
+`plate_outer_radius_m=0.080` 使孔板至少具有 80 mm 内切半径，覆盖工作空间、
+插头端面及安全倾角投影；旧配置缺字段时保留原板面。孔口和间隙不变。
 
-这对应 X/Y 各 ±10 mm、Z 为 1–10 mm，旋转向量三个分量各 ±20°；
-最大水平偏离约 14.14 mm，总转角最大约 34.64°（`difficulty=1`）。
-扩大范围可能增加孔口初始接触和安全终止，不能据此保证成功率不降。
-改变这些范围后恢复训练会保留课程等级、清空旧成功率窗口；
-旧检查点缺失的 Z 参数按原始 4–10 mm 解释，保持兼容。
-
-`initial_plane_margin` 大于零时启用姿态与高度联动：按旋转后的实际插头外形
-（含 L 形两个部分的外轮廓，圆柱使用解析支撑半径）计算最低点，在满足整个插头
-高于孔口平面指定间隙的合法 Z 区间内均匀采样。真实夹持偏移已通过真实尖端定位抵消。
-当前训练使用 0.001 m，Z 上限仍为 0.01 m，X/Y 和旋转范围不变。
-不可行姿态最多采样 16 次，仍失败则显式报错，不静默越过高度上限。
-此规则偏保守：不允许任何插头部分低于孔口平面，即使该位置本可位于孔洞内。
-默认零保持旧采样行为；修改该值后恢复会清空成功率窗口、保留课程等级。
-仅在 reset 时进行 GPU 批量几何计算，不在逐物理步增加碰撞搜索。
-
-新训练 `plate_outer_radius_m=0.080`（`--plate-outer-radius-m`）将所有形状实体
-孔板外轮廓扩大到至少 **80 mm 内切半径**，孔口轮廓、间隙、材料摩擦与求解器不变。
-正多边形沿原径向分块延伸，方形/L 形使用无体积重叠的盒子拼接，孔洞不填充。
-覆盖验证下界是工作空间半径 + `sqrt(2)*10 mm*scale` 端面包络半径
-+ `35 mm*scale*sin(35°)` 倾斜侧向投影 + `1 mm*scale` 余量，
-默认约 70.22 mm，选择 80 mm 留出额外裕量。相对真实尖端，抓取平移已抵消；
-无界高斯误差与超过安全倾角的异常状态不承诺任意有限板面都覆盖。
-旧检查点缺字段使用 0，保留原约 20 mm 外轮廓。
-
-新训练 `success_opening_required=true`（`--no-success-opening-required` 可关闭）：
-每个成功保持步都要求**真实物理端面中心 XY 在孔口内部或边界**。
-多边形采用支持凹 L 形的射线奇偶判定，圆孔采用解析半径；不使用带噪/延迟位置，
-不恢复旧 `0.4*clearance` 精度门槛，也不要求整个插头投影完全包含，实际适配由碰撞约束负责。
-因此板外下探不会计为成功。旧检查点缺字段按 false 恢复。改变板外形或成功规则后
-必须重建环境/CUDA Graph 并清空成功窗口及自适应统计。
+`success_opening_required=true` 要求成功保持期间真实端面中心 XY 在孔内，
+不以带噪位置判定，也不要求整个投影包含；旧检查点缺字段按 false 恢复。
+位姿范围、板面或成功规则变化后需重建环境并清空旧成功统计，保留课程等级。
 
 ## 4. 架构与方法设计
 
@@ -264,21 +190,14 @@ X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
   1. `H` 系中目标位置减去当前估计尖端位置（3 维）
   2. 规范化相对四元数 `inverse(current) * target`（4 维，消除 `q/-q` 双重覆盖）
   3. `T` 系中关于名义尖端的重力补偿后滤波力旋量 `wrench`（6 维）
-- **仅位置观测延迟**：新训练 `position_observation_delay=true`。每个环境每次 reset
-  独立均匀采样 **0 或 1 个策略帧（0/20 ms）**，回合内固定。只延迟 Actor 的
-  `dx/dy/dz`：目标偏差、名义尖端标定与该历史帧的位置白噪声一并保留。
-  四元数与六轴力旋量仍取当前帧；Critic 始终使用当前干净真实状态，维数不变。
-  reset 用新回合初始带噪位置误差填满历史，部分 reset 不影响其他槽位。
-  历史按策略步 `length` 更新一次，重复读取、CUDA 预热/捕获不推进时间或队列；
-  确定性 `observations_from_noise` 不修改历史。
-  `--no-position-observation-delay` 恢复原即时位置观测；旧检查点缺字段自动按 false 加载。
-- **入孔后负载成本**：新训练 `inserted_load_cost=true`；真实端面中心 `z<-4 mm`
-  后仅惩罚固定孔系 Fx/Fy 与全部三个力矩，无死区，沿用已有归一化安全阈值、
-  有界平方成本和权重。入孔前维持 5 N/0.1 N·m 全范数死区；
-  完整原始三维力/力矩安全检查不变。详见 [REWARD.md](./REWARD.md)。
-  `--no-inserted-load-cost` 或旧检查点缺字段时沿用原奖励。
-  `--resume` 不会用命令行开关覆盖保存配置；启用新机制需显式迁移环境配置并清空
-  成功率窗口/自适应统计，不能把旧模型评估默认为新机制。
+- **位置延迟**：`position_observation_delay=true` 时，每回合固定随机延迟
+  0/20 ms，仅影响 Actor 的完整带噪位置误差；姿态、力觉及 Critic 仍取当前帧。
+  reset 初始化历史，每策略步只推进一次，读取和 CUDA 捕获不推进历史。
+  `--no-position-observation-delay` 可关闭；旧检查点缺字段按 false 恢复。
+- **入孔负载成本**：`inserted_load_cost=true` 时，真实端面中心 `z<-4 mm`
+  后惩罚孔系 Fx/Fy 及全部力矩，无死区；此前使用 5 N/0.1 N·m 全范数死区。
+  原始载荷安全检查不变。`--no-inserted-load-cost` 或旧配置缺字段时沿用原奖励，
+  详见 [REWARD.md](./REWARD.md)。
 - **Critic 特权输入（57 维）**：包含无噪真实状态、线速度/角速度、6 轴刚度与阻尼、质量/主惯量、下游质量/惯量、标定误差、夹持偏移及几何类别独热编码。
 - **循环策略网络**：观测经验归一化 → 两层 `GRU(128)` → `ELU MLP(128, 64)` → 每个动作的均值和 `log_std`（各 6 维）。采用 rsl_rl 原生 `HeteroscedasticGaussianDistribution`，各维独立采样，标准差限制为 `[0.02, 1.0]`；根据观测与循环历史学习探索强度，不硬编码入孔阶段。评估和 TorchScript/ONNX 导出仍只使用 6 维均值动作。
   不再维护独立的全局 std 参数；`init_std` 只用于新网络的输出层初始化。日志 `Mean action std` 是最后一次策略分布计算中 std 张量的整体均值，不是按入孔阶段统计的 rollout 均值。
@@ -293,16 +212,10 @@ python migrate_policy_std.py runs/continuous_single/checkpoint.pt \
 python train.py --resume --output runs/continuous_state_std --device cuda:0
 ```
 
-迁移保留均值策略、GRU、归一化、价值网络、训练步数及未改变参数的优化器状态；
-新增 std 输出权重初始化为零，偏置为旧各维有效 `log_std`，因此初始动作分布不变。
-输出层优化器矩保留原均值部分，新增 std 部分从零开始；原全局 std 参数及其优化器状态移除。
-标准差上下限沿用源运行配置，课程归零并清空成功窗口、自适应采样历史，环境数恢复各形状均分。
-这不是从随机权重重训；新分布可能过早收缩探索，收益仍需通过成功率、超限率和确定性评估验证。
-
-可选 `--initial-std 0.1 --noise-level 1`：保留均值策略，将六维 std 初始化为 0.1，
-从目标间隙、10% 噪声幅度开始（仍按幅度线性递增，不采用平方根缩放）。
-省略这些参数则继承旧有效 std 并从完整课程 0 开始。std 输出权重为零不妨碍该层
-权重和偏置获得梯度；初次反传中共享网络仍由均值分支训练，之后 std 分支也可向共享层传播梯度。
+迁移保留均值策略、GRU、归一化、Critic、进度及兼容的优化器状态；
+std 新权重置零、偏置继承旧 `log_std`，新增优化器矩置零，删除旧全局 std。
+课程和采样历史重置，环境均分。可选 `--initial-std 0.1 --noise-level 1`
+指定初始 std 和 10% 噪声；省略时继承旧 std，从课程 0 开始。迁移收益需另行评估。
 
 ### 4.2 参数化凸几何与物理模型
 - **几何构建**（[insertion/geometry.py](./insertion/geometry.py)）：无需外部 USD 资产，程序化生成正三角形、方形、正五边形、正六边形、L 形及测试用圆形。正多边形外接圆半径 `10 mm`，L 形包络 `20 mm`，孔深 `25 mm`，插头长 `35 mm`。孔壁拆分为独立凸棱柱以保持中心孔贯通，L 形插头拆分为双盒体保留凹口。
@@ -322,20 +235,12 @@ python train.py --resume --output runs/continuous_state_std --device cuda:0
 
 ### 4.4 当前训练与独立诊断
 
-当前续训目录为 `runs/continuous_position_delay20mm/`，继承第 19704 轮权重及 Adam
-状态，使用 0/20 ms 位置延迟、X/Y 各 ±20 mm、35 mm 横向边界及 80 mm 最小内切
-半径孔板。成功要求真实端面中心在孔口内；中心 `z < -4 mm` 后切换为无死区
-横向力/全力矩成本。满噪声、满难度、0.1 mm 间隙固定，不推进课程。
-
-默认训练不包含失败池、随机意图或恢复课程。旧失败池和随机意图尝试分别归档于
-`feat/failure-replay`、`feat/coherent-exploration`，未取得预期脱困效果，已暂停。
-独立恢复试验也未完成收益验证，协议见 [RECOVERY_EXPERIMENT.md](./RECOVERY_EXPERIMENT.md)；
-这些试验不会由普通训练入口自动启用。
-
-普通策略的观测误差诊断入口为 [evaluate_noise_ablation.py](./evaluate_noise_ablation.py)，
-支持逐项消融、夹持误差通道分解及精确 XY/力觉联合对照。结果与限制见
-[OBSERVATION_ERROR_ANALYSIS.md](./OBSERVATION_ERROR_ANALYSIS.md)。
-联合 oracle 对照的 632/640 不代表部署能力或当前训练环境的成功率。
+运行参数以对应 `config.json` 和 checkpoint 为准，不以代码默认值推断历史训练。
+普通入口不启用失败池、随机意图或恢复课程；独立恢复试验见
+[RECOVERY_EXPERIMENT.md](./RECOVERY_EXPERIMENT.md)。
+观测消融入口为 [evaluate_noise_ablation.py](./evaluate_noise_ablation.py)，
+结果及限制见 [OBSERVATION_ERROR_ANALYSIS.md](./OBSERVATION_ERROR_ANALYSIS.md)；
+oracle 对照不代表部署能力。
 
 ## 5. 离线推理接口
 

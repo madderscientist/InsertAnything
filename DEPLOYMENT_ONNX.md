@@ -1,286 +1,125 @@
-# ONNX deployment contract for the real-robot integration agent
+# ONNX deployment guide
 
-## 0. Scope and readiness
+This is a simulation-trained inference model, not a robot controller or validated safety system. `contract.json` is authoritative for the exported iteration, training configuration, tensor interface and source SHA256. Numerical equivalence does not establish real-robot readiness.
 
-This package is an inference interface, NOT a robot controller or a validated
-real-robot safety system. The policy has only been trained/evaluated in simulation.
-Check the exported model's exact
-iteration, curriculum level, environment parameters and SHA256 in `contract.json`.
-Do not interpret passing ONNX equivalence tests as successful sim-to-real validation.
+## 1. Files and interface
 
-Historical exports included iteration 13574 at 20% noise; this is not the
-configuration of every subsequent export. The current model's source iteration
-and environment are recorded in `contract.json`. ONNX returns the deterministic mean:
-no action sampling, no std input, no artificial exploration on the robot.
-This file describes the interface for any export; `contract.json` is authoritative
-for the particular file. Robot dimensions, sensor calibration, sign convention,
-gravity compensation, controller bandwidth and contact compliance must be verified
-by the integration team before enabling motion.
+- `actor.onnx`: deterministic mean policy with embedded observation normalization.
+- `contract.json`: interface, coordinate conventions and source configuration.
+- Optional `validation.json` and `test_vectors.npz`: recurrent equivalence results and reference observations/actions/hidden states. Test-vector reset flags indicate when to zero the hidden input; compare with `rtol=1e-4, atol=1e-5`.
 
-## 1. Files and dependencies
-
-- `actor.onnx`: observation normalization + two-layer GRU + ELU MLP, deterministic.
-- `contract.json`: input/action semantics, limits, source and training configuration.
-- `validation.json`: CPU ONNX/PyTorch recurrent sequence equivalence and ONNX-only latency.
-- `test_vectors.npz`: ordered test observations, PyTorch reference mean actions,
-  reference hidden outputs and boolean reset flags. At a true flag zero the input
-  hidden state; otherwise feed the preceding ONNX hidden output. Compare actions
-  and states with rtol=1e-4, atol=1e-5. This tests inference, not the sensor adapter.
-
-Inference needs Python, NumPy and ONNX Runtime, not MuJoCo, Torch or mjlab:
+Inference requires only NumPy and ONNX Runtime:
 
 ```bash
 python -m pip install numpy onnxruntime
 ```
 
-Repository export additionally needs `onnx`, `onnxscript`, `onnxruntime` and Torch.
-All observations/states are finite `float32`, C-contiguous arrays. Fixed batch one:
-
-| Name | Shape | Meaning |
+| Tensor | Shape | Meaning |
 |---|---|---|
-| `obs` input | `[1,13]` | unnormalized SI-unit observation |
-| `h_in` input | `[2,1,128]` | previous GRU state |
-| `actions` output | `[1,6]` | deterministic, unbounded mean action |
-| `h_out` output | `[2,1,128]` | state for next policy tick |
+| `obs` | `[1,13]` | Unnormalized observation |
+| `h_in` | `[2,1,128]` | Previous GRU state |
+| `actions` | `[1,6]` | Unbounded deterministic mean |
+| `h_out` | `[2,1,128]` | Next GRU state |
 
-Normalization statistics are embedded: DO NOT normalize/clamp observations again.
-Export with `--onnx --prune-std` to physically remove the six unused log-std
-rows and their biases from the final head. The interface and mean actions remain
-unchanged; `contract.json` records `onnx.std_head_pruned`.
-The network does NOT perform pose transforms, filtering, action clipping,
-workspace checks, success detection or safety-stop handling.
+All tensors are finite, contiguous `float32`, with fixed batch size one. Do not normalize observations again or sample exploration noise. Exporting with `--onnx --prune-std` removes the unused standard-deviation head without changing mean actions.
 
-## 2. Coordinates, units and pose
+## 2. Frames and observations
 
-All frames are right-handed; positions in meters, rotations in radians, force in N,
-moment in N*m. Quaternions are unit Hamilton quaternions in **w,x,y,z** order.
-`R_AB` maps coordinates from frame B into A; `q_AB` is the corresponding quaternion.
+Use right-handed frames, SI units (`m`, `s`, `rad`, `N`, `N*m`) and Hamilton unit quaternions in **w,x,y,z** order. `R_AB` maps B-frame vectors into A; `q_AB` represents the same rotation.
 
-- H: fixed hole frame, origin at the hole entrance plane, +Z outward/upward.
-  Insertion proceeds along -Z. H X/Y encode the hole's chosen yaw reference.
-- T: nominal tool/peg-tip frame. Orientation follows the tool body; origin is the
-  calibrated nominal peg tip, NOT the robot flange or sensor origin.
-- S: physical force/torque sensor frame at the sensor reference point.
-- B: robot base/world frame, used only by the external robot adapter.
+- **H**: fixed hole frame at the entrance; +Z points outward, insertion proceeds along -Z.
+- **T**: nominal tool-tip frame, following tool orientation; not the flange or sensor origin.
+- **S**: force/torque sensor frame at its measurement reference point.
+- **B**: robot base/world frame.
 
-Convert measured TCP/nominal-tip pose into H:
+Transform the calibrated measured tip pose from B into H. Flange feedback first requires the real flange-to-tip transform; do not inject simulation grasp offsets.
 
 ```text
 p_HT = R_HB * (p_BT - p_BH)
 q_HT = inverse(q_BH) * q_BT
+
+obs[0,0:3]   = p_goal_H - p_HT
+obs[0,3:7]   = canonical(inverse(q_HT) * q_goal_H)
+obs[0,7:10]  = filtered force at nominal tip, in T
+obs[0,10:13] = filtered moment about nominal tip, in T
 ```
 
-If robot feedback is the flange pose, first apply the calibrated flange-to-tip
-rigid transform. Do NOT add a simulation "grasp offset" to a real measured pose.
-Calibrate the actual tool; residual errors are not something to inject manually.
+The goal is expressed in H; for example, `[0,0,-0.015]` is 15 mm insertion depth, not a universal target. Read the source configuration for training depths. Position error stays in fixed H; do not rotate it into T, add shape IDs or fold orientation by shape symmetry.
 
-The goal pose is in H. A nominal example is `p_goal=[0,0,-0.015]`,
-`q_goal=[1,0,0,0]`, meaning a 15 mm target depth and aligned tool axes.
-Use the real task's verified target depth, not this example blindly.
-Training sampled 5--22.5 mm depth. No shape ID or symmetry folding goes into obs.
-Do not assume that a 180-degree-flipped tool frame matches the trained convention.
+`canonical(q)` normalizes q and selects the sign making its first component with absolute value above `1e-8` positive, in w,x,y,z order. Reject zero/invalid quaternions. Training may delay only position observations by 0/20 ms; this is outside ONNX. Measure actual sensor latency rather than adding artificial delays or noise.
 
-Observation layout (zero-based):
+## 3. Force/torque preprocessing
 
-```text
-obs[0,0:3]  = p_goal_H - p_tip_H
-obs[0,3:7]  = canonical(inverse(q_HT) * q_goal_H)
-obs[0,7:10] = filtered, gravity-compensated force at tip, expressed in T
-obs[0,10:13]= filtered, gravity-compensated moment about nominal tip, expressed in T
-```
+Use all six sensor channels. Subtract electronic zero bias and compensate gravity for all downstream hardware, without double compensation or taring away contact. Verify signs using known applied forces/moments: the model expects external load on the tool. Simulation retains downstream inertial load; do not assume an ideal contact-only signal or remove dynamic loads without validation.
 
-Position error is in **fixed H**, NOT in the moving tool frame.
-New training can set `position_observation_delay=true`: each episode independently
-selects 0 or 1 policy frame (0/20 ms), affecting only the complete noisy position
-error, never orientation or wrench. The simulator retains historical position
-noise and initializes history from the new episode; this is NOT implemented inside
-ONNX. Consult `contract.json` for the particular model. Legacy checkpoints missing
-the field retain immediate observations. Do not inject artificial noise or choose
-robot latency blindly; measure and validate the external sensor adapter.
-Relative orientation uses **inverse(current) * goal**, not the opposite order.
-Canonical quaternion: normalize, then choose sign so the first component whose
-absolute value exceeds 1e-8 in w,x,y,z order is positive. Usually this means w>=0.
-Reject invalid/zero quaternions rather than silently replacing them by identity.
-
-## 3. Force/torque processing: implement this outside ONNX
-
-### 3.1 Calibrate and establish signs
-
-Start from the complete six-axis wrench `[Fx,Fy,Fz,Mx,My,Mz]` at S, in S axes.
-Subtract calibrated sensor electronic zero offsets and compensate the static
-gravity wrench of ALL hardware downstream of S at the current orientation.
-Do not tare away an existing contact force. Do not double-compensate if the sensor
-driver already compensates gravity.
-
-Simulation disables gravity and models contact minus downstream inertial load.
-Its wrench is not an ideal contact-only signal: downstream inertia remains.
-The nominal downstream simulated mass is 0.2--0.4 kg in training (not the entire
-robot reflected inertia). Do not subtract all dynamic/inertial load by default.
-Real mass/COM, acceleration and sign conventions need independent verification.
-
-Vendor sign conventions differ (load-on-sensor versus sensor-on-tool). Match the
-simulation's external load-on-tool convention using known static applied forces
-and moments in each axis. Do not guess or blindly negate all six channels.
-Never directly feed wrist-frame moments without shifting their reference point.
-
-### 3.2 Low-pass at the sensor/wrist reference point
-
-Training low-passes the compensated six-axis sensor wrench in tool-following
-sensor axes, BEFORE shifting to the tip:
+Low-pass the compensated wrench in sensor axes **before** shifting its reference point:
 
 ```text
 tau = 0.015 seconds
 alpha = 1 - exp(-actual_sensor_dt / tau)
-filtered_S = filtered_S + alpha * (compensated_wrench_S - filtered_S)
+filtered_S += alpha * (compensated_wrench_S - filtered_S)
 ```
 
-Training updates at 1000 Hz (dt=0.001, alpha approximately 0.064493);
-the actor reads the latest result at 50 Hz.
-Use timestamped high-rate samples if available. Filtering only at 50 Hz is not
-numerically equivalent when there are intervening samples, motion or impacts.
-Do not low-pass twice in both driver and application without characterizing it.
-Simulation resets the filter to zero each episode. A real filter reset must only
-occur in a confirmed safe unloaded state; it must not mask a live contact.
+Training updates at 1 kHz and reads at 50 Hz; filtering only at 50 Hz is not equivalent. Use timestamps and avoid duplicate filtering. Reset a physical filter only in a verified safe unloaded state.
 
-### 3.3 Rotate and shift to nominal tip
-
-Let `R_TS` map S axes to T axes, and let `r_ST_T` be the vector FROM the sensor
-reference point TO the nominal tip, expressed in T:
+Let `R_TS` map S into T, and `r_ST_T` point from the sensor origin to the nominal tip, expressed in T:
 
 ```text
 F_T = R_TS * filtered_F_S
 M_T = R_TS * filtered_M_S - cross(r_ST_T, F_T)
-wrench_tip_T = [F_T, M_T]
 ```
 
-Use real calibrated extrinsics and lever arm. Training nominally uses aligned
-sensor/tool axes and sensor-to-tip displacement `[0,0,-0.08]` m, but 80 mm is NOT
-a universal robot constant. Test the sign with a known lateral force applied at
-the tip: after the shift, moment about that same tip should be near zero.
+Use measured extrinsics and lever arm, not the simulation's nominal 80 mm offset. A known lateral force applied at the tip should yield approximately zero moment about that tip after transformation. Simulation bias, mounting error, white noise and hysteresis model uncertainty; do not deliberately inject them into robot measurements.
 
-No added white noise, artificial zero bias, mounting error or curriculum scaling
-is needed on the robot. The simulation's per-episode force/moment biases affect
-actor observations only; they are not a preprocessing correction to apply.
-Do not assume validated robustness from training configuration alone. Check this
-export's source configuration and independent evaluation; historical checkpoints
-may have been trained at only a fraction of the configured noise amplitude.
+## 4. Actions and controller
 
-## 4. Actions and external impedance controller
-
-Run at **50 Hz (20 ms)** with synchronized latest pose and processed wrench.
-Always reject nonfinite output. Do not clamp actions; multiply each component by
-the exported per-component scale (verify `contract.json`; its legacy field names
-contain `limit`):
+At **50 Hz**, use synchronized pose and processed wrench. Scale each action component using `translation_limit_m` and `rotation_component_limit_rad` from the contract; these legacy names denote scales, not bounds. Typical values are 0.001 m and 0.5 degrees:
 
 ```text
-dp_H = actions[0,0:3] * 0.001 m
-dr_H = actions[0,3:6] * (0.5*pi/180) rad
+dp_H = actions[0,0:3] * translation_limit_m
+dr_H = actions[0,3:6] * rotation_component_limit_rad
 p_target_H = CURRENT measured nominal-tip position_H + dp_H
 q_target_HT = canonical(ExpQuaternion(dr_H) * CURRENT q_HT)
 ```
 
-Rotation is a rotation vector expressed in H, applied by LEFT multiplication.
-The scale is per component; there is no action clamp or maximum increment.
-This is NOT a velocity command, absolute pose, force command or flange displacement.
-Do not multiply by 0.02 again, or integrate onto last cycle's commanded target.
-Pure rotation keeps the nominal tip position fixed; convert that target to the
-robot flange using the real rigid transform, rather than rotating around the flange.
+Rotation is an H-frame rotation vector applied by **left multiplication**, about the nominal tip. Actions are increments, not velocities: do not multiply by 0.02 or integrate onto the previous commanded target. ONNX performs no clipping; clipping externally changes the policy and requires validation. Independent hardware safety envelopes remain mandatory.
 
-Transform target back to B before passing to a verified Cartesian impedance/
-compliance controller. Training uses impedance at the tip and 1 kHz physics/control;
-50 Hz policy commands do not replace a high-rate compliant low-level controller.
-Sending these targets to a stiff position controller is NOT equivalent.
-Training randomizes diagonal stiffness (300--2500 N/m, 4--12 N*m/rad), damping and
-stiffness axes. Those are simulation ranges, not validated hardware gains.
-Do not invent a low-level gain schedule or execute automatic movements from this file.
+Transform targets back to B and convert tip targets to flange targets using calibrated geometry. Training uses high-rate compliant impedance control, not a stiff position servo; its randomized gains are not approved hardware gains. The 50 Hz policy does not replace the low-level controller.
 
-## 5. Recurrent state and a minimal inference-only example
+## 5. Minimal inference
 
 ```python
 import numpy as np
 import onnxruntime as ort
 
-options = ort.SessionOptions()
-options.intra_op_num_threads = 1
-options.inter_op_num_threads = 1
-session = ort.InferenceSession(
-    "actor.onnx", sess_options=options, providers=["CPUExecutionProvider"])
+session = ort.InferenceSession("actor.onnx", providers=["CPUExecutionProvider"])
 h = np.zeros((2, 1, 128), dtype=np.float32)
 
 def reset_policy():
-    global h
     h.fill(0)
 
-def infer_observation(obs):
+def infer(obs):
     global h
     obs = np.ascontiguousarray(obs, dtype=np.float32)
     if obs.shape != (1, 13) or not np.isfinite(obs).all():
-        raise ValueError("Invalid policy observation; stop through independent safety system")
-    actions, next_h = session.run(None, {"obs": obs, "h_in": h})
+        raise ValueError("Invalid observation")
+    actions, next_h = session.run(["actions", "h_out"], {"obs": obs, "h_in": h})
     if not np.isfinite(actions).all() or not np.isfinite(next_h).all():
         raise RuntimeError("Invalid policy output/state")
     h = next_h
     return actions
 ```
 
-This example performs NO robot I/O and intentionally does NOT build a control loop.
-Keep one state per tool/task; carry `h_out` to the next invocation. Reset to zeros
-at each new insertion attempt, after repositioning, emergency/safety stops,
-communication interruption, or a model change. Do NOT reset every tick.
-Do not advance the GRU twice for the same sensor tick or run one policy state
-across unrelated robots. On late/stale/missing data, stop/hold according to the
-independent controller's safety procedure; do not silently send zeros and continue.
+This example has no robot I/O. Carry `h_out` into the next tick; reset at each new attempt, repositioning, stop, communication interruption or model change, not every tick. Keep separate state per task and advance it only once per sensor tick. Invalid/stale data or inference errors must invoke the independent controller's stop/hold procedure, not a silent zero-action fallback.
 
-## 6. Independent safety, success and commissioning
+## 6. Safety and validation
 
-ONNX has NO safety checks. The existing TorchScript wrapper's checks are NOT
-embedded in this file. The hardware integration must provide independently:
+ONNX contains no pose transforms, filtering, safety checks or success detection. Hardware integration must independently provide:
 
-- High-rate RAW compensated force/moment monitoring, NOT just the 15 ms filter
-  used by the actor. Simulation terminates if the tip force norm exceeds 30 N or
-  tip moment norm exceeds 2 N*m at ANY 1 ms substep; these are simulation limits,
-  not a certification that they are safe for this robot, fixture, peg or person.
-  Use hardware-specific, independently validated lower limits where required.
-- Workspace, tilt, joint, velocity, acceleration, singularity, self-collision,
-  fixture collision and communication watchdog constraints.
-- Independent emergency stop and a supervised, unloaded dry run before contact.
-  No autonomous recovery/retry based solely on a model output.
-- Proper gravity/sign/extrinsic calibration and a force-at-tip lever-arm test.
-- Verified compliant controller and conservative hardware motion/force envelopes.
+- High-rate raw compensated load monitoring, workspace/tilt/joint/motion/collision limits and a communication watchdog.
+- Emergency stop, calibrated sensor signs/extrinsics, a verified compliant controller and supervised unloaded commissioning.
+- Task-specific success sensing and validated contact tests; no automatic recovery based solely on model output.
 
-New simulation configs use horizontal radial distance <=35 mm, explicitly
-containing independent +/-20 mm X/Y starts (square corner radius 28.28 mm).
-Legacy checkpoints missing `workspace_xy_radius_m` retain 25 mm times saved scale;
-read `workspace_xy_m` in the exported contract, not a hardcoded new default.
-`workspace_xy_geometry=radial_disk` makes the offline target guard radial as well;
-legacy exported contracts without this field retain their previous per-axis guard.
-Simulation tip Z remains in
-[-25 mm,30 mm], tilt <=35 degrees, and 8 s episode timeout. Treat these as training
-semantics, not as hardware approval. Match geometries and scale; simulation has
-no robot kinematics, backlash, cable forces, sensor saturation or controller faults.
+Normal simulation terminates above 30 N force norm or 2 N*m tip-moment norm at any 1 ms substep. These are training thresholds, not certified hardware limits; choose independently validated hardware-specific limits. Success and workspace rules vary by checkpoint: consult the source environment's `success_*`, `workspace_xy_radius_m` and episode settings rather than inferring them from appearance.
 
-The legacy iteration-13574 checkpoint uses the strict success rule below.
-New training defaults to target depth reached for 100 ms with the true bottom-face
-center inside the opening on every hold tick (`success_opening_required=true`).
-This rejects off-plate descents, not a fine XY/tilt/yaw alignment gate. Concave L
-openings use inclusive polygon membership; circles use their analytic radius.
-Legacy checkpoints missing this field retain their historical success semantics.
-New plates have minimum outer inradius 80 mm (`plate_outer_radius_m=.080`);
-legacy missing fields retain the original footprint, encoded as zero.
-See `success_alignment_required` in the source environment (missing means legacy).
-Legacy training success is NOT "looks inserted": target depth within 0.2 mm, XY error
-<0.4*clearance, tilt <0.4*clearance/peg_length, symmetry-aware yaw
-<0.4*clearance/radius for 5 consecutive 20 ms ticks, with no safety failure.
-At 0.1 mm clearance, XY tolerance is 40 micrometers. Real success needs independent
-task-specific sensing/validation; do not claim the hardware can observe training
-ground-truth quantities at this precision. Symmetry handling is for success/reward,
-not for folding ONNX input orientation.
-
-Initial-state correction in this run keeps the entire rotated peg at least 1 mm
-above the hole plane, not just its nominal tip center. Do not start a tilted peg
-with an edge already intersecting the fixture. Start from a collision-checked pose.
-
-The package has been validated for recurrent numerical equivalence on the export
-machine CPU. Actual target-machine end-to-end latency, clocks, sensor pipeline,
-robot bandwidth and real contact behavior still require validation. Never interpret
-an inference timing report as evidence of physical safety.
+Start from collision-checked poses. Validate target-machine end-to-end timing, sensor processing, controller bandwidth and contact behavior before motion; inference latency and simulation success do not establish physical safety.

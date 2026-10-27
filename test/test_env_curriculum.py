@@ -92,10 +92,31 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             self.assertEqual(info["reason"].item(), reason)
             self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
             getattr(group, field).zero_()
+        group.cfg = replace(cfg, training=False, terminate_on_overload=False)
+        group.peak_force.fill_(100)
+        group.peak_moment.fill_(10)
+        group.hold.fill_(4)
+        _, done, info = PlantGroup.step_outcome(group, actions)
+        self.assertTrue(done.item())
+        self.assertEqual(info["reason"].item(), 1)
+        self.assertEqual(group.peak_force.item(), 100)
+        self.assertEqual(group.peak_moment.item(), 10)
+        group.hold.zero_()
+        position[:, 2] = 0
+        _, done, _ = PlantGroup.step_outcome(group, actions)
+        self.assertFalse(done.item())
+        group.length.fill_(math.ceil(cfg.episode_seconds / 0.02))
+        _, done, info = PlantGroup.step_outcome(group, actions)
+        self.assertTrue(done.item())
+        self.assertEqual(info["reason"].item(), 4)
         group.hold.fill_(4)
         position[:, 0] = cfg.workspace_xy_radius_m + 0.001
         _, _, info = PlantGroup.step_outcome(group, actions)
         self.assertEqual(info["reason"].item(), 3)
+        group.cfg = cfg
+        group.peak_force.zero_()
+        group.peak_moment.zero_()
+        group.length.zero_()
         position[:, 0] = 0
         position[:, 2] = -0.0147
         group.hold.zero_()

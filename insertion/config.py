@@ -39,6 +39,7 @@ class InsertionCfg:
     rotation_limit: float = math.radians(0.5)
     max_force: float = 30.0
     max_moment: float = 2.0
+    terminate_on_overload: bool = True
     filter_seconds: float = 0.015
     wrench_hysteresis_fraction: float = 0.001
     initial_xy: float = 0.020
@@ -93,6 +94,8 @@ class InsertionCfg:
     timeout_penalty: float = 10.0
 
     def __post_init__(self) -> None:
+        if self.training and not self.terminate_on_overload:
+            raise ValueError("disabling overload termination is only allowed in simulation evaluation")
         if not math.isfinite(self.inserted_load_depth_m) or self.inserted_load_depth_m < 0:
             raise ValueError("inserted_load_depth_m must be finite and nonnegative")
         if self.circle_sides is not None and (
