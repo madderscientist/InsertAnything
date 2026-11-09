@@ -265,9 +265,9 @@ class PlantGroup:
         else:
             self.goal[ids, 2] = -self.uniform(n, 1, low_depth, high_depth)[:, 0]
         if cfg.dynamics == "train":
-            low, high, rot_low, rot_high = 300., 2500., 4., 12.
+            low, high, rot_low, rot_high = 150., 2500., 2., 12.
         elif cfg.dynamics == "soft":
-            low, high, rot_low, rot_high = 300., 600., 1.5, 3.
+            low, high, rot_low, rot_high = 150., 600., 1.5, 3.
         elif cfg.dynamics == "stiff":
             low, high, rot_low, rot_high = 3000., 5000., 15., 22.
         else:

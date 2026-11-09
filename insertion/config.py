@@ -46,9 +46,9 @@ class InsertionCfg:
     workspace_xy_radius_m: float = 0.035
     plate_outer_radius_m: float = 0.080
     initial_z_min: float = 0.004
-    initial_z_max: float = 0.01
+    initial_z_max: float = 0.02
     initial_plane_margin: float = 0.0
-    initial_tilt: float = math.radians(3)
+    initial_tilt: float = math.radians(8)
     initial_yaw: float = math.radians(15)
     position_bias: float = 0.0005
     tip_calibration_error: float = 0.0005
@@ -58,7 +58,7 @@ class InsertionCfg:
     position_noise: float = 0.0005
     rotation_noise: float = math.radians(1.5)
     force_noise: float = 0.2
-    moment_noise: float = 0.001
+    moment_noise: float = 0.015
     force_bias: float = 0.5
     moment_bias: float = 0.1
     wrench_bias_distribution: str = "uniform_magnitude"
@@ -82,7 +82,7 @@ class InsertionCfg:
     xy_cost_radius_fraction: float = 0.25
     orientation_cost_per_second: float = 1.0
     orientation_cost_reference_deg: float = 5.0
-    preinsertion_tilt_weight: float = 0.0
+    preinsertion_tilt_weight: float = 0.5
     force_cost_per_second: float = 1.0
     moment_cost_per_second: float = 1.0
     force_cost_free_n: float = 5.0

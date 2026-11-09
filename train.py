@@ -78,9 +78,11 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         observation_cuda_graph=args.observation_cuda_graph,
         position_observation_delay=args.position_observation_delay,
         inserted_load_cost=args.inserted_load_cost,
+        moment_noise=args.moment_noise,
         force_bias=args.force_bias, moment_bias=args.moment_bias,
         wrench_bias_distribution=args.wrench_bias_distribution,
         wrench_hysteresis_fraction=args.wrench_hysteresis_fraction,
+        preinsertion_tilt_weight=args.preinsertion_tilt_weight,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
         workspace_xy_radius_m=args.workspace_xy_radius_m,
         plate_outer_radius_m=args.plate_outer_radius_m,
@@ -573,6 +575,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "position_observation_delay", "inserted_load_cost", "inserted_load_depth_m",
                     "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
                     "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
+                    "moment_noise", "preinsertion_tilt_weight",
                     "initial_z_min", "initial_z_max",
                     "initial_tilt", "initial_yaw", "initial_plane_margin",
                 )
@@ -855,14 +858,18 @@ def main() -> None:
     parser.add_argument("--initial-z-min", type=float, default=0.004)
     parser.add_argument("--initial-plane-margin", type=float, default=0.,
                         help="minimum whole-peg height above hole plane in meters; zero disables")
-    parser.add_argument("--initial-z-max", type=float, default=0.01)
-    parser.add_argument("--initial-tilt-deg", type=float, default=3.,
+    parser.add_argument("--initial-z-max", type=float, default=0.02)
+    parser.add_argument("--initial-tilt-deg", type=float, default=8.,
                         help="initial rotation-vector X/Y component half range in degrees")
     parser.add_argument("--initial-yaw-deg", type=float, default=15.,
                         help="initial rotation-vector Z component half range in degrees")
+    parser.add_argument("--moment-noise", type=float, default=0.015,
+                        help="per-step tip moment Gaussian noise std in Nm")
     parser.add_argument("--moment-bias", type=float, default=0.1,
                         help="maximum moment bias vector magnitude in Nm "
                              "(per-axis half range in legacy per_axis mode)")
+    parser.add_argument("--preinsertion-tilt-weight", type=float, default=0.5,
+                        help="baseline tilt orientation cost weight above hole plane in [0, 1]")
     parser.add_argument("--wrench-bias-distribution", choices=("uniform_magnitude", "per_axis"),
                         default="uniform_magnitude",
                         help="uniform vector magnitude and isotropic direction, or legacy independent axes")

@@ -150,7 +150,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         for kwargs in ({"shape_env_counts": (1,)}, {"force_bias": -1},
                        {"moment_bias": float("nan")}, {"adaptive_sampling": True},
                        {"wrench_bias_distribution": "invalid"},
-                       {"initial_z_min": 0.}, {"initial_z_min": 0.02},
+                       {"initial_z_min": 0.}, {"initial_z_min": 0.025},
                        {"initial_z_max": float("nan")}, {"initial_z_max": 0.03}):
             with self.assertRaises(ValueError):
                 InsertionCfg(**kwargs)
@@ -160,7 +160,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(old.wrench_hysteresis_fraction, 0.)
         self.assertEqual(InsertionCfg().wrench_hysteresis_fraction, 0.001)
         self.assertEqual(old.environment_counts, (512,) * 5)
-        self.assertEqual((old.initial_z_min, old.initial_z_max), (0.004, 0.01))
+        self.assertEqual((old.initial_z_min, old.initial_z_max), (0.004, 0.02))
 
     def terms(self, z=0.001, xy=0., depth=0.015, tilt=0., yaw=0., force=0.,
               moment=0., success=False, failure=False, timeout=False, action=0., previous=0.):
@@ -220,15 +220,16 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             signal, rtol=0, atol=0)
 
     def test_zero_preinsertion_tilt_cost_and_depth_ramp(self):
-        self.assertEqual(InsertionCfg().preinsertion_tilt_weight, 0.)
+        w0 = InsertionCfg().preinsertion_tilt_weight
+        self.assertEqual(w0, 0.5)
         for z in (0.004, 0.):
-            self.assertEqual(float(self.terms(z=z, tilt=10.)["orientation_penalty"]), 0.)
+            self.assertAlmostEqual(float(self.terms(z=z, tilt=5.)["orientation_penalty"]), -0.01 * w0)
         for depth in (0.005, 0.015, 0.0225):
             for inserted_mm in (0., 1., 2., 3., 4., 6.):
                 with self.subTest(depth=depth, inserted_mm=inserted_mm):
                     penalty = self.terms(
                         z=-inserted_mm*0.001, depth=depth, tilt=5.)["orientation_penalty"]
-                    weight = min(inserted_mm/4., 1.)
+                    weight = w0 + (1. - w0) * min(inserted_mm/4., 1.)
                     self.assertAlmostEqual(float(penalty), -0.01*weight)
             expected = -0.02*2.*2.*math.tanh(((depth-0.002)/depth)/2.)
             self.assertAlmostEqual(
@@ -288,7 +289,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertGreater(mouth_delta, 0.)
         linear_delta = 0.08*(math.tanh(1.08/2)-math.tanh(1./2))
         self.assertLess(mouth_delta, linear_delta)
-        self.assertEqual(self.reward(z=0.001, tilt=5.), hover)
+        self.assertLess(self.reward(z=0.001, tilt=5.), hover)
         self.assertLess(self.reward(z=0.001, yaw=5.), self.reward(z=0.001, tilt=5.))
         self.assertLess(float(self.terms(z=-0.013, tilt=3.)["orientation_penalty"]),
                         float(self.terms(z=-0.002, tilt=3.)["orientation_penalty"]))

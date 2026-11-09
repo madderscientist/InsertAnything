@@ -466,7 +466,8 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
         for key, value in (("initial_xy", 0.01), ("initial_tilt", 0.35),
                            ("initial_yaw", 0.35), ("initial_z_min", 0.001),
-                           ("initial_z_max", 0.02), ("initial_plane_margin", 0.001),
+                           ("initial_z_max", 0.025), ("initial_plane_margin", 0.001),
+                           ("moment_noise", 0.001), ("preinsertion_tilt_weight", 0.0),
                            ("success_alignment_required", True), ("success_hold_steps", 6),
                            ("position_observation_delay", False), ("inserted_load_cost", False),
                            ("inserted_load_depth_m", .006),
