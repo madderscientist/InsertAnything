@@ -308,7 +308,7 @@ class PlantGroup:
             self.down_inertia[ids] = 0.0005 * cfg.scale**2
         self.sim.model.body_mass[ids, self.body_id] = self.mass[ids, 0]
         self.sim.model.body_inertia[ids, self.body_id] = self.inertia[ids]
-        friction = self.uniform(n, 1, 0.25, 0.6)
+        friction = self.uniform(n, 1, 0.25, 0.85)
         if cfg.dynamics == "nominal":
             friction.fill_(0.4)
         self.sim.model.geom_friction[ids, :, 0] = friction
