@@ -82,6 +82,8 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         force_bias=args.force_bias, moment_bias=args.moment_bias,
         wrench_bias_distribution=args.wrench_bias_distribution,
         wrench_hysteresis_fraction=args.wrench_hysteresis_fraction,
+        stiction_force=args.stiction_force,
+        stiction_moment=args.stiction_moment,
         preinsertion_tilt_weight=args.preinsertion_tilt_weight,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
         workspace_xy_radius_m=args.workspace_xy_radius_m,
@@ -230,6 +232,12 @@ def contract(cfg: InsertionCfg) -> dict:
             "rate_per_second": cfg.impedance_walk_rate_per_second,
             "target_interval_seconds": cfg.impedance_walk_interval_seconds,
             "time_constant_seconds": cfg.impedance_walk_time_constant_seconds,
+            "nominal_disabled": True,
+        },
+        "actuator_stiction_deadband": {
+            "force_max_n": cfg.stiction_force,
+            "moment_max_nm": cfg.stiction_moment,
+            "difficulty_scaled": True,
             "nominal_disabled": True,
         },
         "clearance_definition": "opposing-face dimension difference; each wall offset is half",
@@ -576,6 +584,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
                     "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
                     "moment_noise", "preinsertion_tilt_weight",
+                    "stiction_force", "stiction_moment",
                     "initial_z_min", "initial_z_max",
                     "initial_tilt", "initial_yaw", "initial_plane_margin",
                 )
@@ -875,6 +884,10 @@ def main() -> None:
                         help="uniform vector magnitude and isotropic direction, or legacy independent axes")
     parser.add_argument("--wrench-hysteresis-fraction", type=float, default=0.001,
                         help="force/moment sensor hysteresis loop span as a fraction of configured range")
+    parser.add_argument("--stiction-force", type=float, default=0.6,
+                        help="maximum per-axis upstream actuator translational stiction deadband in N")
+    parser.add_argument("--stiction-moment", type=float, default=0.06,
+                        help="maximum per-axis upstream actuator rotational stiction deadband in Nm")
     parser.add_argument("--adaptive-sampling", action="store_true",
                         help="supervised continuous training: gently rebalance shape environments")
     parser.add_argument("--clearance-curriculum",

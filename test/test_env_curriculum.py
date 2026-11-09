@@ -150,12 +150,15 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         for kwargs in ({"shape_env_counts": (1,)}, {"force_bias": -1},
                        {"moment_bias": float("nan")}, {"adaptive_sampling": True},
                        {"wrench_bias_distribution": "invalid"},
+                       {"stiction_force": -0.1}, {"stiction_moment": float("nan")},
                        {"initial_z_min": 0.}, {"initial_z_min": 0.025},
                        {"initial_z_max": float("nan")}, {"initial_z_max": 0.03}):
             with self.assertRaises(ValueError):
                 InsertionCfg(**kwargs)
         old = InsertionCfg.from_checkpoint({"envs_per_shape": 512})
         self.assertEqual(old.force_bias, 0.)
+        self.assertEqual((old.stiction_force, old.stiction_moment), (0., 0.))
+        self.assertEqual((InsertionCfg().stiction_force, InsertionCfg().stiction_moment), (0.6, 0.06))
         self.assertEqual(old.wrench_bias_distribution, "per_axis")
         self.assertEqual(old.wrench_hysteresis_fraction, 0.)
         self.assertEqual(InsertionCfg().wrench_hysteresis_fraction, 0.001)
@@ -319,6 +322,18 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             current = bounded_stiffness_step(current, target, initial, lower, upper, 0.01, 1., 0.05)
             self.assertTrue(bool((current >= lower).all() & (current <= upper).all()))
             self.assertTrue(bool(((current - before).abs() <= initial * 0.05 * 0.01 + 1e-10).all()))
+        group = SimpleNamespace(
+            gain_q=torch.tensor([[1., 0., 0., 0.]], dtype=torch.float64),
+            k=torch.tensor([[200., 200., 200., 4., 4., 4.]], dtype=torch.float64),
+            d=torch.tensor([[10., 10., 10., 1., 1., 1.]], dtype=torch.float64),
+            stiction=torch.tensor([[0.6, 0.6, 0.6, 0.06, 0.06, 0.06]], dtype=torch.float64))
+        zero_v = torch.zeros(1, 3, dtype=torch.float64)
+        inside = PlantGroup.impedance(group, torch.tensor([[0.002, -0.003, 0.]], dtype=torch.float64), zero_v, slice(0, 3))
+        torch.testing.assert_close(inside, zero_v)
+        outside = PlantGroup.impedance(
+            group, torch.tensor([[0.005, -0.005, 0.]], dtype=torch.float64),
+            torch.tensor([[0.01, 0., 0.]], dtype=torch.float64), slice(0, 3))
+        torch.testing.assert_close(outside, torch.tensor([[0.3, -0.4, 0.]], dtype=torch.float64))
 
     def test_clearance_difficulty_and_noise_curriculum(self):
         levels = (0.002, 0.001, 0.0005, 0.00025, 0.00015, 0.0001)

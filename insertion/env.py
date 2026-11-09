@@ -136,6 +136,7 @@ class PlantGroup:
             device=device)
         self.k = torch.zeros(self.n, 6, device=device)
         self.d = torch.zeros_like(self.k)
+        self.stiction = torch.zeros_like(self.k)
         self.initial_k = torch.zeros_like(self.k, dtype=torch.float64)
         self.walk_lower = torch.zeros_like(self.initial_k)
         self.walk_upper = torch.zeros_like(self.initial_k)
@@ -306,6 +307,12 @@ class PlantGroup:
             self.gain_q[ids] = self.identity[ids]
             self.down_mass[ids] = 0.3
             self.down_inertia[ids] = 0.0005 * cfg.scale**2
+        if cfg.dynamics == "nominal" or (cfg.stiction_force == 0 and cfg.stiction_moment == 0):
+            self.stiction[ids] = 0
+        else:
+            self.stiction[ids] = torch.cat((
+                self.uniform(n, 3, 0., cfg.stiction_force),
+                self.uniform(n, 3, 0., cfg.stiction_moment)), -1) * self.difficulty
         self.sim.model.body_mass[ids, self.body_id] = self.mass[ids, 0]
         self.sim.model.body_inertia[ids, self.body_id] = self.inertia[ids]
         friction = self.uniform(n, 1, 0.25, 0.85)
@@ -422,7 +429,9 @@ class PlantGroup:
                   part: slice) -> torch.Tensor:
         frame_inv = quat_inv(self.gain_q)
         local_e, local_v = rotate(frame_inv, error), rotate(frame_inv, velocity)
-        return rotate(self.gain_q, self.k[:, part] * local_e - self.d[:, part] * local_v)
+        spring = self.k[:, part] * local_e
+        spring = spring.sign() * (spring.abs() - self.stiction[:, part]).clamp_min(0.)
+        return rotate(self.gain_q, spring - self.d[:, part] * local_v)
 
     def sample_impedance_walk_target(self) -> None:
         if self.cfg.dynamics == "nominal" or self.cfg.impedance_walk_fraction == 0:

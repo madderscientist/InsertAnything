@@ -76,6 +76,8 @@ class InsertionCfg:
     impedance_walk_rate_per_second: float = 0.05
     impedance_walk_interval_seconds: float = 1.0
     impedance_walk_time_constant_seconds: float = 1.0
+    stiction_force: float = 0.6
+    stiction_moment: float = 0.06
     time_cost_per_second: float = 1.0
     position_cost_per_second: float = 2.0
     position_cost_cap: float = 2.0
@@ -140,7 +142,8 @@ class InsertionCfg:
         noise = (self.initial_xy, self.initial_tilt, self.initial_yaw, self.position_bias,
                  self.tip_calibration_error, self.grasp_position_error, self.sensor_rotation_error,
                  self.position_noise, self.rotation_noise, self.force_noise, self.moment_noise,
-                 self.force_bias, self.moment_bias, self.wrench_hysteresis_fraction)
+                 self.force_bias, self.moment_bias, self.wrench_hysteresis_fraction,
+                 self.stiction_force, self.stiction_moment)
         if any(x < 0 or not math.isfinite(x) for x in noise):
             raise ValueError("randomization magnitudes must be finite and nonnegative")
         if self.wrench_bias_distribution not in ("uniform_magnitude", "per_axis"):
@@ -261,6 +264,8 @@ class InsertionCfg:
         values.setdefault("inserted_load_depth_m", 0.0)
         values.setdefault("force_bias", 0.0)
         values.setdefault("moment_bias", 0.0)
+        values.setdefault("stiction_force", 0.0)
+        values.setdefault("stiction_moment", 0.0)
         values.setdefault("wrench_bias_distribution", "per_axis")
         values.setdefault("wrench_hysteresis_fraction", 0.0)
         values.setdefault("initial_xy", 0.003)
