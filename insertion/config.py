@@ -78,6 +78,7 @@ class InsertionCfg:
     impedance_walk_time_constant_seconds: float = 1.0
     stiction_force: float = 0.6
     stiction_moment: float = 0.06
+    wall_friction_force: float = 4.0
     time_cost_per_second: float = 1.0
     position_cost_per_second: float = 2.0
     position_cost_cap: float = 2.0
@@ -91,6 +92,7 @@ class InsertionCfg:
     moment_cost_free_nm: float = 0.1
     action_cost_per_second: float = 0.05
     action_change_cost_per_second: float = 0.05
+    action_cost_cap: float = 4.0
     completion_bonus: float = 20.0
     safety_failure_penalty: float = 200.0
     timeout_penalty: float = 10.0
@@ -143,7 +145,7 @@ class InsertionCfg:
                  self.tip_calibration_error, self.grasp_position_error, self.sensor_rotation_error,
                  self.position_noise, self.rotation_noise, self.force_noise, self.moment_noise,
                  self.force_bias, self.moment_bias, self.wrench_hysteresis_fraction,
-                 self.stiction_force, self.stiction_moment)
+                 self.stiction_force, self.stiction_moment, self.wall_friction_force)
         if any(x < 0 or not math.isfinite(x) for x in noise):
             raise ValueError("randomization magnitudes must be finite and nonnegative")
         if self.wrench_bias_distribution not in ("uniform_magnitude", "per_axis"):
@@ -185,7 +187,7 @@ class InsertionCfg:
             raise ValueError("minimum target depth exceeds the scaled hole's maximum target depth")
         cost_positive = (self.time_cost_per_second, self.position_cost_per_second,
                          self.position_cost_cap, self.xy_cost_radius_fraction,
-                         self.orientation_cost_reference_deg,
+                         self.orientation_cost_reference_deg, self.action_cost_cap,
                          self.completion_bonus, self.safety_failure_penalty)
         if any(not math.isfinite(x) or x <= 0 for x in cost_positive):
             raise ValueError("completion cost scales must be finite and positive")
@@ -223,8 +225,9 @@ class InsertionCfg:
         return self.physics_dt*self.decimation*(
             self.time_cost_per_second + self.position_cost_per_second*self.position_cost_cap
             + 2*self.orientation_cost_per_second + self.force_cost_per_second
-            + self.moment_cost_per_second + self.action_cost_per_second*math.sqrt(6)
-            + self.action_change_cost_per_second*2*math.sqrt(6))
+            + self.moment_cost_per_second
+            + self.action_cost_per_second*self.action_cost_cap*math.sqrt(6)
+            + self.action_change_cost_per_second*2*self.action_cost_cap*math.sqrt(6))
 
     @property
     def environment_counts(self) -> tuple[int, ...]:
@@ -266,6 +269,8 @@ class InsertionCfg:
         values.setdefault("moment_bias", 0.0)
         values.setdefault("stiction_force", 0.0)
         values.setdefault("stiction_moment", 0.0)
+        values.setdefault("wall_friction_force", 0.0)
+        values.setdefault("action_cost_cap", 4.0)
         values.setdefault("wrench_bias_distribution", "per_axis")
         values.setdefault("wrench_hysteresis_fraction", 0.0)
         values.setdefault("initial_xy", 0.003)

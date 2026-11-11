@@ -80,8 +80,8 @@ def completion_cost_terms(
                        / cfg.max_moment).clamp(0, 1)
         force = torch.where(inserted, lateral_force, force)
         moment = torch.where(inserted, full_moment, moment)
-    applied = actions.clamp(-1, 1)
-    previous = previous_actions.clamp(-1, 1)
+    applied = cfg.action_cost_cap * torch.tanh(actions / cfg.action_cost_cap)
+    previous = cfg.action_cost_cap * torch.tanh(previous_actions / cfg.action_cost_cap)
     return {
         "time_penalty": torch.full_like(xy, -dt*cfg.time_cost_per_second),
         "position_penalty": -dt*cfg.position_cost_per_second*distance,
@@ -137,6 +137,8 @@ class PlantGroup:
         self.k = torch.zeros(self.n, 6, device=device)
         self.d = torch.zeros_like(self.k)
         self.stiction = torch.zeros_like(self.k)
+        self.wall_friction = torch.zeros(self.n, device=device)
+        self.wall_force_z = torch.zeros(self.n, device=device)
         self.initial_k = torch.zeros_like(self.k, dtype=torch.float64)
         self.walk_lower = torch.zeros_like(self.initial_k)
         self.walk_upper = torch.zeros_like(self.initial_k)
@@ -313,6 +315,10 @@ class PlantGroup:
             self.stiction[ids] = torch.cat((
                 self.uniform(n, 3, 0., cfg.stiction_force),
                 self.uniform(n, 3, 0., cfg.stiction_moment)), -1) * self.difficulty
+        if cfg.dynamics == "nominal" or cfg.wall_friction_force == 0:
+            self.wall_friction[ids] = 0
+        else:
+            self.wall_friction[ids] = self.uniform(n, 1, 0., cfg.wall_friction_force)[:, 0] * self.difficulty
         self.sim.model.body_mass[ids, self.body_id] = self.mass[ids, 0]
         self.sim.model.body_inertia[ids, self.body_id] = self.inertia[ids]
         friction = self.uniform(n, 1, 0.25, 0.85)
@@ -384,7 +390,7 @@ class PlantGroup:
         self.targets_q[:, ids] = q.unsqueeze(0)
         for buffer in (self.length, self.hold, self.peak_force, self.peak_moment,
                        self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor,
-                       self.hysteresis_sensor):
+                       self.hysteresis_sensor, self.wall_force_z):
             buffer[ids] = 0
         if cfg.position_observation_delay:
             self.reset_position_observation(ids, nominal_tip)
@@ -461,7 +467,9 @@ class PlantGroup:
         acc = self.sim.data.qacc[:, :3]
         alpha_local = self.sim.data.qacc[:, 3:6]
         omega_local = self.sim.data.qvel[:, 3:6]
-        contact_f = self.sim.data.qfrc_constraint[:, :3]
+        contact_f = torch.cat((
+            self.sim.data.qfrc_constraint[:, :2],
+            (self.sim.data.qfrc_constraint[:, 2] + self.wall_force_z).unsqueeze(-1)), dim=-1)
         contact_m = rotate(q, self.sim.data.qfrc_constraint[:, 3:6])
         inertial_m = rotate(q, self.down_inertia * alpha_local
                             + torch.linalg.cross(omega_local, self.down_inertia * omega_local))
@@ -563,7 +571,14 @@ class PlantGroup:
         force = self.impedance(self.physics_p_goal - p_tip, v_tip, slice(0, 3)).clamp(-40, 40)
         angular_error = quat_rotvec(quat_mul(self.physics_q_goal, quat_inv(q)))
         moment_tip = self.impedance(angular_error, omega, slice(3, 6)).clamp(-3, 3)
-        self.applied_wrench[:, :3].copy_(force)
+        true_tip = pos + rotate(q, self.offset)
+        in_opening = (true_tip[:, :2].square().sum(-1) <= self.geometry.radius**2).float()
+        depth_scale = ((-true_tip[:, 2] - 0.0005) / 0.004).clamp(0., 1.) * in_opening
+        max_wall_f = self.wall_friction * depth_scale
+        wall_f = (-force[:, 2] - self.mass[:, 0] * v[:, 2] / 0.005).clamp(-max_wall_f, max_wall_f)
+        self.wall_force_z.copy_(wall_f)
+        applied_f = torch.cat((force[:, :2], (force[:, 2] + wall_f).unsqueeze(-1)), dim=-1)
+        self.applied_wrench[:, :3].copy_(applied_f)
         self.applied_wrench[:, 3:].copy_(moment_tip + torch.linalg.cross(r_ct, force))
 
     def physics_sensor(self) -> None:

@@ -68,6 +68,8 @@
 | `InsertionCfg.initial_tilt` (`--initial-tilt-deg`) | `3°` | **`8°`** | 初始旋转向量 X/Y 半幅从 `3°` 扩展至 `8°`，覆盖真机起手姿态偏差 |
 | `PlantGroup.reset` (`dynamics="train"` 刚度范围) | `[300, 2500] N/m`<br>`[4, 12] N·m/rad` | **`[150, 2500] N/m`**<br>**`[2, 12] N·m/rad`** | 下探覆盖桌面串联机械臂在长工具下的真实等效末端平移/旋转刚度，并与 `soft` 评估模式对齐 |
 | `InsertionCfg.stiction_force / stiction_moment` (`--stiction-force / --stiction-moment`) | `0.0 N` / `0.0 N·m` | **`0.6 N` / `0.06 N·m`** | 建模腕部力传感器上游的关节残余静摩擦死区，迫使策略在落入死区时主动放大动作冲破粘滞 |
+| `InsertionCfg.wall_friction_force` (`--wall-friction-force`) | `0.0 N` | **`4.0 N`** | 建模入孔后孔壁周向抱紧与层纹滑动摩擦阻力（随入孔深度线性激活并计入腕部力传感器 $F_z$），防止策略在孔内遇到轴向阻力或圆孔零 $M_z$ 时误判为孔板表面而停止下压 |
+| `InsertionCfg.action_cost_cap` (`--action-cost-cap`) | `1.0` (`clamp`) | **`4.0` (`tanh`)** | 将动作与动作差分惩罚从硬截断 `clamp(-1,1)` 改为 `4.0 * tanh(a/4.0)`，保留小幅探索微颤的同时消除 `|a|>1` 区间的零梯度失控抽搐 |
 | `PlantGroup.reset` (`geom_friction` 滑动摩擦范围) | `[0.25, 0.6]` | **`[0.25, 0.85]`** | 覆盖 3D 打印件层纹与孔口边缘高摩擦接触，配合低刚度迫使策略在横向搜索时控制下压力 |
 | `train.restore_environment_progress` | 未监控 `moment_noise` 与 `preinsertion_tilt_weight` | **加入 `changed_fields`** | 从旧检查点迁移至新参数续训时，自动保留当前课程等级并清空旧分布下的成功率统计窗口 |
 
@@ -124,6 +126,8 @@ micromamba run -r ~/micromamba -n mj python -u train.py \
        moment_bias=0.1,
        stiction_force=0.6,
        stiction_moment=0.06,
+       wall_friction_force=4.0,
+       action_cost_cap=4.0,
        preinsertion_tilt_weight=0.5,
        initial_z_max=0.02,
        initial_tilt=math.radians(8.0),

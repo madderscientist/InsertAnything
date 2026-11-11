@@ -151,6 +151,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
                        {"moment_bias": float("nan")}, {"adaptive_sampling": True},
                        {"wrench_bias_distribution": "invalid"},
                        {"stiction_force": -0.1}, {"stiction_moment": float("nan")},
+                       {"wall_friction_force": -1.}, {"action_cost_cap": 0.},
                        {"initial_z_min": 0.}, {"initial_z_min": 0.025},
                        {"initial_z_max": float("nan")}, {"initial_z_max": 0.03}):
             with self.assertRaises(ValueError):
@@ -158,7 +159,10 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         old = InsertionCfg.from_checkpoint({"envs_per_shape": 512})
         self.assertEqual(old.force_bias, 0.)
         self.assertEqual((old.stiction_force, old.stiction_moment), (0., 0.))
+        self.assertEqual(old.wall_friction_force, 0.)
+        self.assertEqual(old.action_cost_cap, 4.)
         self.assertEqual((InsertionCfg().stiction_force, InsertionCfg().stiction_moment), (0.6, 0.06))
+        self.assertEqual((InsertionCfg().wall_friction_force, InsertionCfg().action_cost_cap), (4.0, 4.0))
         self.assertEqual(old.wrench_bias_distribution, "per_axis")
         self.assertEqual(old.wrench_hysteresis_fraction, 0.)
         self.assertEqual(InsertionCfg().wrench_hysteresis_fraction, 0.001)
@@ -298,6 +302,10 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
                         float(self.terms(z=-0.002, tilt=3.)["orientation_penalty"]))
         self.assertEqual(float(self.terms(force=5.)["force_penalty"]), 0)
         self.assertLess(float(self.terms(force=6.)["force_penalty"]), 0)
+        self.assertLess(float(self.terms(action=3.)["action_penalty"]),
+                        float(self.terms(action=1.)["action_penalty"]))
+        self.assertLess(float(self.terms(action=3., previous=-1.)["action_change_penalty"]),
+                        float(self.terms(action=1., previous=-1.)["action_change_penalty"]))
         worst = self.reward(z=1000., xy=1000., tilt=180., yaw=180.,
                             force=1000., moment=1000., action=100., previous=-100.)
         self.assertGreaterEqual(worst, -cfg.completion_step_cost_bound)

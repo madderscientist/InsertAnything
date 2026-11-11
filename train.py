@@ -84,6 +84,8 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         wrench_hysteresis_fraction=args.wrench_hysteresis_fraction,
         stiction_force=args.stiction_force,
         stiction_moment=args.stiction_moment,
+        wall_friction_force=args.wall_friction_force,
+        action_cost_cap=args.action_cost_cap,
         preinsertion_tilt_weight=args.preinsertion_tilt_weight,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
         workspace_xy_radius_m=args.workspace_xy_radius_m,
@@ -240,6 +242,13 @@ def contract(cfg: InsertionCfg) -> dict:
             "difficulty_scaled": True,
             "nominal_disabled": True,
         },
+        "hole_wall_axial_friction": {
+            "force_max_n": cfg.wall_friction_force,
+            "activation": "true tip inside hole opening radius, linear ramp from z=-0.5mm to -4.5mm",
+            "difficulty_scaled": True,
+            "nominal_disabled": True,
+        },
+        "action_cost_cap": cfg.action_cost_cap,
         "clearance_definition": "opposing-face dimension difference; each wall offset is half",
         "simulation_only": True,
     }
@@ -584,7 +593,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
                     "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
                     "moment_noise", "preinsertion_tilt_weight",
-                    "stiction_force", "stiction_moment",
+                    "stiction_force", "stiction_moment", "wall_friction_force", "action_cost_cap",
                     "initial_z_min", "initial_z_max",
                     "initial_tilt", "initial_yaw", "initial_plane_margin",
                 )
@@ -888,6 +897,10 @@ def main() -> None:
                         help="maximum per-axis upstream actuator translational stiction deadband in N")
     parser.add_argument("--stiction-moment", type=float, default=0.06,
                         help="maximum per-axis upstream actuator rotational stiction deadband in Nm")
+    parser.add_argument("--wall-friction-force", type=float, default=4.0,
+                        help="maximum in-hole axial wall rubbing friction resistance in N")
+    parser.add_argument("--action-cost-cap", type=float, default=4.0,
+                        help="smooth tanh saturation scale for action and action-change costs")
     parser.add_argument("--adaptive-sampling", action="store_true",
                         help="supervised continuous training: gently rebalance shape environments")
     parser.add_argument("--clearance-curriculum",

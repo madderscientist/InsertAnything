@@ -469,6 +469,7 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                            ("initial_z_max", 0.025), ("initial_plane_margin", 0.001),
                            ("moment_noise", 0.001), ("preinsertion_tilt_weight", 0.0),
                            ("stiction_force", 0.0), ("stiction_moment", 0.0),
+                           ("wall_friction_force", 0.0), ("action_cost_cap", 1.0),
                            ("success_alignment_required", True), ("success_hold_steps", 6),
                            ("position_observation_delay", False), ("inserted_load_cost", False),
                            ("inserted_load_depth_m", .006),

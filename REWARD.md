@@ -23,7 +23,7 @@ C_t=w_t+w_p D_t+w_o O_t+w_F f_t^2+w_M m_t^2
     +w_a\|\bar a_t\|_2+w_{\Delta a}\|\bar a_t-\bar a_{t-1}\|_2
 $$
 
-其中 $\bar a_t=\mathrm{clip}(a_t,-1,1)$，仅用于保持动作成本有界，不限制送入物理目标变换的策略动作。单步奖励为：
+其中 $\bar a_t=c_a\tanh(a_t/c_a)$（默认 $c_a=4.0$），既保持动作成本有界以满足安全罚分下界定理，又在无界动作空间 $|a|>1$ 区间提供平滑恢复梯度以抑制失控大幅跳变，同时不限制送入物理目标变换的策略动作。单步奖励为：
 
 $$
 r_t=-\Delta t\,C_t+B\,\mathbf{1}_S
@@ -48,6 +48,7 @@ $$
 | `inserted_load_depth_m` | 0.004 | 上述成本切换深度，严格小于负深度才启用 |
 | `action_cost_per_second` | 0.05 | $w_a$，动作幅度成本系数 |
 | `action_change_cost_per_second` | 0.05 | $w_{\Delta a}$，相邻步动作变化成本系数 |
+| `action_cost_cap` | 4.0 | $c_a$，动作与动作差分成本的 `tanh` 平滑饱和尺度 |
 | `completion_bonus` | 20.0 | $B$，达标保持 5 步后的一次性成功奖励 |
 | `safety_failure_penalty` | 200.0 | $P_X$，安全超限或逃出工作空间的一次性惩罚 |
 | `timeout_penalty` | 10.0 | $P_T$，超时未完成的一次性惩罚 |
