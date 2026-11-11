@@ -238,7 +238,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
                         z=-inserted_mm*0.001, depth=depth, tilt=5.)["orientation_penalty"]
                     weight = w0 + (1. - w0) * min(inserted_mm/4., 1.)
                     self.assertAlmostEqual(float(penalty), -0.01*weight)
-            expected = -0.02*2.*2.*math.tanh(((depth-0.002)/depth)/2.)
+            expected = -0.02*2.*math.tanh((depth-0.002)/depth)
             self.assertAlmostEqual(
                 float(self.terms(z=-0.002, depth=depth)["position_penalty"]), expected)
         for z in (0.004, 0., -0.0075, -0.015):
@@ -312,13 +312,18 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertLess(self.reward(failure=True), -cfg.completion_step_cost_bound / (1 - PPO_DISCOUNT))
 
     def test_squared_xy_and_linear_remaining_depth(self):
-        for xy in (0., 0.0002, 0.001, 0.0025, 0.005):
+        for xy in (0., 0.0002, 0.001, 0.0025, 0.005, 0.020):
             for z in (0.004, 0., -0.0075, -0.015, -0.02):
                 with self.subTest(xy=xy, z=z):
-                    metric = (xy/0.0025)**2 + max(z+0.015, 0.)/0.015
-                    expected = -0.08*math.tanh(metric/2.)
+                    xy_term = math.tanh((xy/0.0025)**2)
+                    z_term = math.tanh(max(z+0.015, 0.)/0.015)
+                    expected = -0.04*(xy_term + z_term)
                     self.assertAlmostEqual(
                         float(self.terms(xy=xy, z=z)["position_penalty"]), expected)
+            # Z-descent reward gradient must remain strictly positive even at 20 mm XY offset
+            self.assertGreater(
+                float(self.terms(xy=xy, z=0.001)["position_penalty"]),
+                float(self.terms(xy=xy, z=0.020)["position_penalty"]))
 
     def test_bounded_stiffness_walk_math(self):
         initial = torch.tensor([[300., 1500., 2500., 4., 8., 12.]], dtype=torch.float64)

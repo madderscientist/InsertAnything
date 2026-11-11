@@ -58,9 +58,12 @@ def completion_cost_terms(
 ) -> dict[str, torch.Tensor]:
     dt = cfg.physics_dt*cfg.decimation
     remaining = z_disp.clamp_min(0)/target_depth
-    # XY 单独平方以放宽中心附近探索，剩余深度保持线性
-    distance = (xy/(radius*cfg.xy_cost_radius_fraction)).square() + remaining
-    distance = cfg.position_cost_cap*torch.tanh(distance/cfg.position_cost_cap)
+    # XY 与 Z 各自独立 tanh 饱和后再相加，防止大平面偏差饱和外层 tanh 抹平 Z 轴下压梯度
+    half_cap = 0.5*cfg.position_cost_cap
+    xy_distance = half_cap*torch.tanh(
+        (xy/(radius*cfg.xy_cost_radius_fraction)).square()/half_cap)
+    z_distance = half_cap*torch.tanh(remaining/half_cap)
+    distance = xy_distance + z_distance
     reference = math.radians(cfg.orientation_cost_reference_deg)
     tilt_error, yaw_error = (tilt/reference).square(), (yaw/reference).square()
     # 倾角权重在最低点进入前 4 mm 内线性增强，与最终目标深度无关
@@ -268,23 +271,29 @@ class PlantGroup:
         else:
             self.goal[ids, 2] = -self.uniform(n, 1, low_depth, high_depth)[:, 0]
         if cfg.dynamics == "train":
-            low, high, rot_low, rot_high = 150., 2500., 2., 12.
+            low, high, rot_low, rot_high = 120., 1200., 1.5, 10.
         elif cfg.dynamics == "soft":
-            low, high, rot_low, rot_high = 150., 600., 1.5, 3.
+            low, high, rot_low, rot_high = 120., 600., 1.5, 3.
         elif cfg.dynamics == "stiff":
             low, high, rot_low, rot_high = 3000., 5000., 15., 22.
         else:
             low = high = 1500.
             rot_low = rot_high = 8.
-        self.k[ids] = torch.cat((self.uniform(n, 3, low, high),
-                                 self.uniform(n, 3, rot_low, rot_high)), -1)
+        if cfg.dynamics == "train":
+            self.k[ids] = torch.cat((
+                self.uniform(n, 3, math.log(low), math.log(high)).exp(),
+                self.uniform(n, 3, math.log(rot_low), math.log(rot_high)).exp()), -1)
+        else:
+            self.k[ids] = torch.cat((self.uniform(n, 3, low, high),
+                                     self.uniform(n, 3, rot_low, rot_high)), -1)
         lower = torch.tensor([low]*3 + [rot_low]*3, device=self.device)
         upper = torch.tensor([high]*3 + [rot_high]*3, device=self.device)
         if cfg.training and cfg.dynamics == "train":
-            center = torch.tensor([1500.]*3 + [8.]*3, device=self.device)
-            self.k[ids] = center + self.difficulty * (self.k[ids] - center)
-            lower = center + self.difficulty * (lower-center)
-            upper = center + self.difficulty * (upper-center)
+            center = torch.tensor([math.sqrt(low*high)]*3 + [math.sqrt(rot_low*rot_high)]*3,
+                                  device=self.device)
+            self.k[ids] = center * (self.k[ids] / center) ** self.difficulty
+            lower = center * (lower / center) ** self.difficulty
+            upper = center * (upper / center) ** self.difficulty
         self.initial_k[ids] = self.k[ids].double()
         self.walk_lower[ids] = torch.maximum(lower, self.initial_k[ids]*(1-cfg.impedance_walk_fraction))
         self.walk_upper[ids] = torch.minimum(upper, self.initial_k[ids]*(1+cfg.impedance_walk_fraction))
@@ -321,7 +330,7 @@ class PlantGroup:
             self.wall_friction[ids] = self.uniform(n, 1, 0., cfg.wall_friction_force)[:, 0] * self.difficulty
         self.sim.model.body_mass[ids, self.body_id] = self.mass[ids, 0]
         self.sim.model.body_inertia[ids, self.body_id] = self.inertia[ids]
-        friction = self.uniform(n, 1, 0.25, 0.85)
+        friction = self.uniform(n, 1, 0.25, 1.15)
         if cfg.dynamics == "nominal":
             friction.fill_(0.4)
         self.sim.model.geom_friction[ids, :, 0] = friction
