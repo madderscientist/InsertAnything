@@ -55,6 +55,7 @@ def completion_cost_terms(
     success: torch.Tensor, safety_failure: torch.Tensor, timeout: torch.Tensor,
     *, tip_center_z: torch.Tensor | None = None,
     hole_force: torch.Tensor | None = None,
+    overloaded: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     dt = cfg.physics_dt*cfg.decimation
     remaining = z_disp.clamp_min(0)/target_depth
@@ -71,27 +72,42 @@ def completion_cost_terms(
     tilt_weight = cfg.preinsertion_tilt_weight + (1-cfg.preinsertion_tilt_weight)*tilt_progress
     tilt_cost, yaw_cost = tilt_error/(1+tilt_error), yaw_error/(1+yaw_error)
     orientation = tilt_weight*tilt_cost + yaw_cost
-    force = ((torch.linalg.vector_norm(wrench[:, :3], dim=-1)-cfg.force_cost_free_n)
-             / (cfg.max_force-cfg.force_cost_free_n)).clamp(0, 1)
-    moment = ((torch.linalg.vector_norm(wrench[:, 3:], dim=-1)-cfg.moment_cost_free_nm)
-              / (cfg.max_moment-cfg.moment_cost_free_nm)).clamp(0, 1)
+    cap = cfg.load_cost_cap
+    force_norm = torch.linalg.vector_norm(wrench[:, :3], dim=-1)
+    moment_norm = torch.linalg.vector_norm(wrench[:, 3:], dim=-1)
+    force = ((force_norm-cfg.force_cost_free_n)
+             / (cfg.max_force-cfg.force_cost_free_n)).clamp(0, cap)
+    moment = ((moment_norm-cfg.moment_cost_free_nm)
+              / (cfg.max_moment-cfg.moment_cost_free_nm)).clamp(0, cap)
+    z_weight = torch.ones_like(xy)
     if cfg.inserted_load_cost and tip_center_z is not None and hole_force is not None:
-        inserted = tip_center_z < -cfg.inserted_load_depth_m
-        lateral_force = (torch.linalg.vector_norm(hole_force[:, :2], dim=-1)
-                         / cfg.max_force).clamp(0, 1)
-        full_moment = (torch.linalg.vector_norm(wrench[:, 3:], dim=-1)
-                       / cfg.max_moment).clamp(0, 1)
-        force = torch.where(inserted, lateral_force, force)
-        moment = torch.where(inserted, full_moment, moment)
+        if cfg.inserted_load_depth_m > 0:
+            z_weight = (1.0 + tip_center_z / cfg.inserted_load_depth_m).clamp(0.0, 1.0)
+        else:
+            z_weight = (tip_center_z >= 0.0).to(hole_force.dtype)
+        weighted_hole_f = torch.cat((
+            hole_force[:, :2], (hole_force[:, 2] * z_weight).unsqueeze(-1)), dim=-1)
+        weighted_f_norm = torch.linalg.vector_norm(weighted_hole_f, dim=-1)
+        free_f = cfg.force_cost_free_n * z_weight
+        free_m = cfg.moment_cost_free_nm * z_weight
+        force = ((weighted_f_norm - free_f) / (cfg.max_force - free_f)).clamp(0, cap)
+        moment = ((moment_norm - free_m) / (cfg.max_moment - free_m)).clamp(0, cap)
+    if overloaded is None:
+        overloaded = ((force_norm > cfg.max_force) | (moment_norm > cfg.max_moment)) & (
+            not cfg.terminate_on_overload)
     applied = cfg.action_cost_cap * torch.tanh(actions / cfg.action_cost_cap)
     previous = cfg.action_cost_cap * torch.tanh(previous_actions / cfg.action_cost_cap)
+    # 浅入孔 3 mm 内随 Z 权重从 1 渐变到 0，同步放开入孔后的向下 (-Z) 动作幅度限制
+    downward_z = torch.where(applied[:, 2] < 0, applied[:, 2] * z_weight, applied[:, 2])
+    applied_for_cost = torch.cat((applied[:, :2], downward_z.unsqueeze(-1), applied[:, 3:]), dim=-1)
     return {
         "time_penalty": torch.full_like(xy, -dt*cfg.time_cost_per_second),
         "position_penalty": -dt*cfg.position_cost_per_second*distance,
         "orientation_penalty": -dt*cfg.orientation_cost_per_second*orientation,
         "force_penalty": -dt*cfg.force_cost_per_second*force.square(),
         "moment_penalty": -dt*cfg.moment_cost_per_second*moment.square(),
-        "action_penalty": -dt*cfg.action_cost_per_second*torch.linalg.vector_norm(applied, dim=-1),
+        "overload_penalty": -dt*cfg.overload_cost_per_second*overloaded.float(),
+        "action_penalty": -dt*cfg.action_cost_per_second*torch.linalg.vector_norm(applied_for_cost, dim=-1),
         "action_change_penalty": -dt*cfg.action_change_cost_per_second*torch.linalg.vector_norm(
             applied-previous, dim=-1),
         "completion_bonus": cfg.completion_bonus*success.float(),
@@ -127,6 +143,8 @@ class PlantGroup:
         self.hold = torch.zeros_like(self.length)
         self.peak_force = torch.zeros(self.n, device=device)
         self.peak_moment = torch.zeros_like(self.peak_force)
+        self.step_peak_force = torch.zeros_like(self.peak_force)
+        self.step_peak_moment = torch.zeros_like(self.peak_force)
         self.last_action = torch.zeros(self.n, 6, device=device)
         self.wrench = torch.zeros(self.n, 6, device=device)
         self.wrench_bias = torch.zeros_like(self.wrench)
@@ -398,6 +416,7 @@ class PlantGroup:
         self.targets_p[:, ids] = nominal_tip.unsqueeze(0)
         self.targets_q[:, ids] = q.unsqueeze(0)
         for buffer in (self.length, self.hold, self.peak_force, self.peak_moment,
+                       self.step_peak_force, self.step_peak_moment,
                        self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor,
                        self.hysteresis_sensor, self.wall_force_z):
             buffer[ids] = 0
@@ -582,7 +601,8 @@ class PlantGroup:
         moment_tip = self.impedance(angular_error, omega, slice(3, 6)).clamp(-3, 3)
         true_tip = pos + rotate(q, self.offset)
         in_opening = (true_tip[:, :2].square().sum(-1) <= self.geometry.radius**2).float()
-        depth_scale = ((-true_tip[:, 2] - 0.0005) / 0.004).clamp(0., 1.) * in_opening
+        ramp_depth = self.cfg.inserted_load_depth_m if self.cfg.inserted_load_depth_m > 0 else 0.003
+        depth_scale = ((-true_tip[:, 2] - 0.0005) / ramp_depth).clamp(0., 1.) * in_opening
         max_wall_f = self.wall_friction * depth_scale
         wall_f = (-force[:, 2] - self.mass[:, 0] * v[:, 2] / 0.005).clamp(-max_wall_f, max_wall_f)
         self.wall_force_z.copy_(wall_f)
@@ -592,10 +612,25 @@ class PlantGroup:
 
     def physics_sensor(self) -> None:
         self.update_sensor()
-        self.peak_force.copy_(torch.maximum(self.peak_force,
-            torch.linalg.vector_norm(self.raw_wrench[:, :3], dim=-1)))
-        self.peak_moment.copy_(torch.maximum(self.peak_moment,
-            torch.linalg.vector_norm(self.raw_wrench[:, 3:], dim=-1)))
+        pos, q, _, _ = self.state()
+        true_tip_z = (pos + rotate(q, self.offset))[:, 2]
+        raw_hole_f = rotate(q, self.raw_wrench[:, :3])
+        if self.cfg.inserted_load_cost:
+            if self.cfg.inserted_load_depth_m > 0:
+                z_weight = (1.0 + true_tip_z / self.cfg.inserted_load_depth_m).clamp(0.0, 1.0)
+            else:
+                z_weight = (true_tip_z >= 0.0).to(raw_hole_f.dtype)
+            weighted_raw_f = torch.cat((
+                raw_hole_f[:, :2], (raw_hole_f[:, 2] * z_weight).unsqueeze(-1)), dim=-1)
+            step_force_norm = torch.linalg.vector_norm(weighted_raw_f, dim=-1)
+        else:
+            step_force_norm = torch.linalg.vector_norm(self.raw_wrench[:, :3], dim=-1)
+        force_norm = torch.linalg.vector_norm(self.raw_wrench[:, :3], dim=-1)
+        moment_norm = torch.linalg.vector_norm(self.raw_wrench[:, 3:], dim=-1)
+        self.step_peak_force.copy_(torch.maximum(self.step_peak_force, step_force_norm))
+        self.step_peak_moment.copy_(torch.maximum(self.step_peak_moment, moment_norm))
+        self.peak_force.copy_(torch.maximum(self.peak_force, force_norm))
+        self.peak_moment.copy_(torch.maximum(self.peak_moment, moment_norm))
 
     def advance_physics(self) -> None:
         cfg = self.cfg
@@ -687,6 +722,8 @@ class PlantGroup:
 
     def prepare_actions(self, actions: torch.Tensor) -> None:
         cfg = self.cfg
+        self.step_peak_force.zero_()
+        self.step_peak_moment.zero_()
         pos, q, _, _ = self.state()
         p_target, q_target = action_target(tip_pose(pos, q, self.nominal_offset + self.calibration),
                                            q, actions, cfg.translation_limit, cfg.rotation_limit)
@@ -713,6 +750,11 @@ class PlantGroup:
             success = (success & (xy < self.clearance * 0.4)
                        & (tilt < self.clearance / self.geometry.peg_length * 0.4)
                        & (yaw < self.clearance / self.geometry.radius * 0.4))
+        step_force = getattr(self, "step_peak_force", self.peak_force)
+        step_moment = getattr(self, "step_peak_moment", self.peak_moment)
+        overloaded = (step_force > cfg.max_force) | (step_moment > cfg.max_moment)
+        if cfg.training and not cfg.terminate_on_overload:
+            success = success & ~overloaded
         self.hold.copy_(torch.where(success, self.hold + 1, torch.zeros_like(self.hold)))
         success = self.hold >= cfg.success_hold_steps
         excessive = cfg.terminate_on_overload & (
@@ -726,7 +768,8 @@ class PlantGroup:
         terms = completion_cost_terms(
             cfg, xy, z_disp, -self.goal[:, 2], self.geometry.radius, tilt, yaw,
             self.wrench, actions, self.last_action, success, excessive | escaped, timeout,
-            tip_center_z=tip[:, 2], hole_force=rotate(q, self.wrench[:, :3]))
+            tip_center_z=tip[:, 2], hole_force=rotate(q, self.wrench[:, :3]),
+            overloaded=overloaded & (not cfg.terminate_on_overload))
         self.last_reward_terms = terms
         reward = torch.stack(list(terms.values())).sum(0)
         self.last_action.copy_(actions)

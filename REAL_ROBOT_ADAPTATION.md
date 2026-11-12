@@ -69,8 +69,10 @@
 | `PlantGroup.reset` (`dynamics="train"` 刚度范围与分布) | 线性均匀 `[300, 2500] N/m`<br>`[4, 12] N·m/rad` | **对数均匀 `[120, 1200] N/m`**（中位数 `379 N/m`）<br>**`[1.5, 10] N·m/rad`**（中位数 `3.87 N·m/rad`） | 将刚度分布重心压向真机长工具下的等效柔顺区间（`120–380 N/m` 占比达 `50%`），减缓仿真空中横移速度以真实复现外围贴板长时搜索 |
 | `InsertionCfg.stiction_force / stiction_moment` (`--stiction-force / --stiction-moment`) | `0.0 N` / `0.0 N·m` | **`0.6 N` / `0.06 N·m`** | 建模腕部力传感器上游的关节残余静摩擦死区，迫使策略在落入死区时主动放大动作冲破粘滞 |
 | `InsertionCfg.wall_friction_force` (`--wall-friction-force`) | `0.0 N` | **`4.0 N`** | 建模入孔后孔壁周向抱紧与层纹滑动摩擦阻力（随入孔深度线性激活并计入腕部力传感器 $F_z$），防止策略在孔内遇到轴向阻力或圆孔零 $M_z$ 时误判为孔板表面而停止下压 |
+| `InsertionCfg.inserted_load_depth_m` | `0.004 m`（阶跃切换） | **`0.003 m`（线性渐变）** | 浅入孔前 `3 mm` 内将孔系轴向力 $F_{H,z}$、负载死区与向下 `-Z` 动作幅度惩罚的权重 $w_z$ 从 `1` 线性衰减至 `0`，消除浅入孔段因轴向摩擦惩罚导致的停滞 |
 | `InsertionCfg.action_cost_cap` (`--action-cost-cap`) | `1.0` (`clamp`) | **`4.0` (`tanh`)** | 将动作与动作差分惩罚从硬截断 `clamp(-1,1)` 改为 `4.0 * tanh(a/4.0)`，保留小幅探索微颤的同时消除 `|a|>1` 区间的零梯度失控抽搐 |
 | `completion_cost_terms` (`distance` 饱和方式) | $c\tanh((u_{xy}^2+u_z)/c)$ | **$c_{1/2}\tanh(u_{xy}^2/c_{1/2}) + c_{1/2}\tanh(u_z/c_{1/2})$** | 解耦 XY 与 Z 的 $\tanh$ 饱和，根除 `|XY| >= 10 mm` 时 $u_{xy}^2$ 饱和共享外层 $\tanh$ 导致 Z 轴下压梯度归零、诱发策略向 $+Z$ 抬升至 `25–50 mm` 悬停的现象 |
+| `InsertionCfg.terminate_on_overload / load_cost_cap / overload_cost_per_second` | `True` / `1.0` / `0.0` | **`False` / `1.5` / `2.0`** | 力/力矩超限时不再立即终止重置，而是清零成功保持步数 `hold`、保留 `1.5` 倍二次超限梯度并附加每秒 `-2.0` 的超限运行罚分，让 GRU 经历超限后的状态并学会主动退让卸力 |
 | `PlantGroup.reset` (`geom_friction` 滑动摩擦范围) | `[0.25, 0.6]` | **`[0.25, 1.15]`** | 覆盖 3D 打印件层纹台阶刮擦与孔口边缘高摩擦咬合，配合低刚度与独立 Z 梯度迫使策略在外围贴板抗摩擦搜索 |
 | `train.restore_environment_progress` | 未监控 `moment_noise` 与 `preinsertion_tilt_weight` | **加入 `changed_fields`** | 从旧检查点迁移至新参数续训时，自动保留当前课程等级并清空旧分布下的成功率统计窗口 |
 

@@ -249,6 +249,9 @@ def contract(cfg: InsertionCfg) -> dict:
             "nominal_disabled": True,
         },
         "action_cost_cap": cfg.action_cost_cap,
+        "load_cost_cap": cfg.load_cost_cap,
+        "overload_cost_per_second": cfg.overload_cost_per_second,
+        "terminate_on_overload": cfg.terminate_on_overload,
         "clearance_definition": "opposing-face dimension difference; each wall offset is half",
         "simulation_only": True,
     }
@@ -593,7 +596,9 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
                     "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
                     "moment_noise", "preinsertion_tilt_weight",
-                    "stiction_force", "stiction_moment", "wall_friction_force", "action_cost_cap",
+                    "stiction_force", "stiction_moment", "wall_friction_force",
+                    "load_cost_cap", "overload_cost_per_second", "terminate_on_overload",
+                    "action_cost_cap",
                     "initial_z_min", "initial_z_max",
                     "initial_tilt", "initial_yaw", "initial_plane_margin",
                 )

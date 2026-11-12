@@ -83,7 +83,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         group.cfg = replace(cfg, success_alignment_required=True)
         PlantGroup.step_outcome(group, actions)
         self.assertEqual(group.hold.item(), 0)
-        group.cfg = cfg
+        group.cfg = replace(cfg, terminate_on_overload=True)
         for field, value, reason in (("peak_force", 31., 2), ("peak_moment", 2.1, 2)):
             group.hold.fill_(4)
             getattr(group, field).fill_(value)
@@ -91,6 +91,18 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             self.assertTrue(done.item())
             self.assertEqual(info["reason"].item(), reason)
             self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
+            getattr(group, field).zero_()
+        # Default training mode (terminate_on_overload=False): continues on overload, resets hold, applies overload_penalty
+        group.cfg = cfg
+        for field, value in (("peak_force", 31.), ("peak_moment", 2.1)):
+            group.hold.fill_(4)
+            getattr(group, field).fill_(value)
+            _, done, info = PlantGroup.step_outcome(group, actions)
+            self.assertFalse(done.item())
+            self.assertEqual(group.hold.item(), 0)
+            self.assertEqual(info["reason"].item(), 0)
+            self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
+            self.assertAlmostEqual(group.last_reward_terms["overload_penalty"].item(), -0.04)
             getattr(group, field).zero_()
         group.cfg = replace(cfg, training=False, terminate_on_overload=False)
         group.peak_force.fill_(100)

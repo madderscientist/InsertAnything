@@ -25,7 +25,7 @@ class InsertionCfg:
     observation_cuda_graph: bool = False
     position_observation_delay: bool = True
     inserted_load_cost: bool = True
-    inserted_load_depth_m: float = 0.004
+    inserted_load_depth_m: float = 0.003
     episode_seconds: float = 8.0
     clearance: float = 0.0001
     circle_sides: int | None = None
@@ -39,7 +39,7 @@ class InsertionCfg:
     rotation_limit: float = math.radians(0.5)
     max_force: float = 30.0
     max_moment: float = 2.0
-    terminate_on_overload: bool = True
+    terminate_on_overload: bool = False
     filter_seconds: float = 0.015
     wrench_hysteresis_fraction: float = 0.001
     initial_xy: float = 0.020
@@ -88,6 +88,8 @@ class InsertionCfg:
     preinsertion_tilt_weight: float = 0.5
     force_cost_per_second: float = 1.0
     moment_cost_per_second: float = 1.0
+    load_cost_cap: float = 1.5
+    overload_cost_per_second: float = 2.0
     force_cost_free_n: float = 5.0
     moment_cost_free_nm: float = 0.1
     action_cost_per_second: float = 0.05
@@ -98,8 +100,8 @@ class InsertionCfg:
     timeout_penalty: float = 10.0
 
     def __post_init__(self) -> None:
-        if self.training and not self.terminate_on_overload:
-            raise ValueError("disabling overload termination is only allowed in simulation evaluation")
+        if not isinstance(self.terminate_on_overload, bool):
+            raise ValueError("terminate_on_overload must be a boolean")
         if not math.isfinite(self.inserted_load_depth_m) or self.inserted_load_depth_m < 0:
             raise ValueError("inserted_load_depth_m must be finite and nonnegative")
         if self.circle_sides is not None and (
@@ -187,7 +189,8 @@ class InsertionCfg:
             raise ValueError("minimum target depth exceeds the scaled hole's maximum target depth")
         cost_positive = (self.time_cost_per_second, self.position_cost_per_second,
                          self.position_cost_cap, self.xy_cost_radius_fraction,
-                         self.orientation_cost_reference_deg, self.action_cost_cap,
+                         self.orientation_cost_reference_deg, self.load_cost_cap,
+                         self.action_cost_cap,
                          self.completion_bonus, self.safety_failure_penalty)
         if any(not math.isfinite(x) or x <= 0 for x in cost_positive):
             raise ValueError("completion cost scales must be finite and positive")
@@ -196,7 +199,8 @@ class InsertionCfg:
         if not math.isfinite(self.preinsertion_tilt_weight) or not 0 <= self.preinsertion_tilt_weight <= 1:
             raise ValueError("preinsertion_tilt_weight must be finite and in [0, 1]")
         cost_nonnegative = (self.orientation_cost_per_second, self.force_cost_per_second,
-                            self.moment_cost_per_second, self.action_cost_per_second,
+                            self.moment_cost_per_second, self.overload_cost_per_second,
+                            self.action_cost_per_second,
                             self.action_change_cost_per_second, self.timeout_penalty,
                             self.force_cost_free_n, self.moment_cost_free_nm)
         if any(not math.isfinite(x) or x < 0 for x in cost_nonnegative):
@@ -222,10 +226,11 @@ class InsertionCfg:
     @property
     def completion_step_cost_bound(self) -> float:
         # 单步运行成本的理论上界，用于校验安全失败罚分下界
+        load_cap_sq = self.load_cost_cap ** 2
         return self.physics_dt*self.decimation*(
             self.time_cost_per_second + self.position_cost_per_second*self.position_cost_cap
-            + 2*self.orientation_cost_per_second + self.force_cost_per_second
-            + self.moment_cost_per_second
+            + 2*self.orientation_cost_per_second + self.force_cost_per_second*load_cap_sq
+            + self.moment_cost_per_second*load_cap_sq + self.overload_cost_per_second
             + self.action_cost_per_second*self.action_cost_cap*math.sqrt(6)
             + self.action_change_cost_per_second*2*self.action_cost_cap*math.sqrt(6))
 
@@ -270,7 +275,10 @@ class InsertionCfg:
         values.setdefault("stiction_force", 0.0)
         values.setdefault("stiction_moment", 0.0)
         values.setdefault("wall_friction_force", 0.0)
+        values.setdefault("load_cost_cap", 1.5)
+        values.setdefault("overload_cost_per_second", 2.0)
         values.setdefault("action_cost_cap", 4.0)
+        values.setdefault("terminate_on_overload", False)
         values.setdefault("wrench_bias_distribution", "per_axis")
         values.setdefault("wrench_hysteresis_fraction", 0.0)
         values.setdefault("initial_xy", 0.003)

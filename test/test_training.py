@@ -259,8 +259,8 @@ class PolicyAndViewerTests(unittest.TestCase):
         self.assertFalse(diagnostic.training)
         self.assertEqual(diagnostic.max_force, cfg.max_force)
         self.assertEqual(diagnostic.max_moment, cfg.max_moment)
-        with self.assertRaisesRegex(ValueError, "simulation evaluation"):
-            replace(cfg, terminate_on_overload=False)
+        with self.assertRaisesRegex(ValueError, "terminate_on_overload"):
+            replace(cfg, terminate_on_overload="invalid")  # type: ignore[arg-type]
         self.assertEqual(replay_index(1., 400), 50)
 
 
@@ -470,6 +470,8 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                            ("moment_noise", 0.001), ("preinsertion_tilt_weight", 0.0),
                            ("stiction_force", 0.0), ("stiction_moment", 0.0),
                            ("wall_friction_force", 0.0), ("action_cost_cap", 1.0),
+                           ("load_cost_cap", 1.0), ("overload_cost_per_second", 0.0),
+                           ("terminate_on_overload", True),
                            ("success_alignment_required", True), ("success_hold_steps", 6),
                            ("position_observation_delay", False), ("inserted_load_cost", False),
                            ("inserted_load_depth_m", .006),

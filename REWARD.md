@@ -42,10 +42,13 @@ $$
 | `preinsertion_tilt_weight` | 0.5 | $w_{\mathrm{tilt},0}$，入孔前倾角回正基础权重 |
 | `force_cost_per_second` | 1.0 | $w_F$，每秒接触力超死区成本系数 |
 | `moment_cost_per_second` | 1.0 | $w_M$，每秒接触力矩超死区成本系数 |
+| `load_cost_cap` | 1.5 | $c_L$，归一化力与力矩成本的上限（保留超限区二次惩罚梯度） |
+| `overload_cost_per_second` | 2.0 | $w_{\mathrm{ov}}$，单步原始力/力矩峰值超限时的额外每秒惩罚系数 |
+| `terminate_on_overload` | false | 力/力矩超限时是否立即终止回合（默认不终止，重罚并继续运行） |
 | `force_cost_free_n` | 5.0 N | 力成本死区（按三维范数） |
 | `moment_cost_free_nm` | 0.1 N·m | 力矩成本死区（按三维范数） |
-| `inserted_load_cost` | true | 真实端面中心 `z < -4 mm` 后启用无死区横向力/全力矩成本 |
-| `inserted_load_depth_m` | 0.004 | 上述成本切换深度，严格小于负深度才启用 |
+| `inserted_load_cost` | true | 浅入孔 `3 mm` 内将轴向 $Z$ 力/动作权重与负载死区从 `1` 线性衰减至 `0` |
+| `inserted_load_depth_m` | 0.003 | 浅入孔渐变深度（`3 mm`），在此深度内 $w_z$ 由 `1` 渐变至 `0` |
 | `action_cost_per_second` | 0.05 | $w_a$，动作幅度成本系数 |
 | `action_change_cost_per_second` | 0.05 | $w_{\Delta a}$，相邻步动作变化成本系数 |
 | `action_cost_cap` | 4.0 | $c_a$，动作与动作差分成本的 `tanh` 平滑饱和尺度 |
@@ -104,14 +107,22 @@ f_t=\mathrm{clip}\left(\frac{\|F\|_2-5}{30-5},0,1\right),
 m_t=\mathrm{clip}\left(\frac{\|M\|_2-0.1}{2-0.1},0,1\right)
 $$
 
-新训练默认 `inserted_load_cost=true`。当且仅当真实物理端面中心
-$z_{\mathrm{center}}<-0.004\ \mathrm{m}$ 时，改用：
+新训练默认 `inserted_load_cost=true`、`inserted_load_depth_m=0.003`（`3 mm`）。定义浅入孔轴向权重：
+
+$$
+w_z = \mathrm{clip}\!\left(1 + \frac{z_{\mathrm{center}}}{d_{\mathrm{load}}},\ 0,\ 1\right)
+$$
+
+在孔口及上方（$z_{\mathrm{center}}\ge 0$）时 $w_z=1$；在浅入孔前 `3 mm`（$z_{\mathrm{center}}\in[-0.003,0]\ \mathrm{m}$）内，$w_z$ 从 `1` 线性衰减至 `0`；在 $z_{\mathrm{center}}\le -0.003\ \mathrm{m}$ 后保持 $w_z=0$。孔坐标系下的加权接触力、负载死区与向下动作幅度成本同步按 $w_z$ 过渡：
 
 $$
 F_H=R_{HT}F_T,\qquad
-f_t=\mathrm{clip}\left(\frac{\sqrt{F_{H,x}^2+F_{H,y}^2}}{F_{\max}},0,1\right),
+\|F_H\|_{w_z}=\sqrt{F_{H,x}^2+F_{H,y}^2+(w_z F_{H,z})^2}
+$$
+$$
+f_t=\mathrm{clip}\!\left(\frac{\|F_H\|_{w_z}-5w_z}{F_{\max}-5w_z},\ 0,\ c_L\right),
 \qquad
-m_t=\mathrm{clip}\left(\frac{\sqrt{M_x^2+M_y^2+M_z^2}}{M_{\max}},0,1\right)
+m_t=\mathrm{clip}\!\left(\frac{\|M\|_2-0.1w_z}{M_{\max}-0.1w_z},\ 0,\ c_L\right)
 $$
 
 使用当前滤波后、名义尖端处的力旋量（与旧奖励相同的数据源），不叠加 Actor
@@ -151,7 +162,8 @@ $$
 恢复原有 `0.4 × clearance` 的 XY/倾角/偏航成功门槛，确保历史评估兼容。
 显式切换成功判定或保持步数后，恢复训练保留课程等级但清空成功率窗口；
 迁移运行配置时还应清空自适应采样 EMA，避免混用不同判定的失败率。
-- **安全失败（−200）**：未滤波峰值力 $>30\text{ N}$、峰值力矩 $>2\text{ N}\cdot\text{m}$、逃出工作空间或倾角 $>35^\circ$。
+- **过载连续惩罚与成功门控（默认 `terminate_on_overload=false`）**：当当前 `20 ms` 步内的 `1 ms` 子步未滤波峰值力 $>30\text{ N}$ 或峰值力矩 $>2\text{ N}\cdot\text{m}$ 时，**不终止回合**，而是将该步的成功保持计数 `hold` 重置为 `0`（严禁在超限状态下混过成功判定），同时施加二次负载超限梯度（上限 `load_cost_cap=1.5`，即最高 `2.25` 倍二次惩罚）与额外运行惩罚 $-\Delta t\,w_{\mathrm{ov}}$（默认每秒 `-2.0`），迫使策略学习从过载/卡阻状态主动退让卸力。
+- **安全失败（−200）**：逃出工作空间或倾角 $>35^\circ$（若显式开启 `terminate_on_overload=true`，则未滤波峰值力 $>30\text{ N}$ 或峰值力矩 $>2\text{ N}\cdot\text{m}$ 亦触发安全终止）。
 - 新训练的横向安全工作空间是 `workspace_xy_radius_m=0.035` 的圆盘，
   容纳初始 X/Y 各独立 ±20 mm 的正方形（角点半径 28.28 mm）。
   旧检查点缺少半径字段时仍用原 `0.025 * scale` m。Z、倾角及完整力/力矩安全阈值未改变。
