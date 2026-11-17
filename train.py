@@ -71,6 +71,11 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
     return InsertionCfg(
         shapes=tuple(args.shapes), envs_per_shape=args.envs_per_shape,
         seed=args.seed, episode_seconds=args.episode_seconds,
+        enable_timeout=args.enable_timeout,
+        rough_surface=args.rough_surface,
+        rough_max_amplitude_m=args.rough_max_amplitude,
+        rough_wavelength_min_m=args.rough_wavelength_min,
+        rough_wavelength_max_m=args.rough_wavelength_max,
         clearance_curriculum=args.clearance_curriculum,
         noise_curriculum=args.noise_curriculum or args.success_noise_curriculum,
         noise_curriculum_mode="success" if args.success_noise_curriculum else "steps",
@@ -85,6 +90,13 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         stiction_force=args.stiction_force,
         stiction_moment=args.stiction_moment,
         wall_friction_force=args.wall_friction_force,
+        grasp_position_error=args.grasp_position_error,
+        grasp_z_error=args.grasp_z_error,
+        tip_calibration_error=args.tip_calibration_error,
+        rotation_bias=math.radians(args.rotation_bias_deg),
+        hole_depth_m=args.hole_depth,
+        align_goal_z_to_observation=args.align_goal_z_to_observation,
+        stagnation_cost_per_second=args.stagnation_cost_per_second,
         action_cost_cap=args.action_cost_cap,
         preinsertion_tilt_weight=args.preinsertion_tilt_weight,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
@@ -179,8 +191,13 @@ def contract(cfg: InsertionCfg) -> dict:
             "wrench_sampling": "independent Gaussian per observation after tip transform/filter",
             "grasp_distribution": cfg.grasp_error_distribution,
             "grasp_component_scale_m": cfg.grasp_position_error,
+            "grasp_z_component_scale_m": (
+                cfg.grasp_position_error if cfg.grasp_z_error is None else cfg.grasp_z_error),
             "grasp_scale_semantics": "std" if cfg.grasp_error_distribution == "gaussian" else "half range",
             "grasp_sampling": "per episode",
+            "tip_calibration_half_range_m": cfg.tip_calibration_error,
+            "rotation_bias_half_range_rad": cfg.rotation_bias,
+            "align_goal_z_to_observation": cfg.align_goal_z_to_observation,
         },
         "force_limit_n": cfg.max_force,
         "moment_limit_nm": cfg.max_moment,
@@ -188,7 +205,7 @@ def contract(cfg: InsertionCfg) -> dict:
         "workspace_xy_geometry": "radial_disk",
         "plate_outer_radius_m": cfg.plate_outer_radius_m,
         "plate_coverage": "minimum outer inradius; zero retains legacy footprint",
-        "workspace_z_low_m": -0.025 * cfg.scale,
+        "workspace_z_low_m": -cfg.hole_depth_m * cfg.scale,
         "workspace_z_high_m": 0.03 * cfg.scale,
         "max_tilt_rad": 0.6108652381980153,
         "hidden_state": [2, "batch", 128],
@@ -251,7 +268,25 @@ def contract(cfg: InsertionCfg) -> dict:
         "action_cost_cap": cfg.action_cost_cap,
         "load_cost_cap": cfg.load_cost_cap,
         "overload_cost_per_second": cfg.overload_cost_per_second,
+        "stagnation_cost_per_second": cfg.stagnation_cost_per_second,
+        "workspace_z_max_m": cfg.workspace_z_max_m,
+        "rough_low_spawn_prob": cfg.rough_low_spawn_prob,
+        "stagnation_speed_threshold_mps": cfg.stagnation_speed_threshold_mps,
+        "stagnation_window_seconds": cfg.stagnation_window_seconds,
+        "surface_z_free_m": cfg.surface_z_free_m,
         "terminate_on_overload": cfg.terminate_on_overload,
+        "enable_timeout": cfg.enable_timeout,
+        "rough_surface": {
+            "enabled": cfg.rough_surface,
+            "min_amplitude_m": cfg.rough_min_amplitude_m,
+            "max_amplitude_m": cfg.rough_max_amplitude_m,
+            "wavelength_bounds_m": [cfg.rough_wavelength_min_m, cfg.rough_wavelength_max_m],
+            "max_slope_deg": cfg.rough_max_slope_deg,
+            "flat_probability": cfg.rough_flat_probability,
+            "num_waves": cfg.rough_num_waves,
+            "step_jitter": cfg.rough_step_jitter,
+            "stepped_prob": cfg.rough_stepped_prob,
+        },
         "clearance_definition": "opposing-face dimension difference; each wall offset is half",
         "simulation_only": True,
     }
@@ -323,7 +358,7 @@ def publish_scene(env: InsertionEnv, output: Path, metadata: dict, progress: dic
     for group in env.groups:
         if group.shape in plants:
             continue
-        plants[group.shape] = {
+        plant_entry = {
             "qpos": group.sim.data.qpos[0].cpu().tolist(),
             "grasp_offset": (group.offset[0]-group.nominal_offset[0]).cpu().tolist(),
             "goal": group.goal[0].cpu().tolist(),
@@ -335,6 +370,10 @@ def publish_scene(env: InsertionEnv, output: Path, metadata: dict, progress: dic
             "difficulty": group.difficulty,
             "noise_scale": group.noise_scale,
         }
+        if group.surf_slice is not None:
+            plant_entry["surface_geom_pos"] = group.sim.model.geom_pos[0, group.surf_slice].cpu().tolist()
+            plant_entry["surface_geom_quat"] = group.sim.model.geom_quat[0, group.surf_slice].cpu().tolist()
+        plants[group.shape] = plant_entry
     atomic_json(output / "scene.json", {
         **progress, "environment": metadata["environment"], "plants": plants,
     })
@@ -597,7 +636,14 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
                     "moment_noise", "preinsertion_tilt_weight",
                     "stiction_force", "stiction_moment", "wall_friction_force",
+                    "grasp_position_error", "grasp_z_error", "tip_calibration_error",
+                    "rotation_bias", "hole_depth_m", "align_goal_z_to_observation",
+                    "target_depth_min_m", "target_depth_max_fraction",
+                    "stagnation_cost_per_second", "stagnation_window_seconds",
+                    "stagnation_speed_threshold_mps", "surface_z_free_m",
                     "load_cost_cap", "overload_cost_per_second", "terminate_on_overload",
+                    "enable_timeout", "rough_surface", "rough_max_amplitude_m",
+                    "rough_wavelength_min_m", "rough_wavelength_max_m",
                     "action_cost_cap",
                     "initial_z_min", "initial_z_max",
                     "initial_tilt", "initial_yaw", "initial_plane_margin",
@@ -861,6 +907,16 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--episode-seconds", type=float, default=8.0)
+    parser.add_argument("--enable-timeout", action=argparse.BooleanOptionalAction, default=True,
+                        help="terminate episodes at --episode-seconds; disable for infinite-horizon escape")
+    parser.add_argument("--rough-surface", action=argparse.BooleanOptionalAction, default=False,
+                        help="randomize uneven multi-frequency upper surface outside hole opening")
+    parser.add_argument("--rough-max-amplitude", type=float, default=0.0025,
+                        help="maximum peak-to-valley uneven surface amplitude in meters")
+    parser.add_argument("--rough-wavelength-min", type=float, default=0.008,
+                        help="minimum uneven surface spatial wavelength in meters")
+    parser.add_argument("--rough-wavelength-max", type=float, default=0.036,
+                        help="maximum uneven surface spatial wavelength in meters")
     parser.add_argument("--target-depth-min", type=float, default=0.005, help="metres")
     parser.add_argument("--target-depth-max-fraction", type=float, default=0.9)
     parser.add_argument("--shapes", nargs="+", choices=TRAIN_SHAPES, default=list(TRAIN_SHAPES))
@@ -904,6 +960,21 @@ def main() -> None:
                         help="maximum per-axis upstream actuator rotational stiction deadband in Nm")
     parser.add_argument("--wall-friction-force", type=float, default=4.0,
                         help="maximum in-hole axial wall rubbing friction resistance in N")
+    parser.add_argument("--grasp-position-error", type=float, default=0.0015,
+                        help="per-axis Gaussian std (or uniform half range) of lateral XY tip offset in m")
+    parser.add_argument("--grasp-z-error", type=float, default=0.005,
+                        help="Gaussian std (or uniform half range) of longitudinal Z tip offset in m")
+    parser.add_argument("--tip-calibration-error", type=float, default=0.0005,
+                        help="per-axis uniform half range of TCP calibration offset in m")
+    parser.add_argument("--rotation-bias-deg", type=float, default=1.5,
+                        help="per-axis uniform half range of constant orientation bias in degrees")
+    parser.add_argument("--hole-depth", type=float, default=0.028,
+                        help="physical through-hole depth and lower Z workspace limit in meters")
+    parser.add_argument("--align-goal-z-to-observation",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="shift commanded goal Z by upright longitudinal offset (h + Z)")
+    parser.add_argument("--stagnation-cost-per-second", type=float, default=0.0,
+                        help="running penalty per second when pre-goal smoothed tip speed stagnates")
     parser.add_argument("--action-cost-cap", type=float, default=4.0,
                         help="smooth tanh saturation scale for action and action-change costs")
     parser.add_argument("--adaptive-sampling", action="store_true",

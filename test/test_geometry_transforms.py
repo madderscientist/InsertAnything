@@ -144,6 +144,34 @@ class GeometryAndTransformTests(unittest.TestCase):
                                 torch.zeros(2, 6))
         self.assertEqual(obs.shape, (2, 13))
 
+    def test_rough_surface_holes_remain_open_and_config_validates(self):
+        for shape in ALL_SHAPES:
+            with self.subTest(shape=shape):
+                g = geometry(shape, circle_sides=64 if shape == "circle" else None,
+                             plate_outer_radius_m=0.08, rough_surface=True)
+                model = build_model(g)
+                self.assertGreater(model.nmocap, 0)
+                data = MjData(model)
+                data.qpos[:3] = [0, 0, 0.04]
+                data.qpos[3:] = [1, 0, 0, 0]
+                mj_forward(model, data)
+                self.assertEqual(data.ncon, 0)
+        for bad in (
+            {"enable_timeout": "no"},
+            {"rough_surface": 1},
+            {"rough_max_amplitude_m": -0.001},
+            {"rough_wavelength_min_m": 0.02, "rough_wavelength_max_m": 0.01},
+            {"rough_surface": True, "rough_max_amplitude_m": 0.025, "initial_z_max": 0.02},
+            {"stagnation_cost_per_second": -0.1},
+            {"stagnation_speed_threshold_mps": 0.0},
+            {"rotation_bias": -0.01},
+            {"grasp_z_error": -0.001},
+            {"hole_depth_m": 0.040},
+            {"align_goal_z_to_observation": "yes"},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                InsertionCfg(**bad)
+
 
 if __name__ == "__main__":
     unittest.main()

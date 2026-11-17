@@ -27,14 +27,28 @@ class InsertionCfg:
     inserted_load_cost: bool = True
     inserted_load_depth_m: float = 0.003
     episode_seconds: float = 8.0
+    enable_timeout: bool = True
+    rough_surface: bool = False
+    rough_min_amplitude_m: float = 0.0
+    rough_max_amplitude_m: float = 0.0025
+    rough_wavelength_min_m: float = 0.008
+    rough_wavelength_max_m: float = 0.036
+    rough_max_slope_deg: float = 18.0
+    rough_flat_probability: float = 0.1
+    rough_num_waves: int = 4
+    rough_step_jitter: float = 0.0
+    rough_stepped_prob: float = 0.0
+    rough_low_spawn_prob: float = 0.0
     clearance: float = 0.0001
     circle_sides: int | None = None
     clearance_curriculum: bool = False
     clearance_levels: tuple[float, ...] = CLEARANCE_CURRICULUM_LEVELS
     scale: float = 1.0
+    hole_depth_m: float = HOLE_DEPTH_M
     target_depth_min_m: float = 0.005
     target_depth_max_fraction: float = 0.9
     fixed_target_depth_m: float | None = None
+    align_goal_z_to_observation: bool = True
     translation_limit: float = 0.001
     rotation_limit: float = math.radians(0.5)
     max_force: float = 30.0
@@ -44,6 +58,7 @@ class InsertionCfg:
     wrench_hysteresis_fraction: float = 0.001
     initial_xy: float = 0.020
     workspace_xy_radius_m: float = 0.035
+    workspace_z_max_m: float = 0.030
     plate_outer_radius_m: float = 0.080
     initial_z_min: float = 0.004
     initial_z_max: float = 0.02
@@ -52,9 +67,11 @@ class InsertionCfg:
     initial_yaw: float = math.radians(15)
     position_bias: float = 0.0005
     tip_calibration_error: float = 0.0005
-    grasp_position_error: float = 0.00125
+    grasp_position_error: float = 0.0015
+    grasp_z_error: float | None = None
     grasp_error_distribution: str = "gaussian"
     sensor_rotation_error: float = math.radians(0.5)
+    rotation_bias: float = math.radians(1.5)
     position_noise: float = 0.0005
     rotation_noise: float = math.radians(1.5)
     force_noise: float = 0.2
@@ -82,6 +99,7 @@ class InsertionCfg:
     time_cost_per_second: float = 1.0
     position_cost_per_second: float = 2.0
     position_cost_cap: float = 2.0
+    surface_z_free_m: float = 0.0
     xy_cost_radius_fraction: float = 0.25
     orientation_cost_per_second: float = 1.0
     orientation_cost_reference_deg: float = 5.0
@@ -90,18 +108,41 @@ class InsertionCfg:
     moment_cost_per_second: float = 1.0
     load_cost_cap: float = 1.5
     overload_cost_per_second: float = 2.0
+    stagnation_cost_per_second: float = 0.0
+    stagnation_speed_threshold_mps: float = 0.006
+    stagnation_window_seconds: float = 0.4
     force_cost_free_n: float = 5.0
     moment_cost_free_nm: float = 0.1
     action_cost_per_second: float = 0.05
     action_change_cost_per_second: float = 0.05
     action_cost_cap: float = 4.0
     completion_bonus: float = 20.0
-    safety_failure_penalty: float = 200.0
+    safety_failure_penalty: float = 250.0
     timeout_penalty: float = 10.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.terminate_on_overload, bool):
             raise ValueError("terminate_on_overload must be a boolean")
+        if not isinstance(self.enable_timeout, bool) or not isinstance(self.rough_surface, bool):
+            raise ValueError("enable_timeout and rough_surface must be booleans")
+        if not isinstance(self.align_goal_z_to_observation, bool):
+            raise ValueError("align_goal_z_to_observation must be a boolean")
+        if not math.isfinite(self.hole_depth_m) or not 0.01 <= self.hole_depth_m <= 0.033:
+            raise ValueError("hole_depth_m must be finite and within [0.01, 0.033] m (below 35 mm peg length)")
+        if self.grasp_z_error is not None and (not math.isfinite(self.grasp_z_error) or self.grasp_z_error < 0):
+            raise ValueError("grasp_z_error must be None or finite and nonnegative")
+        if not math.isfinite(self.rough_max_amplitude_m) or self.rough_max_amplitude_m < 0:
+            raise ValueError("rough_max_amplitude_m must be finite and nonnegative")
+        if (not math.isfinite(self.rough_wavelength_min_m)
+                or not math.isfinite(self.rough_wavelength_max_m)
+                or not 0 < self.rough_wavelength_min_m <= self.rough_wavelength_max_m):
+            raise ValueError("rough surface wavelengths must be positive and ordered")
+        if not math.isfinite(self.rough_max_slope_deg) or not 0 < self.rough_max_slope_deg <= 45:
+            raise ValueError("rough_max_slope_deg must be finite and in (0, 45]")
+        if not math.isfinite(self.rough_flat_probability) or not 0 <= self.rough_flat_probability <= 1:
+            raise ValueError("rough_flat_probability must be finite and in [0, 1]")
+        if type(self.rough_num_waves) is not int or not 1 <= self.rough_num_waves <= 16:
+            raise ValueError("rough_num_waves must be an integer in [1, 16]")
         if not math.isfinite(self.inserted_load_depth_m) or self.inserted_load_depth_m < 0:
             raise ValueError("inserted_load_depth_m must be finite and nonnegative")
         if self.circle_sides is not None and (
@@ -145,6 +186,7 @@ class InsertionCfg:
             raise ValueError("success hold and curriculum horizon must be positive")
         noise = (self.initial_xy, self.initial_tilt, self.initial_yaw, self.position_bias,
                  self.tip_calibration_error, self.grasp_position_error, self.sensor_rotation_error,
+                 self.rotation_bias,
                  self.position_noise, self.rotation_noise, self.force_noise, self.moment_noise,
                  self.force_bias, self.moment_bias, self.wrench_hysteresis_fraction,
                  self.stiction_force, self.stiction_moment, self.wall_friction_force)
@@ -167,6 +209,9 @@ class InsertionCfg:
         if (not math.isfinite(self.initial_plane_margin)
                 or not 0 <= self.initial_plane_margin <= self.initial_z_max):
             raise ValueError("initial plane margin must be finite and within [0, initial_z_max]")
+        if (self.rough_surface and self.rough_max_amplitude_m
+                + max(self.initial_plane_margin, 0.0005 * self.scale) >= self.initial_z_max):
+            raise ValueError("rough_max_amplitude_m plus spawn margin must stay below initial_z_max")
         if (not isinstance(self.noise_zero_steps, int)
                 or not isinstance(self.noise_full_steps, int)
                 or not 0 <= self.noise_zero_steps < self.noise_full_steps):
@@ -181,16 +226,27 @@ class InsertionCfg:
             raise ValueError("minimum target depth must be finite and positive")
         if not math.isfinite(self.target_depth_max_fraction) or not 0 < self.target_depth_max_fraction < 1:
             raise ValueError("maximum target depth fraction must be strictly between zero and one")
-        hole_depth = HOLE_DEPTH_M * self.scale
+        hole_depth = self.hole_depth_m * self.scale
         if self.fixed_target_depth_m is not None:
             if not math.isfinite(self.fixed_target_depth_m) or not 0 < self.fixed_target_depth_m < hole_depth:
                 raise ValueError("fixed target depth must be positive and smaller than hole depth")
         elif self.target_depth_min_m > hole_depth * self.target_depth_max_fraction:
             raise ValueError("minimum target depth exceeds the scaled hole's maximum target depth")
+        if not math.isfinite(self.rough_min_amplitude_m) or not 0 <= self.rough_min_amplitude_m <= self.rough_max_amplitude_m:
+            raise ValueError("rough_min_amplitude_m must be finite and within [0, rough_max_amplitude_m]")
+        if not math.isfinite(self.rough_step_jitter) or not 0 <= self.rough_step_jitter <= 1:
+            raise ValueError("rough_step_jitter must be finite and in [0, 1]")
+        if not math.isfinite(self.rough_stepped_prob) or not 0 <= self.rough_stepped_prob <= 1:
+            raise ValueError("rough_stepped_prob must be finite and in [0, 1]")
+        if not math.isfinite(self.rough_low_spawn_prob) or not 0 <= self.rough_low_spawn_prob <= 1:
+            raise ValueError("rough_low_spawn_prob must be finite and in [0, 1]")
+        if not math.isfinite(self.workspace_z_max_m) or self.workspace_z_max_m <= self.initial_z_max:
+            raise ValueError("workspace_z_max_m must be finite and exceed initial_z_max")
         cost_positive = (self.time_cost_per_second, self.position_cost_per_second,
                          self.position_cost_cap, self.xy_cost_radius_fraction,
                          self.orientation_cost_reference_deg, self.load_cost_cap,
-                         self.action_cost_cap,
+                         self.action_cost_cap, self.stagnation_speed_threshold_mps,
+                         self.stagnation_window_seconds,
                          self.completion_bonus, self.safety_failure_penalty)
         if any(not math.isfinite(x) or x <= 0 for x in cost_positive):
             raise ValueError("completion cost scales must be finite and positive")
@@ -200,6 +256,7 @@ class InsertionCfg:
             raise ValueError("preinsertion_tilt_weight must be finite and in [0, 1]")
         cost_nonnegative = (self.orientation_cost_per_second, self.force_cost_per_second,
                             self.moment_cost_per_second, self.overload_cost_per_second,
+                            self.stagnation_cost_per_second, self.surface_z_free_m,
                             self.action_cost_per_second,
                             self.action_change_cost_per_second, self.timeout_penalty,
                             self.force_cost_free_n, self.moment_cost_free_nm)
@@ -231,6 +288,7 @@ class InsertionCfg:
             self.time_cost_per_second + self.position_cost_per_second*self.position_cost_cap
             + 2*self.orientation_cost_per_second + self.force_cost_per_second*load_cap_sq
             + self.moment_cost_per_second*load_cap_sq + self.overload_cost_per_second
+            + self.stagnation_cost_per_second
             + self.action_cost_per_second*self.action_cost_cap*math.sqrt(6)
             + self.action_change_cost_per_second*2*self.action_cost_cap*math.sqrt(6))
 
@@ -250,7 +308,7 @@ class InsertionCfg:
     def target_depth_bounds_m(self) -> tuple[float, float]:
         if self.fixed_target_depth_m is not None:
             return self.fixed_target_depth_m, self.fixed_target_depth_m
-        return self.target_depth_min_m, HOLE_DEPTH_M * self.scale * self.target_depth_max_fraction
+        return self.target_depth_min_m, self.hole_depth_m * self.scale * self.target_depth_max_fraction
 
     def noise_scale(self, policy_steps: int) -> float:
         if not self.training or not self.noise_curriculum:
@@ -266,25 +324,55 @@ class InsertionCfg:
     @classmethod
     def from_checkpoint(cls, environment: dict) -> "InsertionCfg":
         values = dict(environment)
-        values.setdefault("success_alignment_required", True)
-        values.setdefault("position_observation_delay", False)
-        values.setdefault("inserted_load_cost", False)
-        values.setdefault("inserted_load_depth_m", 0.0)
-        values.setdefault("force_bias", 0.0)
-        values.setdefault("moment_bias", 0.0)
-        values.setdefault("stiction_force", 0.0)
-        values.setdefault("stiction_moment", 0.0)
-        values.setdefault("wall_friction_force", 0.0)
-        values.setdefault("load_cost_cap", 1.5)
-        values.setdefault("overload_cost_per_second", 2.0)
-        values.setdefault("action_cost_cap", 4.0)
-        values.setdefault("terminate_on_overload", False)
-        values.setdefault("wrench_bias_distribution", "per_axis")
-        values.setdefault("wrench_hysteresis_fraction", 0.0)
-        values.setdefault("initial_xy", 0.003)
-        values.setdefault("workspace_xy_radius_m", 0.025*values.get("scale", 1.0))
-        values.setdefault("plate_outer_radius_m", 0.0)
-        values.setdefault("success_opening_required", False)
+        defaults = {
+            "success_alignment_required": True,
+            "position_observation_delay": False,
+            "inserted_load_cost": False,
+            "inserted_load_depth_m": 0.0,
+            "force_bias": 0.0,
+            "moment_bias": 0.0,
+            "rotation_bias": 0.0,
+            "grasp_z_error": None,
+            "hole_depth_m": HOLE_DEPTH_M,
+            "align_goal_z_to_observation": False,
+            "stiction_force": 0.0,
+            "stiction_moment": 0.0,
+            "wall_friction_force": 0.0,
+            "load_cost_cap": 1.5,
+            "overload_cost_per_second": 2.0,
+            "stagnation_cost_per_second": 0.0,
+            "stagnation_speed_threshold_mps": 0.006,
+            "stagnation_window_seconds": 0.4,
+            "surface_z_free_m": 0.0,
+            "action_cost_cap": 4.0,
+            "terminate_on_overload": False,
+            "enable_timeout": True,
+            "rough_surface": False,
+            "rough_min_amplitude_m": 0.0,
+            "rough_max_amplitude_m": 0.0025,
+            "rough_wavelength_min_m": 0.008,
+            "rough_wavelength_max_m": 0.036,
+            "rough_max_slope_deg": 18.0,
+            "rough_flat_probability": 0.1,
+            "rough_num_waves": 4,
+            "rough_step_jitter": 0.0,
+            "rough_stepped_prob": 0.0,
+            "rough_low_spawn_prob": 0.0,
+            "workspace_z_max_m": 0.030,
+            "wrench_bias_distribution": "per_axis",
+            "wrench_hysteresis_fraction": 0.0,
+            "initial_xy": 0.003,
+            "workspace_xy_radius_m": 0.025 * values.get("scale", 1.0),
+            "plate_outer_radius_m": 0.0,
+            "success_opening_required": False,
+        }
+        for key, default in defaults.items():
+            values.setdefault(key, default)
+        for retired in (
+            "stagnation_lift_cost_per_second", "stagnation_lift_target",
+            "stagnation_lift_scale", "stagnation_lateral_target", "stagnation_lateral_scale",
+        ):
+            values.pop(retired, None)
         if values.pop("load_cost_power", 2) != 2:
             raise ValueError("linear-load experimental checkpoints require explicit reward migration")
         if "shapes" in values:

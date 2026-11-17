@@ -163,8 +163,10 @@ $$
 显式切换成功判定或保持步数后，恢复训练保留课程等级但清空成功率窗口；
 迁移运行配置时还应清空自适应采样 EMA，避免混用不同判定的失败率。
 - **过载连续惩罚与成功门控（默认 `terminate_on_overload=false`）**：当当前 `20 ms` 步内的 `1 ms` 子步未滤波峰值力 $>30\text{ N}$ 或峰值力矩 $>2\text{ N}\cdot\text{m}$ 时，**不终止回合**，而是将该步的成功保持计数 `hold` 重置为 `0`（严禁在超限状态下混过成功判定），同时施加二次负载超限梯度（上限 `load_cost_cap=1.5`，即最高 `2.25` 倍二次惩罚）与额外运行惩罚 $-\Delta t\,w_{\mathrm{ov}}$（默认每秒 `-2.0`），迫使策略学习从过载/卡阻状态主动退让卸力。
-- **安全失败（−200）**：逃出工作空间或倾角 $>35^\circ$（若显式开启 `terminate_on_overload=true`，则未滤波峰值力 $>30\text{ N}$ 或峰值力矩 $>2\text{ N}\cdot\text{m}$ 亦触发安全终止）。
+- **未达标停滞惩罚（`stagnation_cost_per_second`）**：在真实尖端尚未到达目标深度（$z_t > z_{\mathrm{goal}}+0.5\text{ mm}$）时，按窗口 $\tau_{\mathrm{stag}}$ 跟踪指数平滑位置 $\bar p_t$（凹凸表面模式下按进度投影 $p_{\mathrm{prog}}=[x_t,y_t,\min(z_t,0)]$ 统计，防止台面原地上下抖动刷速度），计算等效净推进速率 $v_{\mathrm{eff}}=\|\,p-\bar p_t\,\|/\tau_{\mathrm{stag}}$；当 $v_{\mathrm{eff}} < v_{\mathrm{th}}$ 时施加二次惩罚 $-\Delta t\,w_{\mathrm{stag}}\,\mathrm{clip}(1-v_{\mathrm{eff}}/v_{\mathrm{th}},0,1)^2$，配合二阶段板面上方越障免罚带 `surface_z_free_m` 打破台阶凹坑死顶的局部最优。
+- **安全失败（−250）**：逃出工作空间或倾角 $>35^\circ$（若显式开启 `terminate_on_overload=true`，则未滤波峰值力 $>30\text{ N}$ 或峰值力矩 $>2\text{ N}\cdot\text{m}$ 亦触发安全终止）。
 - 新训练的横向安全工作空间是 `workspace_xy_radius_m=0.035` 的圆盘，
   容纳初始 X/Y 各独立 ±20 mm 的正方形（角点半径 28.28 mm）。
   旧检查点缺少半径字段时仍用原 `0.025 * scale` m。Z、倾角及完整力/力矩安全阈值未改变。
-- **防自杀约束**：默认单步运行成本理论上界 $C_{\mathrm{step,max}}\approx0.18735$，折扣因子 $\gamma=0.9985$ 下无穷步累计运行成本上界为 $\frac{C_{\mathrm{step,max}}}{1-\gamma}\approx124.90 < P_X=200$。配置同时检查安全罚分大于单步上界加超时罚分，以避免安全终止成为逃避运行成本的廉价选择；这不是策略绝不会违规的保证。验证测试见 [test/test_env_curriculum.py](./test/test_env_curriculum.py)。
+- **无超时/长时防僵尸脱困模式**：平坦表面保持 `8 s` 超时；第二阶段凹凸表面训练可配置长时防僵尸回收上限（默认 `episode_seconds=35.0, timeout_penalty=60.0`），既保留充足的越障脱困探索窗口，又防止极少数死锁样本长期占据并行环境槽位。
+- **防自杀约束**：配置自动校验安全失败罚分（默认 `safety_failure_penalty=250.0`）严格大于包含停滞惩罚与过载惩罚在内的最差无穷步折扣累计运行成本上界 $\frac{C_{\mathrm{step,max}}}{1-\gamma}$ 及单步上界加超时罚分，避免安全终止成为逃避运行成本的廉价选择；验证测试见 [test/test_env_curriculum.py](./test/test_env_curriculum.py)。

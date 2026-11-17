@@ -4,6 +4,7 @@ import argparse
 from dataclasses import replace
 import json
 import logging
+import math
 from pathlib import Path
 import threading
 import time
@@ -39,7 +40,8 @@ def replay_config(environment: dict, shape: str, zero_noise: bool = False,
         cfg = replace(cfg, noise_curriculum=False, noise_curriculum_mode="steps",
                       position_noise=0., rotation_noise=0., force_noise=0., moment_noise=0.,
                       position_bias=0., tip_calibration_error=0., grasp_position_error=0.,
-                      sensor_rotation_error=0., force_bias=0., moment_bias=0.)
+                      grasp_z_error=0., sensor_rotation_error=0., rotation_bias=0.,
+                      force_bias=0., moment_bias=0.)
     return cfg
 
 
@@ -69,7 +71,6 @@ class PolicyReplay:
 
     def _run(self) -> None:
         try:
-            import torch
             from evaluate import load_checkpoint, REASONS
             from insertion import InsertionEnv
 
@@ -96,7 +97,7 @@ class PolicyReplay:
                     for _ in range(env.max_episode_length):
                         if self.stop.is_set() or shape != self.shape:
                             break
-                        frames.append({
+                        frame = {
                             "qpos": group.sim.data.qpos[0].cpu().tolist(),
                             "grasp_offset": (group.offset[0]-group.nominal_offset[0]).cpu().tolist(),
                             "goal": group.goal[0].cpu().tolist(),
@@ -106,7 +107,11 @@ class PolicyReplay:
                             "episode_step": int(group.length[0]),
                             "clearance": group.clearance,
                             "difficulty": group.difficulty,
-                        })
+                        }
+                        if group.surf_slice is not None:
+                            frame["surface_geom_pos"] = group.sim.model.geom_pos[0, group.surf_slice].cpu().tolist()
+                            frame["surface_geom_quat"] = group.sim.model.geom_quat[0, group.surf_slice].cpu().tolist()
+                        frames.append(frame)
                         obs, _, dones, info = env.step(actor(obs))
                         actor.reset(dones)
                         if bool(dones[0]):
@@ -178,30 +183,62 @@ def visible_wrench_vector(value: np.ndarray, reference: float) -> np.ndarray:
     return value*(0.03/reference)
 
 
+def terrain_height_color(height_m: float, ref_max_m: float = 0.0025) -> tuple[int, int, int]:
+    t = float(np.clip(height_m / max(ref_max_m, 1e-4), 0.0, 1.0))
+    if t < 0.5:
+        u = t * 2.0
+        return (
+            int(75 + u * (95 - 75)),
+            int(102 + u * (165 - 102)),
+            int(142 + u * (145 - 142)),
+        )
+    u = (t - 0.5) * 2.0
+    return (
+        int(95 + u * (225 - 95)),
+        int(165 + u * (135 - 165)),
+        int(145 + u * (70 - 145)),
+    )
+
+
 class SnapshotScene:
     def __init__(self, server: viser.ViserServer | Any, shape: str, cfg: InsertionCfg):
         self.server = server
         self.model = build_model(geometry(shape, cfg.clearance, cfg.scale, cfg.circle_sides,
-                                          cfg.plate_outer_radius_m))
+                                          cfg.plate_outer_radius_m, cfg.rough_surface,
+                                          cfg.hole_depth_m))
         self.data = MjData(self.model)
         self.base_geom_pos = self.model.geom_pos.copy()
         self.tool_id = self.model.body("tool").id
         self.peg_ids = np.flatnonzero(self.model.geom_bodyid == self.tool_id)
+        self.surf_ids = (
+            np.flatnonzero(self.model.geom_bodyid == self.model.body("surface").id)
+            if cfg.rough_surface else np.array([], dtype=int))
+        surf_set = set(self.surf_ids.tolist())
+        peg_set = set(self.peg_ids.tolist())
+        self.wall_ids = np.array(
+            [i for i in range(self.model.ngeom) if i not in surf_set and i not in peg_set],
+            dtype=int,
+        )
+        self.surf_local_meshes = [geom_mesh(self.model, int(i)) for i in self.surf_ids]
+        self.last_surf_signature: bytes | None = None
+        self.walls_placed = False
+        self.terrain_handle: Any = None
         self.nominal_tip = np.array([0., 0., -0.05*cfg.scale])
         # 使用独立随机命名空间，防止切换形状时客户端残留上一几何的四元数姿态
         self.root = server.scene.add_frame(f"/plant/{shape}-{uuid4().hex}", show_axes=False)
-        self.handles = []
-        for index in range(self.model.ngeom):
+        self.geom_handles: dict[int, Any] = {}
+        for index in (*self.wall_ids.tolist(), *self.peg_ids.tolist()):
             mesh = geom_mesh(self.model, index)
             rgba = self.model.geom_rgba[index]
             name = mj_id2name(self.model, mjtObj.mjOBJ_GEOM, index)
-            self.handles.append(server.scene.add_mesh_simple(
+            self.geom_handles[index] = server.scene.add_mesh_simple(
                 f"{self.root.name}/{name}", mesh.vertices, mesh.faces,
                 color=(int(rgba[0]*255), int(rgba[1]*255), int(rgba[2]*255)),
-                opacity=0.45 if index not in self.peg_ids else 1.,
+                opacity=1.0 if index in peg_set else 0.38,
                 side="double",
-            ))
+            )
         self.tip = server.scene.add_frame(f"{self.root.name}/actual_tip", axes_length=0.006, axes_radius=0.0002)
+        self.nominal_tcp = server.scene.add_frame(f"{self.root.name}/nominal_tcp", axes_length=0.0045, axes_radius=0.00016)
         self.goal = server.scene.add_frame(f"{self.root.name}/true_goal", axes_length=0.006, axes_radius=0.0002)
         self.hole = server.scene.add_frame(f"{self.root.name}/hole", axes_length=0.015, axes_radius=0.0002)
         self.wrench_frame = server.scene.add_frame(
@@ -213,25 +250,77 @@ class SnapshotScene:
                 color, thickness=6., thickness_units="screen",
                 position=(0., 0.008 if name == "force" else -0.008, 0.)))
 
+    def _build_combined_terrain_mesh(self, surf_pos: np.ndarray) -> trimesh.Trimesh:
+        heights = surf_pos[:, 2] + self.model.geom_size[self.surf_ids, 2]
+        span = max(float(heights.max()), 0.0025)
+        verts_all, faces_all, colors_all = [], [], []
+        v_offset = 0
+        for local_i, geom_i in enumerate(self.surf_ids):
+            base = self.surf_local_meshes[local_i]
+            rot = self.data.geom_xmat[geom_i].reshape(3, 3)
+            pos = self.data.geom_xpos[geom_i]
+            verts = base.vertices @ rot.T + pos
+            rgb = terrain_height_color(float(heights[local_i]), span)
+            rgba = np.empty((len(verts), 4), dtype=np.uint8)
+            rgba[:, 0], rgba[:, 1], rgba[:, 2], rgba[:, 3] = rgb[0], rgb[1], rgb[2], 235
+            verts_all.append(verts)
+            faces_all.append(base.faces + v_offset)
+            colors_all.append(rgba)
+            v_offset += len(verts)
+        return trimesh.Trimesh(
+            vertices=np.vstack(verts_all),
+            faces=np.vstack(faces_all),
+            vertex_colors=np.vstack(colors_all),
+            process=False,
+        )
+
     def update(self, plant: dict) -> None:
         wrench = np.asarray(plant["wrench"], dtype=float)
         if wrench.shape != (6,) or not np.isfinite(wrench).all():
             raise ValueError("viewer wrench must contain six finite components")
         self.data.qpos[:] = plant["qpos"]
-        self.model.geom_pos[:] = self.base_geom_pos
-        self.model.geom_pos[self.peg_ids] += np.asarray(plant["grasp_offset"])
+        self.model.geom_pos[self.peg_ids] = (
+            self.base_geom_pos[self.peg_ids] + np.asarray(plant["grasp_offset"]))
+        rebuild_terrain = False
+        surf_pos = None
+        if len(self.surf_ids) and "surface_geom_pos" in plant:
+            surf_pos = np.asarray(plant["surface_geom_pos"], dtype=np.float32)
+            surf_quat = np.asarray(plant["surface_geom_quat"], dtype=np.float32)
+            sig = surf_pos.tobytes() + surf_quat.tobytes()
+            if sig != self.last_surf_signature:
+                self.last_surf_signature = sig
+                self.model.geom_pos[self.surf_ids] = surf_pos
+                self.model.geom_quat[self.surf_ids] = surf_quat
+                rebuild_terrain = True
         mj_forward(self.model, self.data)
+        combined_terrain = (
+            self._build_combined_terrain_mesh(surf_pos)
+            if rebuild_terrain and surf_pos is not None else None
+        )
+        active_indices = (
+            (*self.wall_ids.tolist(), *self.peg_ids.tolist())
+            if not self.walls_placed else tuple(self.peg_ids.tolist())
+        )
         with self.server.atomic():
-            for index, handle in enumerate(self.handles):
+            if combined_terrain is not None:
+                self.terrain_handle = self.server.scene.add_mesh_trimesh(
+                    f"{self.root.name}/rough_terrain", combined_terrain)
+            for index in active_indices:
+                handle = self.geom_handles[index]
                 q = np.empty(4)
                 mju_mat2Quat(q, self.data.geom_xmat[index])
                 handle.position = self.data.geom_xpos[index]
                 handle.wxyz = q
+            self.walls_placed = True
             rotated = np.empty(3)
             mju_rotVecQuat(rotated, self.nominal_tip+plant["grasp_offset"],
                            self.data.qpos[3:7])
             self.tip.position = self.data.qpos[:3]+rotated
             self.tip.wxyz = self.data.qpos[3:7]
+            calib_off = np.asarray(plant.get("calib_offset", (0., 0., 0.)), dtype=float)
+            mju_rotVecQuat(rotated, self.nominal_tip + calib_off, self.data.qpos[3:7])
+            self.nominal_tcp.position = self.data.qpos[:3] + rotated
+            self.nominal_tcp.wxyz = self.data.qpos[3:7]
             self.goal.position = np.asarray(plant["goal"])
             mju_rotVecQuat(rotated, self.nominal_tip, self.data.qpos[3:7])
             # 偏移显示避免不透明插头遮挡；只表达载荷方向，不代表实际作用点
@@ -276,12 +365,14 @@ class CpuSimModel:
         self.body_inertia = torch.from_numpy(model.body_inertia).float().unsqueeze(0).clone()
         self.geom_friction = torch.from_numpy(model.geom_friction).float().unsqueeze(0).clone()
         self.geom_pos = torch.from_numpy(model.geom_pos).float().unsqueeze(0).clone()
+        self.geom_quat = torch.from_numpy(model.geom_quat).float().unsqueeze(0).clone()
 
     def push(self) -> None:
         self._m.body_mass[:] = self.body_mass[0].numpy()
         self._m.body_inertia[:] = self.body_inertia[0].numpy()
         self._m.geom_friction[:] = self.geom_friction[0].numpy()
         self._m.geom_pos[:] = self.geom_pos[0].numpy()
+        self._m.geom_quat[:] = self.geom_quat[0].numpy()
 
 
 class CpuSim:
@@ -317,32 +408,104 @@ class CpuSim:
         self.data.pull()
 
 
+def _cross3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    out = np.empty(3, dtype=np.float64)
+    out[0] = a[1] * b[2] - a[2] * b[1]
+    out[1] = a[2] * b[0] - a[0] * b[2]
+    out[2] = a[0] * b[1] - a[1] * b[0]
+    return out
+
+
+def _np_quat_canonical(q: np.ndarray) -> np.ndarray:
+    n = math.sqrt(float(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]))
+    q = q / max(n, 1e-12)
+    for i in range(4):
+        if abs(q[i]) > 1e-8:
+            return -q if q[i] < 0 else q
+    return q
+
+
+def _np_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    qw, qx, qy, qz = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    vx, vy, vz = float(v[0]), float(v[1]), float(v[2])
+    uvx = qy * vz - qz * vy
+    uvy = qz * vx - qx * vz
+    uvz = qx * vy - qy * vx
+    out = np.empty(3, dtype=np.float64)
+    out[0] = vx + 2.0 * (qw * uvx + (qy * uvz - qz * uvy))
+    out[1] = vy + 2.0 * (qw * uvy + (qz * uvx - qx * uvz))
+    out[2] = vz + 2.0 * (qw * uvz + (qx * uvy - qy * uvx))
+    return out
+
+
+def _np_quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    aw, ax, ay, az = float(a[0]), float(a[1]), float(a[2]), float(a[3])
+    bw, bx, by, bz = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+    out = np.empty(4, dtype=np.float64)
+    out[0] = aw * bw - (ax * bx + ay * by + az * bz)
+    out[1] = aw * bx + bw * ax + (ay * bz - az * by)
+    out[2] = aw * by + bw * ay + (az * bx - ax * bz)
+    out[3] = aw * bz + bw * az + (ax * by - ay * bx)
+    return out
+
+
+def _np_quat_rotvec(q: np.ndarray) -> np.ndarray:
+    q = _np_quat_canonical(q)
+    sine = math.sqrt(float(q[1]*q[1] + q[2]*q[2] + q[3]*q[3]))
+    if sine > 1e-7:
+        angle = 2.0 * math.atan2(sine, float(q[0]))
+        return q[1:] * (angle / sine)
+    return q[1:] * 2.0
+
+
+def _np_transform_wrench(f: np.ndarray, m: np.ndarray, q: np.ndarray, r: np.ndarray) -> np.ndarray:
+    fr = _np_rotate(q, f)
+    mr = _np_rotate(q, m)
+    out = np.empty(6, dtype=np.float64)
+    out[:3] = fr
+    out[3:] = mr - _cross3(r, fr)
+    return out
+
+
 class RealtimePlant(PlantGroup):
     """Single-environment real-time CPU MuJoCo plant with interactive pose/noise/dynamics control."""
 
     def __init__(self, shape: str, cfg: InsertionCfg):
         cfg = replace(cfg, shapes=(shape,), envs_per_shape=1, shape_env_counts=(),
                       adaptive_sampling=False, training=False, episode_seconds=1e9,
+                      enable_timeout=False, rough_surface=True,
                       physics_cuda_graph=False, observation_cuda_graph=False)
         super().__init__(shape, cfg, "cpu")
+        seed_now = time.time_ns() & 0x7FFF_FFFF
+        self.generator.manual_seed(seed_now)
+        self.walk_generator.manual_seed((seed_now + 500003) & 0x7FFF_FFFF)
         self.grasp_dir = torch.zeros(1, 3)
         self.calib_dir = torch.zeros(1, 3)
         self.pos_bias_dir = torch.zeros(1, 3)
+        self.rot_bias_dir = torch.zeros(1, 3)
         self.sensor_rot_dir = torch.zeros(1, 3)
         self.force_bias_dir = torch.zeros(1, 3)
         self.moment_bias_dir = torch.zeros(1, 3)
+        self.sampled_act_delay = 0
+        self.wave_u_wl = torch.zeros(1, cfg.rough_num_waves)
+        self.wave_theta = torch.zeros(1, cfg.rough_num_waves)
+        self.wave_phase = torch.zeros(1, cfg.rough_num_waves)
+        self.wave_weights = torch.ones(1, cfg.rough_num_waves) / cfg.rough_num_waves
+        self.tile_jitter = torch.zeros(1, max(1, len(self.surf_geom_ids)))
+        self.terrain_stepped = False
         self.resample_fixed_directions()
+        self.resample_terrain_waves()
 
     def _build_simulation(self) -> None:
         cfg = self.cfg
         self.geometry = geometry(self.shape, self.clearance, cfg.scale, cfg.circle_sides,
-                                 cfg.plate_outer_radius_m)
+                                 cfg.plate_outer_radius_m, cfg.rough_surface, cfg.hole_depth_m)
         self.model = build_model(self.geometry)
         self.model.opt.timestep = cfg.physics_dt
         self.model.opt.gravity[:] = 0
         self.model.opt.iterations = 50
         self.model.opt.ls_iterations = 20
-        self.model.bvh_aabb[:, 3:] += 0.01
+        self.model.bvh_aabb[:, 3:] += 0.06
         self.body_id = self.model.body("tool").id
         self.sim = CpuSim(self.model)
         self.peg_geom_ids = (self.model.geom_bodyid == self.body_id).nonzero()[0].tolist()
@@ -352,22 +515,62 @@ class RealtimePlant(PlantGroup):
             self.geometry.peg_polygon, dtype=torch.float32, device=self.device)
         self.hole_polygon = torch.tensor(
             self.geometry.hole_polygon, dtype=torch.float32, device=self.device)
+        self._init_rough_surface()
 
     def resample_fixed_directions(self) -> None:
         self.grasp_dir = torch.randn(1, 3, generator=self.generator)
         self.calib_dir = self.uniform(1, 3, -1., 1.)
         self.pos_bias_dir = self.uniform(1, 3, -1., 1.)
+        self.rot_bias_dir = self.uniform(1, 3, -1., 1.)
         self.sensor_rot_dir = self.uniform(1, 3, -1., 1.)
         self.force_bias_dir = self.sample_wrench_bias(1, 1.0)
         self.moment_bias_dir = self.sample_wrench_bias(1, 1.0)
+        self.sampled_act_delay = int(torch.randint(0, 3, (1,), generator=self.generator).item())
+        self.gain_q = rotvec_quat(self.uniform(1, 3, -0.5, 0.5))
+        self.damping_ratio = self.uniform(1, 6, 0.8, 1.3)
+        self.mass = self.uniform(1, 1, 0.7, 1.5)
+        inertia_parts = self.uniform(1, 3, 0.001, 0.0025)
+        self.inertia = (inertia_parts.sum(-1, keepdim=True) - inertia_parts) * self.cfg.scale ** 2
+        self.down_mass = self.uniform(1, 1, 0.2, 0.4)
+        down_parts = self.uniform(1, 3, 0.00015, 0.00035)
+        self.down_inertia = (down_parts.sum(-1, keepdim=True) - down_parts) * self.cfg.scale ** 2
+        self.sim.model.body_mass[0, self.body_id] = self.mass[0, 0]
+        self.sim.model.body_inertia[0, self.body_id] = self.inertia[0]
 
-    def apply_parameters(self, *, noise_scale: float, pos_bias_mm: float, grasp_err_mm: float,
-                         calib_err_mm: float, pos_noise_mm: float, rot_noise_deg: float,
+    def resample_terrain_waves(self) -> None:
+        m = self.cfg.rough_num_waves
+        self.wave_u_wl = self.uniform(1, m, 0., 1.)
+        self.wave_theta = self.uniform(1, m, -3.14159265, 3.14159265)
+        self.wave_phase = self.uniform(1, m, -3.14159265, 3.14159265)
+        w = self.uniform(1, m, 0.2, 1.0)
+        self.wave_weights = w / w.sum(dim=-1, keepdim=True)
+        k_tiles = max(1, len(self.surf_geom_ids))
+        self.tile_jitter = self.uniform(1, k_tiles, -0.5, 0.5)
+        self.terrain_stepped = bool(self.uniform(1, 1, 0., 1.).item() < self.cfg.rough_stepped_prob)
+
+    def apply_terrain(self, amplitude_mm: float, wl_min_mm: float, wl_max_mm: float) -> None:
+        if self.surf_slice is None:
+            return
+        lo = max(4.0, min(wl_min_mm, wl_max_mm)) * 1e-3 * self.cfg.scale
+        hi = max(lo + 1e-4, max(wl_min_mm, wl_max_mm) * 1e-3 * self.cfg.scale)
+        wavelengths = (math.log(lo) + self.wave_u_wl * (math.log(hi) - math.log(lo))).exp()
+        amp = torch.tensor([[max(0.0, amplitude_mm) * 1e-3 * self.cfg.scale]], dtype=torch.float32)
+        jitter = self.tile_jitter if self.tile_jitter.shape[1] == len(self.surf_geom_ids) else None
+        stepped = torch.tensor([[self.terrain_stepped]], dtype=torch.bool)
+        pos, q_full, tile_top_z = self._compute_rough_tiles(
+            amp, wavelengths, self.wave_theta, self.wave_phase, self.wave_weights, jitter, stepped)
+        self.sim.model.geom_pos[:, self.surf_slice] = pos
+        self.sim.model.geom_quat[:, self.surf_slice] = q_full
+        self.surface_max_height[:] = tile_top_z.amax(dim=-1).clamp_min(0.0)
+        self.sim.model.push()
+
+    def apply_parameters(self, *, noise_scale: float, pos_bias_mm: float,
+                         grasp_xy_err_mm: float, grasp_z_err_mm: float,
+                         calib_err_mm: float, rot_bias_deg: float, pos_noise_mm: float, rot_noise_deg: float,
                          force_bias_n: float, force_noise_n: float, moment_bias_nm: float,
                          moment_noise_nm: float, k_xyz: float, k_rot: float, friction_mu: float,
                          stiction_f: float, stiction_m: float, wall_f: float,
                          terminate_on_overload: bool, recompute_geom: bool = True) -> None:
-        import math
         self.noise_scale = float(noise_scale)
         self.cfg = replace(
             self.cfg,
@@ -377,7 +580,11 @@ class RealtimePlant(PlantGroup):
             moment_noise=moment_noise_nm,
             terminate_on_overload=terminate_on_overload,
         )
-        grasp = self.grasp_dir * (grasp_err_mm * 1e-3 * self.noise_scale)
+        grasp = torch.stack((
+            self.grasp_dir[:, 0] * (grasp_xy_err_mm * 1e-3),
+            self.grasp_dir[:, 1] * (grasp_xy_err_mm * 1e-3),
+            self.grasp_dir[:, 2].clamp(-2.5, 2.5) * (grasp_z_err_mm * 1e-3),
+        ), dim=-1) * self.noise_scale
         self.offset[0] = self.nominal_offset[0] + grasp[0]
         if recompute_geom:
             for geom_id in self.peg_geom_ids:
@@ -389,25 +596,34 @@ class RealtimePlant(PlantGroup):
             self.sim.model.push()
         self.calibration[0] = self.calib_dir[0] * (calib_err_mm * 1e-3 * self.noise_scale)
         self.bias[0] = self.pos_bias_dir[0] * (pos_bias_mm * 1e-3 * self.noise_scale)
+        if self.cfg.align_goal_z_to_observation:
+            self.bias[0, 2] = self.calibration[0, 2] - grasp[0, 2]
+        self.rotation_bias_q[0] = rotvec_quat(
+            self.rot_bias_dir * (math.radians(rot_bias_deg) * self.noise_scale))[0]
         self.sensor_error[0] = rotvec_quat(
             self.sensor_rot_dir * (self.cfg.sensor_rotation_error * self.noise_scale))[0]
         self.wrench_bias[0, :3] = self.force_bias_dir[0] * (force_bias_n * self.noise_scale)
         self.wrench_bias[0, 3:] = self.moment_bias_dir[0] * (moment_bias_nm * self.noise_scale)
         self.k[0] = torch.tensor([k_xyz, k_xyz, k_xyz, k_rot, k_rot, k_rot], dtype=torch.float32)
         self.initial_k[0] = self.k[0].double()
-        self.walk_current[0] = self.initial_k[0]
-        self.walk_target[0] = self.initial_k[0]
-        self.walk_lower[0] = self.initial_k[0]
-        self.walk_upper[0] = self.initial_k[0]
+        wf = self.cfg.impedance_walk_fraction if self.noise_scale > 0 else 0.0
+        self.walk_lower[0] = self.initial_k[0] * (1.0 - wf)
+        self.walk_upper[0] = self.initial_k[0] * (1.0 + wf)
+        if recompute_geom:
+            self.walk_current[0] = self.initial_k[0]
+            self.walk_target[0] = self.initial_k[0]
+        else:
+            self.walk_current[0] = self.walk_current[0].clamp(self.walk_lower[0], self.walk_upper[0])
+            self.walk_target[0] = self.walk_target[0].clamp(self.walk_lower[0], self.walk_upper[0])
         inertia6 = torch.cat((self.mass.expand(1, 3), self.inertia), -1)
-        self.d[0] = 2.0 * torch.sqrt(self.k * inertia6)[0]
+        self.d[0] = (2.0 * self.damping_ratio * torch.sqrt(self.k * inertia6))[0]
         self.stiction[0] = torch.tensor([stiction_f]*3 + [stiction_m]*3, dtype=torch.float32)
         self.wall_friction[0] = float(wall_f)
+        self.delay[0] = self.sampled_act_delay if self.noise_scale > 0 else 0
 
     def set_initial_pose(self, x_mm: float, y_mm: float, z_mm: float,
                          rx_deg: float, ry_deg: float, rz_deg: float,
                          depth_mm: float) -> None:
-        import math
         self.sim.reset(torch.zeros(1, dtype=torch.long))
         self.goal[0] = torch.tensor([0., 0., -depth_mm * 1e-3], dtype=torch.float32)
         pos = torch.tensor([[x_mm * 1e-3, y_mm * 1e-3, z_mm * 1e-3]], dtype=torch.float32)
@@ -416,6 +632,7 @@ class RealtimePlant(PlantGroup):
         q = rotvec_quat(rv)
         self.sim.data.qpos[0, :3] = (pos - rotate(q, self.offset))[0]
         self.sim.data.qpos[0, 3:7] = q[0]
+        self.tip_ema[:] = torch.cat((pos[:, :2], pos[:, 2:3].clamp_max(0.0)), dim=-1)
         self.sim.data.qvel.zero_()
         self.sim.data.xfrc_applied.zero_()
         self.sim.forward()
@@ -425,7 +642,7 @@ class RealtimePlant(PlantGroup):
         self.targets_q[:] = q.unsqueeze(0)
         self.physics_p_goal[:] = nominal_tip
         self.physics_q_goal[:] = q
-        self.delay.zero_()
+        self.delay[0] = self.sampled_act_delay if self.noise_scale > 0 else 0
         for buffer in (self.length, self.hold, self.peak_force, self.peak_moment,
                        self.step_peak_force, self.step_peak_moment,
                        self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor,
@@ -434,10 +651,164 @@ class RealtimePlant(PlantGroup):
         if self.cfg.position_observation_delay:
             self.reset_position_observation(torch.zeros(1, dtype=torch.long), nominal_tip)
 
-    def snapshot_dict(self) -> dict:
-        return {
+    def advance_physics(self) -> None:
+        cfg = self.cfg
+        d = self.sim.mj_data
+        m = self.model
+        body_id = self.body_id
+        gain_q = self.gain_q[0].numpy().astype(np.float64)
+        gain_q_inv = np.array([gain_q[0], -gain_q[1], -gain_q[2], -gain_q[3]], dtype=np.float64)
+        do_walk = (cfg.dynamics != "nominal" and cfg.impedance_walk_fraction > 0
+                   and not torch.allclose(self.walk_lower, self.walk_upper))
+        walk_cur = self.walk_current[0].numpy().copy()
+        walk_tgt = self.walk_target[0].numpy()
+        walk_init = self.initial_k[0].numpy()
+        walk_lo = self.walk_lower[0].numpy()
+        walk_hi = self.walk_upper[0].numpy()
+        walk_alpha = 1.0 - math.exp(-cfg.physics_dt / cfg.impedance_walk_time_constant_seconds)
+        walk_max_delta = walk_init * (cfg.impedance_walk_rate_per_second * cfg.physics_dt)
+        damp_ratio = self.damping_ratio[0].numpy().astype(np.float64)
+        inertia6 = np.concatenate((
+            np.repeat(self.mass[0].numpy().astype(np.float64), 3),
+            self.inertia[0].numpy().astype(np.float64),
+        ))
+        k_f = self.k[0, :3].numpy().astype(np.float64).copy()
+        k_m = self.k[0, 3:].numpy().astype(np.float64).copy()
+        d_f = self.d[0, :3].numpy().astype(np.float64).copy()
+        d_m = self.d[0, 3:].numpy().astype(np.float64).copy()
+        stic_f = self.stiction[0, :3].numpy().astype(np.float64)
+        stic_m = self.stiction[0, 3:].numpy().astype(np.float64)
+        nom_calib = (self.nominal_offset[0] + self.calibration[0]).numpy().astype(np.float64)
+        offset = self.offset[0].numpy().astype(np.float64)
+        sensor_off = self.sensor_offset[0].numpy().astype(np.float64)
+        sensor_err = self.sensor_error[0].numpy().astype(np.float64)
+        r_st_rot = _np_rotate(sensor_err, nom_calib - sensor_off)
+        r_raw = offset - sensor_off
+        q_ident = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        p_goal = self.physics_p_goal[0].numpy().astype(np.float64)
+        q_goal = self.physics_q_goal[0].numpy().astype(np.float64)
+        wall_fric = float(self.wall_friction[0])
+        mass = float(self.mass[0, 0])
+        down_mass = float(self.down_mass[0, 0])
+        down_inertia = self.down_inertia[0].numpy().astype(np.float64)
+        alpha = 1.0 - math.exp(-cfg.physics_dt / cfg.filter_seconds)
+        hyst_hw = self.hysteresis_half_width.numpy().astype(np.float64)
+        filt = self.filtered_sensor[0].numpy().astype(np.float64).copy()
+        hyst = self.hysteresis_sensor[0].numpy().astype(np.float64).copy()
+        step_pf = float(self.step_peak_force[0])
+        step_pm = float(self.step_peak_moment[0])
+        pf = float(self.peak_force[0])
+        pm = float(self.peak_moment[0])
+        r_sq = self.geometry.radius ** 2
+        ramp_depth = cfg.inserted_load_depth_m if cfg.inserted_load_depth_m > 0 else 0.003
+        wall_fz = 0.0
+        wrench_out = np.zeros(6, dtype=np.float64)
+        raw_out = np.zeros(6, dtype=np.float64)
+
+        for _ in range(cfg.decimation):
+            if do_walk:
+                delta = np.clip((walk_tgt - walk_cur) * walk_alpha, -walk_max_delta, walk_max_delta)
+                walk_cur = np.clip(walk_cur + delta, walk_lo, walk_hi)
+                k_f = walk_cur[:3]
+                k_m = walk_cur[3:]
+                d_all = 2.0 * damp_ratio * np.sqrt(walk_cur * inertia6)
+                d_f = d_all[:3]
+                d_m = d_all[3:]
+            pos = d.qpos[:3]
+            q = _np_quat_canonical(d.qpos[3:7])
+            v = d.qvel[:3]
+            omega = _np_rotate(q, d.qvel[3:6])
+            r_ct = _np_rotate(q, nom_calib)
+            p_tip = pos + r_ct
+            v_tip = v + _cross3(omega, r_ct)
+
+            loc_ef = _np_rotate(gain_q_inv, p_goal - p_tip)
+            loc_vf = _np_rotate(gain_q_inv, v_tip)
+            spr_f = k_f * loc_ef
+            spr_f = np.sign(spr_f) * np.maximum(np.abs(spr_f) - stic_f, 0.0)
+            force = np.clip(_np_rotate(gain_q, spr_f - d_f * loc_vf), -40.0, 40.0)
+
+            q_inv = np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
+            ang_err = _np_quat_rotvec(_np_quat_mul(q_goal, q_inv))
+            loc_em = _np_rotate(gain_q_inv, ang_err)
+            loc_vm = _np_rotate(gain_q_inv, omega)
+            spr_m = k_m * loc_em
+            spr_m = np.sign(spr_m) * np.maximum(np.abs(spr_m) - stic_m, 0.0)
+            moment_tip = np.clip(_np_rotate(gain_q, spr_m - d_m * loc_vm), -3.0, 3.0)
+
+            true_tip = pos + _np_rotate(q, offset)
+            in_open = 1.0 if (true_tip[0] ** 2 + true_tip[1] ** 2 <= r_sq) else 0.0
+            depth_scale = min(max((-true_tip[2] - 0.0005) / ramp_depth, 0.0), 1.0) * in_open
+            max_wf = wall_fric * depth_scale
+            wall_fz = min(max(-force[2] - mass * v[2] / 0.005, -max_wf), max_wf)
+
+            d.xfrc_applied[body_id, 0] = force[0]
+            d.xfrc_applied[body_id, 1] = force[1]
+            d.xfrc_applied[body_id, 2] = force[2] + wall_fz
+            d.xfrc_applied[body_id, 3:] = moment_tip + _cross3(r_ct, force)
+
+            mj_step(m, d)
+
+            q2 = _np_quat_canonical(d.qpos[3:7])
+            q2_inv = np.array([q2[0], -q2[1], -q2[2], -q2[3]], dtype=np.float64)
+            acc = d.qacc[:3]
+            alpha_loc = d.qacc[3:6]
+            omega_loc = d.qvel[3:6]
+            cf = np.array(
+                [d.qfrc_constraint[0], d.qfrc_constraint[1], d.qfrc_constraint[2] + wall_fz],
+                dtype=np.float64,
+            )
+            cm = _np_rotate(q2, d.qfrc_constraint[3:6])
+            iner_m = _np_rotate(
+                q2, down_inertia * alpha_loc + _cross3(omega_loc, down_inertia * omega_loc))
+            wrist = _np_transform_wrench(cf - down_mass * acc, cm - iner_m, q2_inv, sensor_off)
+            filt += alpha * (wrist - filt)
+            hyst = np.minimum(np.maximum(hyst, filt - hyst_hw), filt + hyst_hw)
+            wrench_out = _np_transform_wrench(hyst[:3], hyst[3:], sensor_err, r_st_rot)
+            raw_out = _np_transform_wrench(wrist[:3], wrist[3:], q_ident, r_raw)
+
+            f_norm = float(np.linalg.norm(raw_out[:3]))
+            m_norm = float(np.linalg.norm(raw_out[3:]))
+            if cfg.inserted_load_cost:
+                tz = float((d.qpos[:3] + _np_rotate(q2, offset))[2])
+                if cfg.inserted_load_depth_m > 0:
+                    zw = min(max(1.0 + tz / cfg.inserted_load_depth_m, 0.0), 1.0)
+                else:
+                    zw = 1.0 if tz >= 0.0 else 0.0
+                rhf = _np_rotate(q2, raw_out[:3])
+                step_fn = float(np.hypot(np.hypot(rhf[0], rhf[1]), rhf[2] * zw))
+            else:
+                step_fn = f_norm
+            if step_fn > step_pf:
+                step_pf = step_fn
+            if m_norm > step_pm:
+                step_pm = m_norm
+            if f_norm > pf:
+                pf = f_norm
+            if m_norm > pm:
+                pm = m_norm
+
+        if do_walk:
+            self.walk_current[0] = torch.from_numpy(walk_cur)
+            self.k[0] = torch.from_numpy(walk_cur.astype(np.float32))
+            self.d[0] = torch.from_numpy((2.0 * damp_ratio * np.sqrt(walk_cur * inertia6)).astype(np.float32))
+        self.sim.data.pull()
+        self.sim.data.xfrc_applied[0] = torch.from_numpy(d.xfrc_applied.astype(np.float32))
+        self.wall_force_z[0] = float(wall_fz)
+        self.filtered_sensor[0] = torch.from_numpy(filt.astype(np.float32))
+        self.hysteresis_sensor[0] = torch.from_numpy(hyst.astype(np.float32))
+        self.wrench[0] = torch.from_numpy(wrench_out.astype(np.float32))
+        self.raw_wrench[0] = torch.from_numpy(raw_out.astype(np.float32))
+        self.step_peak_force[0] = step_pf
+        self.step_peak_moment[0] = step_pm
+        self.peak_force[0] = pf
+        self.peak_moment[0] = pm
+
+    def snapshot_dict(self, *, include_surface: bool = True) -> dict:
+        entry = {
             "qpos": self.sim.data.qpos[0].tolist(),
             "grasp_offset": (self.offset[0] - self.nominal_offset[0]).tolist(),
+            "calib_offset": self.calibration[0].tolist(),
             "goal": self.goal[0].tolist(),
             "wrench": self.wrench[0].tolist(),
             "stiffness": self.k[0].tolist(),
@@ -446,10 +817,13 @@ class RealtimePlant(PlantGroup):
             "clearance": self.clearance,
             "difficulty": self.difficulty,
         }
+        if include_surface and self.surf_slice is not None:
+            entry["surface_geom_pos"] = self.sim.model.geom_pos[0, self.surf_slice].tolist()
+            entry["surface_geom_quat"] = self.sim.model.geom_quat[0, self.surf_slice].tolist()
+        return entry
 
 
 def run_interactive(args: argparse.Namespace) -> None:
-    import math
     from evaluate import load_checkpoint, REASONS
 
     torch.set_num_threads(1)
@@ -477,18 +851,32 @@ def run_interactive(args: argparse.Namespace) -> None:
             "🎲 按策略 std 随机采样动作 (Stochastic)", initial_value=False)
         btn_reload = server.gui.add_button("🔄 重载最新训练 Checkpoint")
 
-    with server.gui.add_folder("1. 插头与初始位姿 (开始后锁定)", expand_by_default=True):
+    with server.gui.add_folder("1. 插头、初始位姿与凹凸地形 (开始后锁定)", expand_by_default=True):
         gui_shape = server.gui.add_dropdown(
             "插头形状 (Geometry)", options=ALL_SHAPES,
             initial_value=args.shape or "square")
-        gui_x = server.gui.add_slider("初始 X (mm)", min=-25.0, max=25.0, step=0.5, initial_value=6.0)
-        gui_y = server.gui.add_slider("初始 Y (mm)", min=-25.0, max=25.0, step=0.5, initial_value=-6.0)
+        gui_x = server.gui.add_slider("初始 X (mm)", min=-25.0, max=25.0, step=0.5, initial_value=12.0)
+        gui_y = server.gui.add_slider("初始 Y (mm)", min=-25.0, max=25.0, step=0.5, initial_value=-10.0)
         gui_z = server.gui.add_slider("初始 Z 高度 (mm)", min=1.0, max=25.0, step=0.5, initial_value=10.0)
         gui_rx = server.gui.add_slider("初始倾角 Rx (deg)", min=-15.0, max=15.0, step=0.5, initial_value=3.0)
         gui_ry = server.gui.add_slider("初始倾角 Ry (deg)", min=-15.0, max=15.0, step=0.5, initial_value=-3.0)
         gui_rz = server.gui.add_slider("初始偏航 Rz (deg)", min=-25.0, max=25.0, step=0.5, initial_value=5.0)
-        gui_depth = server.gui.add_slider("目标深度 (mm)", min=5.0, max=22.5, step=0.5, initial_value=15.0)
+        max_depth_mm = round(base_cfg.hole_depth_m * base_cfg.target_depth_max_fraction * 1000, 1)
+        min_depth_mm = round(base_cfg.target_depth_min_m * 1000, 1)
+        gui_depth = server.gui.add_slider(
+            "目标深度 (mm)", min=min_depth_mm, max=max_depth_mm, step=0.5, initial_value=15.0)
         btn_random_pose = server.gui.add_button("🎲 随机生成初始位姿")
+        gui_rough_amp = server.gui.add_slider(
+            "凹凸地形峰谷幅度 (mm, 0=平坦)", min=0.0, max=4.0, step=0.25,
+            initial_value=round(base_cfg.rough_max_amplitude_m * 1000, 2)
+            if base_cfg.rough_surface else 0.0)
+        gui_rough_wl_min = server.gui.add_slider(
+            "地形最小空间波长 (mm)", min=5.0, max=25.0, step=1.0,
+            initial_value=round(base_cfg.rough_wavelength_min_m * 1000, 1))
+        gui_rough_wl_max = server.gui.add_slider(
+            "地形最大空间波长 (mm)", min=10.0, max=50.0, step=1.0,
+            initial_value=round(base_cfg.rough_wavelength_max_m * 1000, 1))
+        btn_random_terrain = server.gui.add_button("🏔️ 随机刷新凹凸地形图案")
 
     with server.gui.add_folder("2. 观测噪声与偏置滑条 (实时可调)", expand_by_default=True):
         gui_noise_scale = server.gui.add_slider(
@@ -497,12 +885,20 @@ def run_interactive(args: argparse.Namespace) -> None:
         gui_pos_bias = server.gui.add_slider(
             "位置常值偏置 (mm)", min=0.0, max=5.0, step=0.1,
             initial_value=round(base_cfg.position_bias * 1000, 2))
-        gui_grasp_err = server.gui.add_slider(
-            "夹持偏移误差 (mm)", min=0.0, max=3.0, step=0.05,
+        gui_grasp_xy_err = server.gui.add_slider(
+            "横向支点偏差 σ_xy (mm)", min=0.0, max=6.0, step=0.25,
             initial_value=round(base_cfg.grasp_position_error * 1000, 2))
+        default_grasp_z = (
+            base_cfg.grasp_position_error if base_cfg.grasp_z_error is None else base_cfg.grasp_z_error)
+        gui_grasp_z_err = server.gui.add_slider(
+            "纵向支点偏差 σ_z (mm)", min=0.0, max=10.0, step=0.25,
+            initial_value=round(default_grasp_z * 1000, 2))
         gui_calib_err = server.gui.add_slider(
-            "尖端标定误差 (mm)", min=0.0, max=2.0, step=0.05,
+            "尖端标定误差 (mm)", min=0.0, max=5.0, step=0.1,
             initial_value=round(base_cfg.tip_calibration_error * 1000, 2))
+        gui_rot_bias = server.gui.add_slider(
+            "姿态常值零偏 (deg)", min=0.0, max=5.0, step=0.1,
+            initial_value=round(math.degrees(base_cfg.rotation_bias), 2))
         gui_pos_noise = server.gui.add_slider(
             "位置逐步白噪声 (mm)", min=0.0, max=2.0, step=0.05,
             initial_value=round(base_cfg.position_noise * 1000, 2))
@@ -521,7 +917,9 @@ def run_interactive(args: argparse.Namespace) -> None:
         gui_moment_noise = server.gui.add_slider(
             "力矩逐步白噪声 (N·m)", min=0.0, max=0.05, step=0.001,
             initial_value=round(base_cfg.moment_noise, 3))
-        btn_resample_bias = server.gui.add_button("🎲 重新采样偏置方向")
+        btn_resample_bias = server.gui.add_button("🎲 重新采样扰动方向/刚度主轴/延迟")
+        gui_auto_resample = server.gui.add_checkbox(
+            "重置/随机位姿时自动重采样本局扰动实例", initial_value=True)
 
     with server.gui.add_folder("3. 物理刚度与摩擦滑条 (实时可调)", expand_by_default=False):
         gui_k_xyz = server.gui.add_slider(
@@ -542,7 +940,10 @@ def run_interactive(args: argparse.Namespace) -> None:
         gui_term_overload = server.gui.add_checkbox(
             "力/力矩超限立即终止", initial_value=False)
 
-    pose_controls = (gui_shape, gui_x, gui_y, gui_z, gui_rx, gui_ry, gui_rz, gui_depth, btn_random_pose)
+    pose_controls = (
+        gui_shape, gui_x, gui_y, gui_z, gui_rx, gui_ry, gui_rz, gui_depth, btn_random_pose,
+        gui_rough_amp, gui_rough_wl_min, gui_rough_wl_max, btn_random_terrain,
+    )
     lock = threading.Lock()
     state = {
         "mode": "setup",  # "setup", "running", "paused", "finished"
@@ -553,11 +954,13 @@ def run_interactive(args: argparse.Namespace) -> None:
         "dirty_params": True,
         "start_requested": False,
         "resample_requested": False,
+        "resample_terrain_requested": False,
         "reload_requested": False,
     }
 
-    plant = RealtimePlant(gui_shape.value, base_cfg)
-    scene = SnapshotScene(server, gui_shape.value, base_cfg)
+    interactive_scene_cfg = replace(base_cfg, rough_surface=True)
+    plant = RealtimePlant(gui_shape.value, interactive_scene_cfg)
+    scene = SnapshotScene(server, gui_shape.value, interactive_scene_cfg)
 
     def set_pose_locked(locked: bool) -> None:
         for ctrl in pose_controls:
@@ -567,8 +970,10 @@ def run_interactive(args: argparse.Namespace) -> None:
         plant.apply_parameters(
             noise_scale=gui_noise_scale.value,
             pos_bias_mm=gui_pos_bias.value,
-            grasp_err_mm=gui_grasp_err.value,
+            grasp_xy_err_mm=gui_grasp_xy_err.value,
+            grasp_z_err_mm=gui_grasp_z_err.value,
             calib_err_mm=gui_calib_err.value,
+            rot_bias_deg=gui_rot_bias.value,
             pos_noise_mm=gui_pos_noise.value,
             rot_noise_deg=gui_rot_noise.value,
             force_bias_n=gui_force_bias.value,
@@ -589,8 +994,9 @@ def run_interactive(args: argparse.Namespace) -> None:
         nonlocal plant, scene
         if gui_shape.value != plant.shape:
             scene.remove()
-            plant = RealtimePlant(gui_shape.value, base_cfg)
-            scene = SnapshotScene(server, gui_shape.value, base_cfg)
+            plant = RealtimePlant(gui_shape.value, interactive_scene_cfg)
+            scene = SnapshotScene(server, gui_shape.value, interactive_scene_cfg)
+        plant.apply_terrain(gui_rough_amp.value, gui_rough_wl_min.value, gui_rough_wl_max.value)
         sync_plant_parameters(recompute_geom=True)
         plant.set_initial_pose(
             gui_x.value, gui_y.value, gui_z.value,
@@ -599,7 +1005,8 @@ def run_interactive(args: argparse.Namespace) -> None:
         )
         scene.update(plant.snapshot_dict())
 
-    for ctrl in (gui_shape, gui_x, gui_y, gui_z, gui_rx, gui_ry, gui_rz, gui_depth):
+    for ctrl in (gui_shape, gui_x, gui_y, gui_z, gui_rx, gui_ry, gui_rz, gui_depth,
+                 gui_rough_amp, gui_rough_wl_min, gui_rough_wl_max):
         @ctrl.on_update
         def _on_pose_change(event) -> None:
             del event
@@ -607,7 +1014,8 @@ def run_interactive(args: argparse.Namespace) -> None:
                 if state["mode"] == "setup":
                     state["dirty_pose"] = True
 
-    for ctrl in (gui_noise_scale, gui_pos_bias, gui_grasp_err, gui_calib_err,
+    for ctrl in (gui_noise_scale, gui_pos_bias, gui_grasp_xy_err, gui_grasp_z_err,
+                 gui_calib_err, gui_rot_bias,
                  gui_pos_noise, gui_rot_noise, gui_force_bias, gui_force_noise,
                  gui_moment_bias, gui_moment_noise, gui_k_xyz, gui_k_rot,
                  gui_friction, gui_stiction_f, gui_stiction_m, gui_wall_f, gui_term_overload):
@@ -628,11 +1036,23 @@ def run_interactive(args: argparse.Namespace) -> None:
             rng = np.random.default_rng()
             gui_x.value = round(float(rng.uniform(-20.0, 20.0)) * 2) / 2
             gui_y.value = round(float(rng.uniform(-20.0, 20.0)) * 2) / 2
-            gui_z.value = round(float(rng.uniform(4.0, 20.0)) * 2) / 2
+            z_floor = max(4.0, float(gui_rough_amp.value) + 3.5)
+            gui_z.value = round(float(rng.uniform(z_floor, 20.0)) * 2) / 2
             gui_rx.value = round(float(rng.uniform(-8.0, 8.0)) * 2) / 2
             gui_ry.value = round(float(rng.uniform(-8.0, 8.0)) * 2) / 2
             gui_rz.value = round(float(rng.uniform(-15.0, 15.0)) * 2) / 2
-            gui_depth.value = round(float(rng.uniform(5.0, 22.5)) * 2) / 2
+            gui_depth.value = round(float(rng.uniform(min_depth_mm, max_depth_mm)) * 2) / 2
+            if gui_auto_resample.value:
+                state["resample_requested"] = True
+            state["dirty_pose"] = True
+
+    @btn_random_terrain.on_click
+    def _on_random_terrain(event) -> None:
+        del event
+        with lock:
+            if state["mode"] != "setup":
+                return
+            state["resample_terrain_requested"] = True
             state["dirty_pose"] = True
 
     @btn_resample_bias.on_click
@@ -678,6 +1098,8 @@ def run_interactive(args: argparse.Namespace) -> None:
             btn_start.disabled = False
             btn_pause.disabled = True
             btn_reset.disabled = True
+            if gui_auto_resample.value:
+                state["resample_requested"] = True
             state["dirty_pose"] = True
 
     @btn_reload.on_click
@@ -703,10 +1125,20 @@ def run_interactive(args: argparse.Namespace) -> None:
             "paused": "⏸ **已暂停**（点击 **⏸ 暂停 / 继续** 恢复，或点击 **⏹ 停止并重置**）",
             "finished": f"🏁 **回合结束：{state['finish_reason']}**（点击 **⏹ 停止并重置** 解锁修改）",
         }
+        grasp_mm = ((plant.offset[0] - plant.nominal_offset[0]) * 1000.0).tolist()
+        bias_mm = (plant.bias[0] * 1000.0).tolist()
+        rb_deg = (quat_rotvec(plant.rotation_bias_q)[0] * (180.0 / math.pi)).tolist()
+        act_d = int(plant.delay[0])
+        obs_d = int(plant.position_delay_frames[0]) if plant.cfg.position_observation_delay else 0
         status_md.content = (
             f"{mode_labels[state['mode']]}  \n"
             f"**模型轮次 (Iteration)**: `{ckpt_iter}` | **形状**: `{plant.shape}` | "
+            f"**地形峰值**: `{float(plant.surface_max_height[0])*1000:.2f} mm` | "
             f"**动作模式**: `{policy_mode}`  \n"
+            f"**本局扰动实例**: 支点 `[{grasp_mm[0]:+5.2f}, {grasp_mm[1]:+5.2f}, {grasp_mm[2]:+5.2f}] mm` | "
+            f"目标偏置 `[{bias_mm[0]:+5.2f}, {bias_mm[1]:+5.2f}, {bias_mm[2]:+5.2f}] mm` | "
+            f"姿态零偏 `[{rb_deg[0]:+4.2f}, {rb_deg[1]:+4.2f}, {rb_deg[2]:+4.2f}]°` | "
+            f"延迟 `act={act_d}/obs={obs_d}帧`  \n"
             f"**当前步数**: `{int(plant.length[0])}` (`{int(plant.length[0])*0.02:.2f} s`) | "
             f"**达标保持**: `{int(plant.hold[0])}/{plant.cfg.success_hold_steps}`  \n"
             f"**真实尖端 XYZ [mm]**: `[{t_pos[0]:+6.2f}, {t_pos[1]:+6.2f}, {t_pos[2]:+6.2f}]` "
@@ -739,6 +1171,9 @@ def run_interactive(args: argparse.Namespace) -> None:
                     if state["resample_requested"]:
                         plant.resample_fixed_directions()
                         state["resample_requested"] = False
+                    if state["resample_terrain_requested"]:
+                        plant.resample_terrain_waves()
+                        state["resample_terrain_requested"] = False
                     if state["start_requested"]:
                         sync_setup_pose()
                         actor.reset()
@@ -765,7 +1200,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                         state["last_action"] = action[0].tolist()
                         state["last_std"] = actor.distribution.std[0].tolist()
                         _, done, info = plant.step(action)
-                        scene.update(plant.snapshot_dict())
+                        scene.update(plant.snapshot_dict(include_surface=False))
                         reason_code = int(info["reason"][0])
                         if bool(done[0]) and reason_code != 4:
                             reason_map = {
@@ -776,7 +1211,9 @@ def run_interactive(args: argparse.Namespace) -> None:
                             state["finish_reason"] = reason_map.get(reason_code, REASONS.get(reason_code, "done"))
                             state["mode"] = "finished"
                             btn_pause.disabled = True
-                        render_status()
+                            render_status()
+                        elif frames % 4 == 0:
+                            render_status()
                     elif state["mode"] in ("paused", "finished"):
                         if state["dirty_params"]:
                             sync_plant_parameters(recompute_geom=False)
@@ -784,7 +1221,7 @@ def run_interactive(args: argparse.Namespace) -> None:
                         if frames % 10 == 0:
                             render_status()
                 frames += 1
-                time.sleep(max(0., 0.02 - (time.monotonic() - started)))
+                time.sleep(max(0.003, 0.02 - (time.monotonic() - started)))
     finally:
         server.stop()
 

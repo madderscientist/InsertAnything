@@ -155,3 +155,21 @@ micromamba run -r ~/micromamba -n mj python -u train.py \
 micromamba run -r ~/micromamba -n mj python export_policy.py \
   runs/real_robot_v1/checkpoint.pt --onnx --prune-std --output runs/export_onnx
 ```
+
+### 4.4 第二阶段：细碎凹凸微砖块上表面与自主越障脱困训练（`train_rough_surface.py`）
+
+针对表面存在碎裂台阶、凹坑或波纹起伏导致的探索卡阻，提供独立阶段脚本 [train_rough_surface.py](./train_rough_surface.py)（所有二阶段机制均隔离在第二阶段配置中，不影响第一阶段默认参数与 `actor.onnx` 13D→6D 推理接口）：
+
+- **细碎扇环微砖块几何与地形随机化（`rough_surface=True`）**：孔口外侧由 `mocap` 刚体承载 `3.6~5.5 mm` 级别的无裂缝微砖块（每种形状 `276~305` 块，L 形额外细分内凹象限为 `3×3`），通过精确三维旋转包围盒（OBB）外法向半空间投影保证绝不侵入孔道，并将与基板共面的谷底砖块自动下沉消除重复接触奇异性。固定 `25%` 并行环境常驻纯平地防止遗忘，其余 `75%` 采样 5 波叠加（波长 `[5, 28] mm`、幅度 `[1.2, 4.0] mm`、`30%` 逐砖碎裂高度抖动，其中 `50%` 强制水平顶 `90°` 垂直断层微台阶）并混合 `50%` 局部谷底低位出生。
+- **纯网络自主越障脱困与防退化机制（零推理外部规则）**：
+  1. **板面上方 `0 ~ 6 mm` 越障高度免罚带（`surface_z_free_m=0.006`）** 与 **防原地弹跳停滞惩罚**：表面以上仅统计横向平移与向下入孔分量 $[x, y, \min(z, 0)]$，消除原地上下抖动刷速度漏洞；
+  2. **退火式零方差路径抬升引导（`RoughStagePPO`）**：仅对受台阶水平反力阻挡且停滞的表面状态施加退火路径梯度引导，配合全状态自适应 KL 信任域与早停熔断；
+  3. **每小时自动隔离双基准评估与最优守门员**：非圆形接触缓冲扩容至 `nconmax=384, njmax=1536`，守护进程每小时拉起独立子进程验证平面与粗糙双基准，自动维护 `best_checkpoint.pt` 并在异常退化时回滚自愈。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 micromamba run -r ~/micromamba -n mj python -u train_rough_surface.py \
+  --output runs/rough_surface_no_timeout \
+  --source-checkpoint runs/continuous_position_delay20mm/checkpoint.pt \
+  --device cuda:0
+```
+

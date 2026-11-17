@@ -259,6 +259,41 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         saved = InsertionCfg.from_checkpoint({"preinsertion_tilt_weight": 0.25})
         self.assertEqual(saved.preinsertion_tilt_weight, 0.25)
 
+    def test_surface_z_free_band_exempts_obstacle_lift_only_in_band(self):
+        cfg_free = InsertionCfg(surface_z_free_m=0.005)
+        cfg_base = InsertionCfg(surface_z_free_m=0.0)
+        depth = torch.tensor([0.015], dtype=torch.float64)
+        zero1 = torch.zeros(1, dtype=torch.float64)
+        zero6 = torch.zeros(1, 6, dtype=torch.float64)
+        flag = torch.tensor([False])
+
+        def pos_pen(cfg, z_val):
+            return float(completion_cost_terms(
+                cfg, zero1, torch.tensor([z_val + 0.015], dtype=torch.float64),
+                depth, 0.01, zero1, zero1, zero6, zero6, zero6, flag, flag, flag,
+            )["position_penalty"])
+
+        at_0 = pos_pen(cfg_free, 0.0)
+        self.assertAlmostEqual(at_0, pos_pen(cfg_base, 0.0))
+        for z_band in (0.001, 0.0025, 0.005):
+            self.assertAlmostEqual(pos_pen(cfg_free, z_band), at_0)
+            self.assertLess(pos_pen(cfg_base, z_band), at_0)
+        self.assertLess(pos_pen(cfg_free, 0.010), at_0)
+        self.assertAlmostEqual(pos_pen(cfg_free, -0.006), pos_pen(cfg_base, -0.006))
+
+    def test_retired_lift_checkpoint_fields_are_stripped(self):
+        cfg = InsertionCfg.from_checkpoint({
+            "stagnation_cost_per_second": 2.5,
+            "stagnation_lift_cost_per_second": 0.0,
+            "stagnation_lift_target": 5.5,
+            "stagnation_lift_scale": 48.0,
+            "stagnation_lateral_target": 4.0,
+            "stagnation_lateral_scale": 24.0,
+            "safety_failure_penalty": 400.0,
+        })
+        self.assertEqual(cfg.stagnation_cost_per_second, 2.5)
+        self.assertFalse(hasattr(cfg, "stagnation_lift_cost_per_second"))
+
     def test_minimum_peg_height_matches_geometry(self):
         q = rotvec_quat(torch.tensor([
             [0., 0., 0.], [0.2, -0.3, 0.4], [math.pi, 0., 0.]],
@@ -398,6 +433,7 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
             shapes=TRAIN_SHAPES, envs_per_shape=2, training=False, dynamics="nominal",
             initial_xy=0, initial_tilt=0, initial_yaw=0, position_bias=0,
             tip_calibration_error=0, grasp_position_error=0, sensor_rotation_error=0,
+            rotation_bias=0,
             position_noise=0, rotation_noise=0, force_noise=0, moment_noise=0,
         )
         cls.env = InsertionEnv(replace(cls.cfg, physics_cuda_graph=True,
@@ -628,6 +664,62 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         group.sim.data.qpos[0, 0] = float("nan")
         with self.assertRaisesRegex(FloatingPointError, "invalid physical state"):
             group.step(actions)
+
+    def test_rough_surface_no_timeout_and_cuda_graph_equivalence(self):
+        cfg = replace(
+            self.cfg,
+            shapes=("square", "l"),
+            envs_per_shape=4,
+            episode_seconds=0.1,
+            enable_timeout=False,
+            timeout_penalty=0.0,
+            rough_surface=True,
+            rough_low_spawn_prob=0.5,
+            rough_max_amplitude_m=0.004,
+            workspace_z_max_m=0.06,
+            surface_z_free_m=0.006,
+            rough_flat_probability=0.0,
+            grasp_position_error=0.0015,
+            grasp_z_error=0.005,
+            hole_depth_m=0.028,
+            target_depth_min_m=0.003,
+            target_depth_max_fraction=25.0 / 28.0,
+            align_goal_z_to_observation=True,
+            rotation_bias=math.radians(1.5),
+            stagnation_cost_per_second=2.5,
+            safety_failure_penalty=400.0,
+            dynamics="train",
+            training=False,
+        )
+        eager = InsertionEnv(cfg, self.device)
+        captured = InsertionEnv(
+            replace(cfg, physics_cuda_graph=True, observation_cuda_graph=True),
+            self.device,
+        )
+        for g in eager.groups:
+            self.assertTrue(bool((g.surface_max_height > 0).all()))
+            self.assertGreater(float(g.surface_max_height.std()), 0.0)
+        zero_actions = torch.zeros(eager.num_envs, 6, device=self.device)
+        with torch.inference_mode():
+            for _ in range(8):
+                obs_e, rew_e, done_e, info_e = eager.step(zero_actions)
+                obs_c, rew_c, done_c, info_c = captured.step(zero_actions)
+                self.assertFalse(bool(done_e.any()))
+                self.assertFalse(bool(info_e["terminal"]["time_outs"].any()))
+                torch.testing.assert_close(obs_c, obs_e, rtol=1e-5, atol=2e-6)
+                torch.testing.assert_close(rew_c, rew_e, rtol=1e-5, atol=2e-6)
+                torch.testing.assert_close(done_c, done_e)
+            self.assertTrue(bool((eager.groups[0].last_reward_terms["stagnation_penalty"] < 0).all()))
+            self.assertTrue(bool((eager.episode_length_buf == 8).all()))
+            down_actions = torch.zeros_like(zero_actions)
+            down_actions[:, 2] = -2.0
+            for step_i in range(10):
+                down_actions[:, 0] = 0.5 * math.sin(step_i)
+                obs_e, rew_e, done_e, _ = eager.step(down_actions)
+                obs_c, rew_c, done_c, _ = captured.step(down_actions)
+                torch.testing.assert_close(obs_c, obs_e, rtol=1e-5, atol=2e-6)
+                torch.testing.assert_close(rew_c, rew_e, rtol=1e-5, atol=2e-6)
+                torch.testing.assert_close(done_c, done_e)
 
 
 if __name__ == "__main__":

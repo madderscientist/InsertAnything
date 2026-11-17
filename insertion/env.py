@@ -16,7 +16,7 @@ from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
 from .config import ALL_SHAPES, InsertionCfg
 from .curriculum import SuccessNoiseCurriculum
-from .geometry import build_model, geometry, points_in_polygon, symmetry_count
+from .geometry import build_model, geometry, points_in_polygon, rough_surface_tiles, symmetry_count
 from .transforms import (action_target, actor_observation, canonical_quat,
                          quat_inv, quat_mul, quat_rotvec, rotate,
                          rotvec_quat, tip_pose, transform_wrench)
@@ -56,9 +56,19 @@ def completion_cost_terms(
     *, tip_center_z: torch.Tensor | None = None,
     hole_force: torch.Tensor | None = None,
     overloaded: torch.Tensor | None = None,
+    stagnation: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     dt = cfg.physics_dt*cfg.decimation
-    remaining = z_disp.clamp_min(0)/target_depth
+    if cfg.surface_z_free_m > 0:
+        lowest_z = z_disp - target_depth
+        eff_z_disp = (
+            target_depth
+            + lowest_z.clamp_max(0.0)
+            + (lowest_z - cfg.surface_z_free_m).clamp_min(0.0)
+        )
+        remaining = eff_z_disp.clamp_min(0.0) / target_depth
+    else:
+        remaining = z_disp.clamp_min(0)/target_depth
     # XY 与 Z 各自独立 tanh 饱和后再相加，防止大平面偏差饱和外层 tanh 抹平 Z 轴下压梯度
     half_cap = 0.5*cfg.position_cost_cap
     xy_distance = half_cap*torch.tanh(
@@ -95,6 +105,8 @@ def completion_cost_terms(
     if overloaded is None:
         overloaded = ((force_norm > cfg.max_force) | (moment_norm > cfg.max_moment)) & (
             not cfg.terminate_on_overload)
+    if stagnation is None:
+        stagnation = torch.zeros_like(xy)
     applied = cfg.action_cost_cap * torch.tanh(actions / cfg.action_cost_cap)
     previous = cfg.action_cost_cap * torch.tanh(previous_actions / cfg.action_cost_cap)
     # 浅入孔 3 mm 内随 Z 权重从 1 渐变到 0，同步放开入孔后的向下 (-Z) 动作幅度限制
@@ -107,6 +119,7 @@ def completion_cost_terms(
         "force_penalty": -dt*cfg.force_cost_per_second*force.square(),
         "moment_penalty": -dt*cfg.moment_cost_per_second*moment.square(),
         "overload_penalty": -dt*cfg.overload_cost_per_second*overloaded.float(),
+        "stagnation_penalty": -dt*cfg.stagnation_cost_per_second*stagnation,
         "action_penalty": -dt*cfg.action_cost_per_second*torch.linalg.vector_norm(applied_for_cost, dim=-1),
         "action_change_penalty": -dt*cfg.action_change_cost_per_second*torch.linalg.vector_norm(
             applied-previous, dim=-1),
@@ -160,6 +173,8 @@ class PlantGroup:
         self.stiction = torch.zeros_like(self.k)
         self.wall_friction = torch.zeros(self.n, device=device)
         self.wall_force_z = torch.zeros(self.n, device=device)
+        self.surface_max_height = torch.zeros(self.n, device=device)
+        self.tip_ema = torch.zeros(self.n, 3, device=device)
         self.initial_k = torch.zeros_like(self.k, dtype=torch.float64)
         self.walk_lower = torch.zeros_like(self.initial_k)
         self.walk_upper = torch.zeros_like(self.initial_k)
@@ -175,6 +190,7 @@ class PlantGroup:
         self.down_inertia = torch.zeros_like(self.inertia)
         self.calibration = torch.zeros(self.n, 3, device=device)
         self.sensor_error = self.identity.clone()
+        self.rotation_bias_q = self.identity.clone()
         self.bias = torch.zeros(self.n, 3, device=device)
         self.delay = torch.zeros(self.n, device=device, dtype=torch.long)
         self.targets_p = torch.zeros(3, self.n, 3, device=device)
@@ -205,17 +221,21 @@ class PlantGroup:
     def _build_simulation(self) -> None:
         cfg = self.cfg
         self.geometry = geometry(self.shape, self.clearance, cfg.scale, cfg.circle_sides,
-                                 cfg.plate_outer_radius_m)
+                                 cfg.plate_outer_radius_m, cfg.rough_surface, cfg.hole_depth_m)
         self.model = build_model(self.geometry)
         self.body_id = self.model.body("tool").id
+        nconmax = 512 if self.shape == "circle" else (384 if cfg.rough_surface else 64)
+        njmax = 2048 if self.shape == "circle" else (1536 if cfg.rough_surface else 256)
         self.sim = Simulation(
-            self.n, SimulationCfg(nconmax=512 if self.shape == "circle" else 64,
-                                 njmax=2048 if self.shape == "circle" else 256,
+            self.n, SimulationCfg(nconmax=nconmax, njmax=njmax,
                                  mujoco=MujocoCfg(timestep=cfg.physics_dt, gravity=(0, 0, 0),
                                                  iterations=50, ls_iterations=20)),
             model=self.model, device=self.device,
         )
-        self.sim.expand_model_fields(("body_mass", "body_inertia", "geom_friction", "geom_pos"))
+        expanded = (("body_mass", "body_inertia", "geom_friction", "geom_pos", "geom_quat")
+                    if cfg.rough_surface
+                    else ("body_mass", "body_inertia", "geom_friction", "geom_pos"))
+        self.sim.expand_model_fields(expanded)
         self.peg_geom_ids = (self.model.geom_bodyid == self.body_id).nonzero()[0].tolist()
         self.default_geom_pos = torch.tensor(
             self.model.geom_pos, device=self.device, dtype=torch.float32)
@@ -223,6 +243,179 @@ class PlantGroup:
             self.geometry.peg_polygon, dtype=torch.float32, device=self.device)
         self.hole_polygon = torch.tensor(
             self.geometry.hole_polygon, dtype=torch.float32, device=self.device)
+        self._init_rough_surface()
+
+    def _init_rough_surface(self) -> None:
+        tiles = rough_surface_tiles(self.geometry)
+        if not tiles:
+            self.surf_geom_ids: list[int] = []
+            self.surf_slice: slice | None = None
+            self.surf_tile_top_z: torch.Tensor | None = None
+            self.surf_tile_xy: torch.Tensor | None = None
+            self.surf_horiz_radius: torch.Tensor | None = None
+            return
+        surface_body_id = self.model.body("surface").id
+        self.surf_geom_ids = (self.model.geom_bodyid == surface_body_id).nonzero()[0].tolist()
+        expected = list(range(self.surf_geom_ids[0], self.surf_geom_ids[-1] + 1))
+        if self.surf_geom_ids != expected or len(self.surf_geom_ids) != len(tiles):
+            raise RuntimeError("rough surface geoms must form a contiguous slice matching tile specs")
+        self.surf_slice = slice(self.surf_geom_ids[0], self.surf_geom_ids[-1] + 1)
+        self.surf_xy = torch.tensor(
+            [[t.cx, t.cy] for t in tiles], device=self.device, dtype=torch.float32)
+        self.surf_sizes = torch.tensor(
+            [[t.sx, t.sy, t.sz] for t in tiles], device=self.device, dtype=torch.float32)
+        self.surf_horiz_radius = torch.hypot(self.surf_sizes[:, 0], self.surf_sizes[:, 1])
+        self.surf_tile_top_z = torch.zeros(self.n, len(tiles), device=self.device, dtype=torch.float32)
+        self.surf_tile_xy = self.surf_xy.unsqueeze(0).expand(self.n, -1, -1).clone()
+        yaws = torch.tensor([t.yaw for t in tiles], device=self.device, dtype=torch.float32)
+        self.surf_q_yaw = torch.stack(
+            (torch.cos(yaws / 2), torch.zeros_like(yaws),
+             torch.zeros_like(yaws), torch.sin(yaws / 2)), dim=-1)
+        u_rows, b_rows, act_rows = [], [], []
+        for c_idx in range(2):
+            u_c, b_c, a_c = [], [], []
+            for t in tiles:
+                if c_idx < len(t.guards):
+                    gx, gy, gb = t.guards[c_idx]
+                    u_c.append([gx, gy, 0.0])
+                    b_c.append(gb)
+                    a_c.append(1.0)
+                else:
+                    u_c.append([1.0, 0.0, 0.0])
+                    b_c.append(-1e9)
+                    a_c.append(0.0)
+            u_rows.append(u_c)
+            b_rows.append(b_c)
+            act_rows.append(a_c)
+        self.surf_guard_u = torch.tensor(u_rows, device=self.device, dtype=torch.float32)
+        self.surf_guard_b = torch.tensor(b_rows, device=self.device, dtype=torch.float32)
+        self.surf_guard_active = torch.tensor(act_rows, device=self.device, dtype=torch.float32)
+        inner_flags = [
+            min(t.cx * gx + t.cy * gy - gb for gx, gy, gb in t.guards) < 0.0032 * self.cfg.scale
+            for t in tiles
+        ]
+        self.surf_inner_ring = torch.tensor(inner_flags, device=self.device, dtype=torch.bool)
+        self.surf_ex = torch.tensor([[1., 0., 0.]], device=self.device, dtype=torch.float32)
+        self.surf_ey = torch.tensor([[0., 1., 0.]], device=self.device, dtype=torch.float32)
+
+    def _compute_rough_tiles(
+        self, amp: torch.Tensor, wavelengths: torch.Tensor, theta: torch.Tensor,
+        phase: torch.Tensor, weights: torch.Tensor,
+        jitter_u: torch.Tensor | None = None, stepped_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        n, k_tiles = amp.shape[0], len(self.surf_geom_ids)
+        wnum = 2 * math.pi / wavelengths
+        kx, ky = wnum * theta.cos(), wnum * theta.sin()
+        arg = (self.surf_xy[None, :, 0:1] * kx[:, None, :]
+               + self.surf_xy[None, :, 1:2] * ky[:, None, :]
+               + phase[:, None, :])
+        psi = (weights[:, None, :] * arg.sin()).sum(dim=-1)
+        cos_w = weights[:, None, :] * arg.cos()
+        dpsi_dx = (cos_w * kx[:, None, :]).sum(dim=-1)
+        dpsi_dy = (cos_w * ky[:, None, :]).sum(dim=-1)
+
+        if cfg.rough_step_jitter > 0 and jitter_u is not None:
+            base_span = (psi.amax(dim=-1, keepdim=True) - psi.amin(dim=-1, keepdim=True)).clamp_min(1e-6)
+            psi = psi + jitter_u * (cfg.rough_step_jitter * base_span)
+
+        psi_min = psi.amin(dim=-1, keepdim=True)
+        scale_h = amp / (psi.amax(dim=-1, keepdim=True) - psi_min).clamp_min(1e-6)
+        h = scale_h * (psi - psi_min)
+        dh_dx, dh_dy = scale_h * dpsi_dx, scale_h * dpsi_dy
+        if stepped_mask is not None:
+            dh_dx = torch.where(stepped_mask, torch.zeros_like(dh_dx), dh_dx)
+            dh_dy = torch.where(stepped_mask, torch.zeros_like(dh_dy), dh_dy)
+
+        outer_slope = math.tan(math.radians(cfg.rough_max_slope_deg))
+        inner_slope = min(outer_slope, math.tan(math.radians(5.0)))
+        tile_max_slope = torch.where(
+            self.surf_inner_ring[None, :],
+            torch.full_like(dh_dx, inner_slope),
+            torch.full_like(dh_dx, outer_slope),
+        )
+        slope_cap = (tile_max_slope / torch.hypot(dh_dx, dh_dy).clamp_min(1e-8)).clamp_max(1.0)
+        dh_dx, dh_dy = dh_dx * slope_cap, dh_dy * slope_cap
+
+        n_raw = torch.stack((-dh_dx, -dh_dy, torch.ones_like(h)), dim=-1)
+        n_surf = n_raw / torch.linalg.vector_norm(n_raw, dim=-1, keepdim=True)
+        sin_b = torch.hypot(n_surf[..., 0], n_surf[..., 1])
+        beta = torch.atan2(sin_b, n_surf[..., 2])
+        ratio = torch.where(sin_b > 1e-6, beta / sin_b.clamp_min(1e-6), torch.ones_like(sin_b))
+        rv_tilt = torch.stack(
+            (-n_surf[..., 1] * ratio, n_surf[..., 0] * ratio, torch.zeros_like(beta)), dim=-1)
+        q_tilt = rotvec_quat(rv_tilt.reshape(-1, 3)).reshape(n, k_tiles, 4)
+        q_full = quat_mul(
+            q_tilt.reshape(-1, 4),
+            self.surf_q_yaw.unsqueeze(0).expand(n, -1, -1).reshape(-1, 4),
+        ).reshape(n, k_tiles, 4)
+
+        top_center = torch.cat(
+            (self.surf_xy.unsqueeze(0).expand(n, -1, -1), h.unsqueeze(-1)), dim=-1)
+        pos = top_center - self.surf_sizes[None, :, 2:3] * n_surf
+        flat_q = q_full.reshape(-1, 4)
+        ex = rotate(flat_q, self.surf_ex.expand(n * k_tiles, 3)).reshape(n, k_tiles, 3)
+        ey = rotate(flat_q, self.surf_ey.expand(n * k_tiles, 3)).reshape(n, k_tiles, 3)
+        ez = n_surf
+        for c_idx in range(2):
+            u_vec = self.surf_guard_u[c_idx]
+            b_val = self.surf_guard_b[c_idx]
+            act = self.surf_guard_active[c_idx]
+            proj_c = (pos * u_vec[None, :, :]).sum(dim=-1)
+            extent = (
+                (ex * u_vec[None, :, :]).sum(dim=-1).abs() * self.surf_sizes[None, :, 0]
+                + (ey * u_vec[None, :, :]).sum(dim=-1).abs() * self.surf_sizes[None, :, 1]
+                + (ez * u_vec[None, :, :]).sum(dim=-1).abs() * self.surf_sizes[None, :, 2]
+            )
+            deficit = (b_val[None, :] - (proj_c - extent)).clamp_min(0.0) * act[None, :]
+            pos = pos + deficit.unsqueeze(-1) * u_vec[None, :, :]
+
+        corner_ext_z = (
+            ex[..., 2].abs() * self.surf_sizes[None, :, 0]
+            + ey[..., 2].abs() * self.surf_sizes[None, :, 1]
+            + ez[..., 2].abs() * self.surf_sizes[None, :, 2]
+        )
+        tile_top_z = pos[..., 2] + corner_ext_z
+        excess_z = (tile_top_z.amax(dim=-1, keepdim=True) - amp).clamp_min(0.0)
+        pos = torch.cat((pos[..., :2], pos[..., 2:3] - excess_z.unsqueeze(-1)), dim=-1)
+        tile_top_z = tile_top_z - excess_z
+        # 当瓦片顶面与 z=0 基板共面时将其下沉到基板内部，消除共面重复接触导致的奇异海森矩阵
+        coplanar_bury = (tile_top_z <= 5e-5 * cfg.scale).to(pos.dtype) * (0.010 * cfg.scale)
+        pos = torch.cat((pos[..., :2], pos[..., 2:3] - coplanar_bury.unsqueeze(-1)), dim=-1)
+        tile_top_z = torch.where(coplanar_bury > 0, torch.zeros_like(tile_top_z), tile_top_z)
+        return pos, q_full, tile_top_z
+
+    def _randomize_rough_surface(self, ids: torch.Tensor) -> None:
+        if self.surf_slice is None or len(ids) == 0:
+            self.surface_max_height[ids] = 0
+            return
+        cfg = self.cfg
+        n, k_tiles, m_waves = len(ids), len(self.surf_geom_ids), cfg.rough_num_waves
+        wl_min, wl_max = cfg.rough_wavelength_min_m * cfg.scale, cfg.rough_wavelength_max_m * cfg.scale
+        wavelengths = self.uniform(n, m_waves, math.log(wl_min), math.log(wl_max)).exp()
+        theta = self.uniform(n, m_waves, -math.pi, math.pi)
+        phase = self.uniform(n, m_waves, -math.pi, math.pi)
+        weights = self.uniform(n, m_waves, 0.2, 1.0)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        amp_scale = self.difficulty if cfg.training else 1.0
+        amp = self.uniform(n, 1, cfg.rough_min_amplitude_m * cfg.scale,
+                           cfg.rough_max_amplitude_m * cfg.scale) * amp_scale
+        if cfg.rough_flat_probability > 0:
+            flat_mask = ((ids < round(self.n * cfg.rough_flat_probability)).unsqueeze(-1)
+                         if cfg.training and self.n >= 4
+                         else self.uniform(n, 1, 0.0, 1.0) < cfg.rough_flat_probability)
+            amp = torch.where(flat_mask, torch.zeros_like(amp), amp)
+        jitter = self.uniform(n, k_tiles, -0.5, 0.5) if cfg.rough_step_jitter > 0 else None
+        stepped = (self.uniform(n, 1, 0.0, 1.0) < cfg.rough_stepped_prob
+                   if cfg.rough_stepped_prob > 0 else None)
+        pos, q_full, tile_top_z = self._compute_rough_tiles(
+            amp, wavelengths, theta, phase, weights, jitter, stepped)
+        self.sim.model.geom_pos[ids, self.surf_slice] = pos
+        self.sim.model.geom_quat[ids, self.surf_slice] = q_full
+        if self.surf_tile_top_z is not None and self.surf_tile_xy is not None:
+            self.surf_tile_top_z[ids] = tile_top_z
+            self.surf_tile_xy[ids] = pos[..., :2]
+        self.surface_max_height[ids] = tile_top_z.amax(dim=-1).clamp_min(0.0)
 
     def uniform(self, n: int, columns: int, low: float, high: float) -> torch.Tensor:
         return low + (high - low) * torch.rand(n, columns, generator=self.generator,
@@ -256,6 +449,8 @@ class PlantGroup:
         grasp = self.offset - self.nominal_offset
         for geom_id in self.peg_geom_ids:
             self.sim.model.geom_pos[:, geom_id] = self.default_geom_pos[geom_id] + grasp
+        if self.surf_slice is not None:
+            self._randomize_rough_surface(torch.arange(self.n, device=self.device))
         self.sim.recompute_constants(RecomputeLevel.set_const)
         self.sim.data.qpos[:] = qpos
         self.sim.data.qvel[:] = qvel
@@ -352,14 +547,22 @@ class PlantGroup:
         if cfg.dynamics == "nominal":
             friction.fill_(0.4)
         self.sim.model.geom_friction[ids, :, 0] = friction
+        z_grasp_err = cfg.grasp_position_error if cfg.grasp_z_error is None else cfg.grasp_z_error
         if cfg.grasp_error_distribution == "gaussian":
-            grasp = self.normal(n, 3, cfg.grasp_position_error)
+            grasp_xy = self.normal(n, 2, cfg.grasp_position_error)
+            grasp_z = (self.normal(n, 1, z_grasp_err).clamp(-2.5 * z_grasp_err, 2.5 * z_grasp_err)
+                       if z_grasp_err > 0 else torch.zeros(n, 1, device=self.device))
+            grasp = torch.cat((grasp_xy, grasp_z), dim=-1)
         else:
-            grasp = self.uniform(n, 3, -cfg.grasp_position_error, cfg.grasp_position_error)
+            grasp = torch.cat((
+                self.uniform(n, 2, -cfg.grasp_position_error, cfg.grasp_position_error),
+                self.uniform(n, 1, -z_grasp_err, z_grasp_err)), dim=-1)
         grasp = grasp*self.noise_scale
         self.offset[ids] = self.nominal_offset[ids] + grasp
         for geom_id in self.peg_geom_ids:
             self.sim.model.geom_pos[ids, geom_id] = self.default_geom_pos[geom_id] + grasp
+        if cfg.rough_surface:
+            self._randomize_rough_surface(ids)
         if self.reset_constants_graph is not None and cfg.physics_cuda_graph:
             self.reset_constants_graph.replay()
         else:
@@ -378,8 +581,13 @@ class PlantGroup:
         self.calibration[ids] = self.uniform(n, 3, -cfg.tip_calibration_error,
                                             cfg.tip_calibration_error)*self.noise_scale
         self.bias[ids] = self.uniform(n, 3, -cfg.position_bias, cfg.position_bias)*self.noise_scale
+        if cfg.align_goal_z_to_observation:
+            # 将名义目标深度同步平移纵向估计偏差 (h + Z)，使竖直到达实际深度 h 时 obs_z 恰好归零
+            self.bias[ids, 2] = self.calibration[ids, 2] - grasp[:, 2]
         self.sensor_error[ids] = rotvec_quat(self.uniform(
             n, 3, -cfg.sensor_rotation_error, cfg.sensor_rotation_error)*self.noise_scale)
+        self.rotation_bias_q[ids] = rotvec_quat(self.uniform(
+            n, 3, -cfg.rotation_bias, cfg.rotation_bias)*self.noise_scale)
         if cfg.force_bias or cfg.moment_bias:
             self.wrench_bias[ids] = torch.cat((
                 self.sample_wrench_bias(n, cfg.force_bias),
@@ -392,9 +600,25 @@ class PlantGroup:
         pos = self.uniform(n, 3, -cfg.initial_xy, cfg.initial_xy) * self.difficulty
         pos[:, 2] = self.uniform(n, 1, cfg.initial_z_min, cfg.initial_z_max)[:, 0]
         q = self.sample_initial_orientation(n)
-        if cfg.initial_plane_margin:
+        if cfg.initial_plane_margin or cfg.rough_surface:
+            plane_margin = (max(cfg.initial_plane_margin, 0.0005 * cfg.scale)
+                            if cfg.rough_surface else cfg.initial_plane_margin)
+            surface_h = self.surface_max_height[ids] if cfg.rough_surface else None
+            if (cfg.rough_surface and cfg.rough_low_spawn_prob > 0
+                    and self.surf_tile_top_z is not None and self.surf_tile_xy is not None
+                    and self.surf_horiz_radius is not None):
+                poly_r = (self.geometry.radius if self.shape == "circle"
+                          else float(torch.linalg.vector_norm(self.peg_polygon, dim=-1).amax()))
+                peg_reach = poly_r + self.geometry.peg_length * math.sin(cfg.initial_tilt) + 0.001 * cfg.scale
+                d_xy = torch.linalg.vector_norm(
+                    pos[:, None, :2] - self.surf_tile_xy[ids], dim=-1)
+                overlap = d_xy <= (peg_reach + self.surf_horiz_radius[None, :])
+                masked_top = torch.where(
+                    overlap, self.surf_tile_top_z[ids], torch.zeros_like(self.surf_tile_top_z[ids]))
+                surface_h = masked_top.amax(dim=-1).clamp_min(0.0)
             for attempt in range(16):
-                minimum_z = self.initial_minimum_tip_height(q)
+                minimum_z = self.initial_minimum_tip_height(
+                    q, margin=plane_margin, surface_height=surface_h)
                 invalid = minimum_z > cfg.initial_z_max
                 if not bool(invalid.any()):
                     break
@@ -405,9 +629,19 @@ class PlantGroup:
             if cfg.initial_z_max > cfg.initial_z_min:
                 height_fraction = (pos[:, 2]-cfg.initial_z_min) / (
                     cfg.initial_z_max-cfg.initial_z_min)
-            pos[:, 2] = minimum_z + height_fraction * (cfg.initial_z_max-minimum_z)
+            full_z = minimum_z + height_fraction * (cfg.initial_z_max-minimum_z)
+            if cfg.rough_surface and cfg.rough_low_spawn_prob > 0:
+                low_mask = self.uniform(n, 1, 0.0, 1.0)[:, 0] < cfg.rough_low_spawn_prob
+                low_z = (minimum_z + height_fraction * (0.0025 * cfg.scale)).clamp_max(cfg.initial_z_max)
+                pos[:, 2] = torch.where(low_mask, low_z, full_z)
+            else:
+                pos[:, 2] = full_z
         self.sim.data.qpos[ids, :3] = pos - rotate(q, self.offset[ids])
         self.sim.data.qpos[ids, 3:7] = q
+        if cfg.rough_surface:
+            self.tip_ema[ids] = torch.cat((pos[:, :2], pos[:, 2:3].clamp_max(0.0)), dim=-1)
+        else:
+            self.tip_ema[ids] = pos
         self.sim.data.qvel[ids] = 0
         self.sim.data.xfrc_applied[ids] = 0
         self.sim.forward()
@@ -450,9 +684,13 @@ class PlantGroup:
             radial_minimum = (local_vertical[:, :2] @ self.peg_polygon.T).amin(dim=-1)
         return radial_minimum + (local_vertical[:, 2]*self.geometry.peg_length).clamp_max(0)
 
-    def initial_minimum_tip_height(self, q: torch.Tensor) -> torch.Tensor:
+    def initial_minimum_tip_height(self, q: torch.Tensor, *,
+                                   margin: float | None = None,
+                                   surface_height: torch.Tensor | None = None) -> torch.Tensor:
         lowest = self.minimum_peg_height_offset(q)
-        return (self.cfg.initial_plane_margin-lowest).clamp_min(self.cfg.initial_z_min)
+        plane = self.cfg.initial_plane_margin if margin is None else margin
+        base = plane - lowest if surface_height is None else surface_height + plane - lowest
+        return base.clamp_min(self.cfg.initial_z_min)
 
     def state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         pos = self.sim.data.qpos[:, :3]
@@ -558,7 +796,7 @@ class PlantGroup:
         true_tip = tip_pose(pos, q, self.offset)
         observed_tip = tip_pose(pos, q, self.nominal_offset + self.calibration)
         noisy_tip = observed_tip + position_noise
-        noisy_q = quat_mul(rotvec_quat(rotation_noise), q)
+        noisy_q = quat_mul(rotvec_quat(rotation_noise), quat_mul(self.rotation_bias_q, q))
         obs = actor_observation(noisy_tip, noisy_q, self.goal + self.bias,
                                 self.identity, self.wrench + self.wrench_bias + noise)
         if self.cfg.position_observation_delay:
@@ -759,17 +997,37 @@ class PlantGroup:
         success = self.hold >= cfg.success_hold_steps
         excessive = cfg.terminate_on_overload & (
             (self.peak_force > cfg.max_force) | (self.peak_moment > cfg.max_moment))
-        escaped = ((xy > cfg.workspace_xy_radius_m) | (tip[:, 2] > 0.03 * cfg.scale)
+        escaped = ((xy > cfg.workspace_xy_radius_m) | (tip[:, 2] > cfg.workspace_z_max_m * cfg.scale)
                    | (tip[:, 2] < -self.geometry.depth) | (tilt > math.radians(35)))
         self.length += 1
-        timeout = self.length >= math.ceil(cfg.episode_seconds / 0.02)
+        stagnation = None
+        tip_ema = getattr(self, "tip_ema", None)
+        if tip_ema is not None:
+            dt = cfg.physics_dt * cfg.decimation
+            alpha_stag = 1.0 - math.exp(-dt / cfg.stagnation_window_seconds)
+            if cfg.rough_surface:
+                prog_pos = torch.cat((tip[:, :2], tip[:, 2:3].clamp_max(0.0)), dim=-1)
+                delta_tip = prog_pos - tip_ema
+            else:
+                delta_tip = tip - tip_ema
+            eff_speed = torch.linalg.vector_norm(delta_tip, dim=-1) / cfg.stagnation_window_seconds
+            tip_ema.add_(alpha_stag * delta_tip)
+            warmup = (self.length.to(tip.dtype) * dt / cfg.stagnation_window_seconds).clamp(0.0, 1.0)
+            not_at_goal = (tip[:, 2] > self.goal[:, 2] + 0.0005).to(tip.dtype)
+            stagnation = (
+                warmup * not_at_goal
+                * (1.0 - eff_speed / cfg.stagnation_speed_threshold_mps).clamp(0.0, 1.0).square()
+            )
+        timeout = ((self.length >= math.ceil(cfg.episode_seconds / 0.02))
+                   if cfg.enable_timeout else torch.zeros_like(success))
         done = success | excessive | escaped | timeout
         success = success & ~excessive & ~escaped
         terms = completion_cost_terms(
             cfg, xy, z_disp, -self.goal[:, 2], self.geometry.radius, tilt, yaw,
             self.wrench, actions, self.last_action, success, excessive | escaped, timeout,
             tip_center_z=tip[:, 2], hole_force=rotate(q, self.wrench[:, :3]),
-            overloaded=overloaded & (not cfg.terminate_on_overload))
+            overloaded=overloaded & (not cfg.terminate_on_overload),
+            stagnation=stagnation)
         self.last_reward_terms = terms
         reward = torch.stack(list(terms.values())).sum(0)
         self.last_action.copy_(actions)
@@ -947,6 +1205,10 @@ class InsertionEnv(VecEnv):
             if self.noise_curriculum is None:
                 logs[f"success/{shape}"] = totals[0]/totals[1]
         self.episode_length_buf.copy_(torch.cat([g.length.to(self.device) for g in self.groups]))
+        if not self.groups[0].cfg.enable_timeout or self.groups[0].cfg.rough_surface:
+            logs["episode/active_max_steps"] = self.episode_length_buf.max().float()
+            logs["episode/stuck_over_8s_fraction"] = (self.episode_length_buf > 400).float().mean()
+            logs["episode/stuck_over_30s_fraction"] = (self.episode_length_buf > 1500).float().mean()
         if self.noise_curriculum is not None:
             logs.pop("curriculum/noise_scale")
             if not self.curriculum_distributed and self.policy_steps % self.curriculum_rollout_steps == 0:
