@@ -98,7 +98,6 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         align_goal_z_to_observation=args.align_goal_z_to_observation,
         stagnation_cost_per_second=args.stagnation_cost_per_second,
         action_cost_cap=args.action_cost_cap,
-        preinsertion_tilt_weight=args.preinsertion_tilt_weight,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
         workspace_xy_radius_m=args.workspace_xy_radius_m,
         plate_outer_radius_m=args.plate_outer_radius_m,
@@ -228,7 +227,7 @@ def contract(cfg: InsertionCfg) -> dict:
         "success_opening": "true physical bottom-center XY inside hole outline, inclusive boundary; circle analytic",
         "success_hold_steps": cfg.success_hold_steps,
         "success_safety_priority": True,
-        "preinsertion_tilt_weight": cfg.preinsertion_tilt_weight,
+        "preinsertion_tilt_weight": 0.0,
         "xy_cost_radius_fraction": cfg.xy_cost_radius_fraction,
         "inserted_load_cost": {
             "enabled": cfg.inserted_load_cost,
@@ -507,8 +506,12 @@ class ContinuousRunner(OnPolicyRunner):
             return
         saved = self.alg.save()
         saved["iter"] = self.current_learning_iteration
+        environment = dict(self.metadata["environment"])
+        environment.pop("preinsertion_tilt_weight", None)
         saved["infos"] = {
             **self.metadata,
+            "environment": environment,
+            "contract": {**self.metadata["contract"], "preinsertion_tilt_weight": 0.0},
             "progress": {"policy_steps": self.env.policy_steps,
                          "transitions": self.env.total_transitions},
         }
@@ -634,7 +637,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "position_observation_delay", "inserted_load_cost", "inserted_load_depth_m",
                     "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
                     "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
-                    "moment_noise", "preinsertion_tilt_weight",
+                    "moment_noise",
                     "stiction_force", "stiction_moment", "wall_friction_force",
                     "grasp_position_error", "grasp_z_error", "tip_calibration_error",
                     "rotation_bias", "hole_depth_m", "align_goal_z_to_observation",
@@ -648,7 +651,9 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "initial_z_min", "initial_z_max",
                     "initial_tilt", "initial_yaw", "initial_plane_margin",
                 )
-                if any(getattr(previous_cfg, key) != getattr(cfg, key) for key in changed_fields):
+                if (source_cfg.get("preinsertion_tilt_weight", 0.0) != 0.0
+                        or any(getattr(previous_cfg, key) != getattr(cfg, key)
+                               for key in changed_fields)):
                     for window in env.noise_curriculum.windows.values():
                         window.clear()
                     logging.warning("Initial pose, observation/reward contract or success criteria changed; retaining curriculum level, clearing windows.")
@@ -947,8 +952,6 @@ def main() -> None:
     parser.add_argument("--moment-bias", type=float, default=0.1,
                         help="maximum moment bias vector magnitude in Nm "
                              "(per-axis half range in legacy per_axis mode)")
-    parser.add_argument("--preinsertion-tilt-weight", type=float, default=0.5,
-                        help="baseline tilt orientation cost weight above hole plane in [0, 1]")
     parser.add_argument("--wrench-bias-distribution", choices=("uniform_magnitude", "per_axis"),
                         default="uniform_magnitude",
                         help="uniform vector magnitude and isotropic direction, or legacy independent axes")

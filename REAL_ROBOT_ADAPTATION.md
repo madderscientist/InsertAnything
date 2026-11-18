@@ -36,7 +36,7 @@
 - **数学根因**：
   在 `insertion/env.py` 的 `step_outcome` 与 `completion_cost_terms` 中，纵向剩余距离使用插头碰撞几何的**最低点高度**：
   $$z_{\min} = z_{\mathrm{tip}} + z_{\mathrm{offset}}(q), \qquad z_{\mathrm{offset}}(\theta) \approx -R\sin\theta - L_{\mathrm{peg}}(1-\cos\theta) < 0$$
-  当原配置 `preinsertion_tilt_weight = 0.0` 时，插头在孔板上方（$z_{\min} \ge 0$）倾斜**完全不产生任何姿态惩罚**，却能通过增大倾角 $\theta$ 直接压低几何最低点 $z_{\min}$（例如 $R=10\text{ mm}$ 插头倾斜 $5^\circ$ 即可白赚 $0.87\text{ mm}$ 的“伪下探深度”并显著降低 `position_penalty`）。
+  当入孔前倾角权重为零时，插头在孔板上方（$z_{\min} \ge 0$）**不产生倾角惩罚**（偏航仍单独计罚），却能通过增大倾角 $\theta$ 直接压低几何最低点 $z_{\min}$（例如 $R=10\text{ mm}$ 插头倾斜 $5^\circ$ 即可白赚 $0.87\text{ mm}$ 的“伪下探深度”并显著降低 `position_penalty`）。
   在仿真中，浮动刚体绕尖端纯旋转毫无代价；但在真机 6 轴串联臂上，绕 `20.5 cm` 尖端旋转 $\Delta\theta = 5^\circ$ 需要主臂 J1–J3 反向平移 $205\text{ mm} \times \sin 5^\circ \approx 17.9\text{ mm}$ 来维持尖端位置不变。由于主臂关节与腕部关节带宽、摩擦不同步，大幅旋转指令直接引发厘米级末端寄生横移与姿态发散。
 
 ### 2.3 现象三：等效末端笛卡尔刚度偏软且接触摩擦偏大，下压搜索时发生粘滞卡死
@@ -58,6 +58,8 @@
 ## 3. 本仓库代码与默认参数改动汇总
 
 针对上述四项根因，对 [insertion/config.py](./insertion/config.py)、[insertion/env.py](./insertion/env.py) 与 [train.py](./train.py) 进行了如下修改：
+
+下表保留真机适配时的改动记录。当前训练已取消表中历史的 `0.5` 入孔前倾角权重，恢复为孔口及以上不罚倾角；入孔后仍逐步回正，偏航惩罚不变，见 [REWARD.md](./REWARD.md#4-姿态成本)。
 
 | 参数 / 逻辑位置 | 原默认值 | 新默认值 | 改动目的 |
 |---|---:|---:|---|
@@ -103,7 +105,7 @@ micromamba run -r ~/micromamba -n mj python -u train.py \
 
 ### 4.2 方案 B：基于已有高轮次 Checkpoint 热启动续训
 
-如果希望复用已有检查点（例如已通过孔间隙课程的 `checkpoint.pt`）快速适应新噪声、新初态与新入孔前倾角权重：
+如果希望复用已有检查点（例如已通过孔间隙课程的 `checkpoint.pt`）快速适应新噪声与新初态：
 
 1. 新建运行目录并复制旧 `checkpoint.pt` 与 `config.json`：
    ```bash
@@ -131,7 +133,6 @@ micromamba run -r ~/micromamba -n mj python -u train.py \
        stiction_moment=0.06,
        wall_friction_force=4.0,
        action_cost_cap=4.0,
-       preinsertion_tilt_weight=0.5,
        initial_z_max=0.02,
        initial_tilt=math.radians(8.0),
    )

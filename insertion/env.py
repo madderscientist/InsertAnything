@@ -77,9 +77,8 @@ def completion_cost_terms(
     distance = xy_distance + z_distance
     reference = math.radians(cfg.orientation_cost_reference_deg)
     tilt_error, yaw_error = (tilt/reference).square(), (yaw/reference).square()
-    # 倾角权重在最低点进入前 4 mm 内线性增强，与最终目标深度无关
-    tilt_progress = ((target_depth-z_disp)/0.004).clamp(0, 1)
-    tilt_weight = cfg.preinsertion_tilt_weight + (1-cfg.preinsertion_tilt_weight)*tilt_progress
+    # 孔口及上方不罚倾角；最低点入孔后前 4 mm 内线性增加权重
+    tilt_weight = ((target_depth-z_disp)/0.004).clamp(0, 1)
     tilt_cost, yaw_cost = tilt_error/(1+tilt_error), yaw_error/(1+yaw_error)
     orientation = tilt_weight*tilt_cost + yaw_cost
     cap = cfg.load_cost_cap

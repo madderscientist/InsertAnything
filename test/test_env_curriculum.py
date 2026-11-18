@@ -182,8 +182,9 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual((old.initial_z_min, old.initial_z_max), (0.004, 0.02))
 
     def terms(self, z=0.001, xy=0., depth=0.015, tilt=0., yaw=0., force=0.,
-              moment=0., success=False, failure=False, timeout=False, action=0., previous=0.):
-        cfg = InsertionCfg()
+              moment=0., success=False, failure=False, timeout=False, action=0., previous=0.,
+              cfg: InsertionCfg | None = None):
+        cfg = InsertionCfg() if cfg is None else cfg
         scalar = lambda x: torch.tensor([x], dtype=torch.float64)
         return completion_cost_terms(
             cfg, scalar(xy), scalar(z + depth), scalar(depth), 0.01,
@@ -239,16 +240,14 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             signal, rtol=0, atol=0)
 
     def test_zero_preinsertion_tilt_cost_and_depth_ramp(self):
-        w0 = InsertionCfg().preinsertion_tilt_weight
-        self.assertEqual(w0, 0.5)
         for z in (0.004, 0.):
-            self.assertAlmostEqual(float(self.terms(z=z, tilt=5.)["orientation_penalty"]), -0.01 * w0)
+            self.assertEqual(float(self.terms(z=z, tilt=5.)["orientation_penalty"]), 0.0)
         for depth in (0.005, 0.015, 0.0225):
             for inserted_mm in (0., 1., 2., 3., 4., 6.):
                 with self.subTest(depth=depth, inserted_mm=inserted_mm):
                     penalty = self.terms(
                         z=-inserted_mm*0.001, depth=depth, tilt=5.)["orientation_penalty"]
-                    weight = w0 + (1. - w0) * min(inserted_mm/4., 1.)
+                    weight = min(inserted_mm/4., 1.)
                     self.assertAlmostEqual(float(penalty), -0.01*weight)
             expected = -0.02*2.*math.tanh((depth-0.002)/depth)
             self.assertAlmostEqual(
@@ -256,8 +255,16 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         for z in (0.004, 0., -0.0075, -0.015):
             self.assertAlmostEqual(
                 float(self.terms(z=z, yaw=5.)["orientation_penalty"]), -0.01)
-        saved = InsertionCfg.from_checkpoint({"preinsertion_tilt_weight": 0.25})
-        self.assertEqual(saved.preinsertion_tilt_weight, 0.25)
+        for rough_surface in (False, True):
+            with self.subTest(legacy_rough_surface=rough_surface):
+                cfg = InsertionCfg.from_checkpoint({
+                    "rough_surface": rough_surface,
+                    "surface_z_free_m": 0.006 if rough_surface else 0.0,
+                    "preinsertion_tilt_weight": 0.5,
+                })
+                self.assertEqual(float(self.terms(z=0.004, tilt=5., cfg=cfg)["orientation_penalty"]), 0.0)
+                self.assertAlmostEqual(
+                    float(self.terms(z=0.004, tilt=5., yaw=5., cfg=cfg)["orientation_penalty"]), -0.01)
 
     def test_surface_z_free_band_exempts_obstacle_lift_only_in_band(self):
         cfg_free = InsertionCfg(surface_z_free_m=0.005)
@@ -343,7 +350,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertGreater(mouth_delta, 0.)
         linear_delta = 0.08*(math.tanh(1.08/2)-math.tanh(1./2))
         self.assertLess(mouth_delta, linear_delta)
-        self.assertLess(self.reward(z=0.001, tilt=5.), hover)
+        self.assertEqual(self.reward(z=0.001, tilt=5.), hover)
         self.assertLess(self.reward(z=0.001, yaw=5.), self.reward(z=0.001, tilt=5.))
         self.assertLess(float(self.terms(z=-0.013, tilt=3.)["orientation_penalty"]),
                         float(self.terms(z=-0.002, tilt=3.)["orientation_penalty"]))

@@ -103,7 +103,6 @@ class InsertionCfg:
     xy_cost_radius_fraction: float = 0.25
     orientation_cost_per_second: float = 1.0
     orientation_cost_reference_deg: float = 5.0
-    preinsertion_tilt_weight: float = 0.5
     force_cost_per_second: float = 1.0
     moment_cost_per_second: float = 1.0
     load_cost_cap: float = 1.5
@@ -252,8 +251,6 @@ class InsertionCfg:
             raise ValueError("completion cost scales must be finite and positive")
         if self.xy_cost_radius_fraction > 1:
             raise ValueError("xy_cost_radius_fraction must be in (0, 1]")
-        if not math.isfinite(self.preinsertion_tilt_weight) or not 0 <= self.preinsertion_tilt_weight <= 1:
-            raise ValueError("preinsertion_tilt_weight must be finite and in [0, 1]")
         cost_nonnegative = (self.orientation_cost_per_second, self.force_cost_per_second,
                             self.moment_cost_per_second, self.overload_cost_per_second,
                             self.stagnation_cost_per_second, self.surface_z_free_m,
@@ -369,6 +366,7 @@ class InsertionCfg:
         for key, default in defaults.items():
             values.setdefault(key, default)
         for retired in (
+            "preinsertion_tilt_weight",
             "stagnation_lift_cost_per_second", "stagnation_lift_target",
             "stagnation_lift_scale", "stagnation_lateral_target", "stagnation_lateral_scale",
         ):

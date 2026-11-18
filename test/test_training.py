@@ -467,7 +467,7 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         for key, value in (("initial_xy", 0.01), ("initial_tilt", 0.35),
                            ("initial_yaw", 0.35), ("initial_z_min", 0.001),
                            ("initial_z_max", 0.025), ("initial_plane_margin", 0.001),
-                           ("moment_noise", 0.001), ("preinsertion_tilt_weight", 0.0),
+                           ("moment_noise", 0.001),
                            ("stiction_force", 0.0), ("stiction_moment", 0.0),
                            ("wall_friction_force", 0.0), ("action_cost_cap", 1.0),
                            ("load_cost_cap", 1.0), ("overload_cost_per_second", 0.0),
@@ -489,9 +489,20 @@ class RuntimeAndDistributedTests(unittest.TestCase):
         restore_environment_progress(env, cfg, saved, 3)
         self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
 
-        saved["infos"]["environment"].pop("success_alignment_required")
+        saved["infos"]["environment"]["preinsertion_tilt_weight"] = 0.5
         with self.assertLogs(level="WARNING"):
             restore_environment_progress(env, cfg, saved, 4)
+        self.assertEqual(curriculum.level, 4)
+        self.assertTrue(all(not w for w in curriculum.windows.values()))
+
+        saved["infos"]["environment"]["preinsertion_tilt_weight"] = 0.0
+        restore_environment_progress(env, cfg, saved, 5)
+        self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
+        del saved["infos"]["environment"]["preinsertion_tilt_weight"]
+
+        saved["infos"]["environment"].pop("success_alignment_required")
+        with self.assertLogs(level="WARNING"):
+            restore_environment_progress(env, cfg, saved, 6)
         self.assertEqual(curriculum.level, 4)
         self.assertTrue(all(not w for w in curriculum.windows.values()))
 

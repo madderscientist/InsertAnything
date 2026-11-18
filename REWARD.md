@@ -39,7 +39,6 @@ $$
 | `xy_cost_radius_fraction` | 0.25 | $k_{xy}$，平面距离参考尺度占半径 $R$ 的比例 |
 | `orientation_cost_per_second` | 1.0 | $w_o$，每秒姿态成本系数 |
 | `orientation_cost_reference_deg` | 5.0° | $\alpha_0$，姿态误差参考角度尺度 |
-| `preinsertion_tilt_weight` | 0.5 | $w_{\mathrm{tilt},0}$，入孔前倾角回正基础权重 |
 | `force_cost_per_second` | 1.0 | $w_F$，每秒接触力超死区成本系数 |
 | `moment_cost_per_second` | 1.0 | $w_M$，每秒接触力矩超死区成本系数 |
 | `load_cost_cap` | 1.5 | $c_L$，归一化力与力矩成本的上限（保留超限区二次惩罚梯度） |
@@ -79,14 +78,12 @@ $$
 定义倾角约束进度 $p=\mathrm{clip}(-z_{\min}/0.004,0,1)$，即最低点进入前 4 mm 的进度，与最终目标深度无关。距离成本中的 $u_z$ 仍按最终目标深度计算。有界角度代价为 $h(\alpha)=\frac{(\alpha/\alpha_0)^2}{1+(\alpha/\alpha_0)^2}$：
 
 $$
-w_{\mathrm{tilt}}(p)=w_{\mathrm{tilt},0}+(1-w_{\mathrm{tilt},0})p,
-\qquad
-O_t=w_{\mathrm{tilt}}(p)h(\theta)+h(\psi)
+O_t=p\,h(\theta)+h(\psi)
 $$
 
 姿态项为 $r_o=-\Delta t\,w_o O_t$，其中 $\theta$ 为工具倾角，$\psi$ 为按几何旋转对称性折叠后的偏航角误差（正 $n$ 边形周期为 $2\pi/n$，L 形为 $2\pi$，圆形为 $0$）。
 
-默认 $w_{\mathrm{tilt},0}=0.5$：最低点在孔口及上方时保留 0.5 倍倾角回正约束（抑制自由空间通过大幅歪斜插头降低几何最低点 $z_{\min}$ 的投机行为，减轻真机长力臂下腕部旋转对大臂平移的反向耦合），进入 1/2/3/4 mm 时权重线性升至 0.625/0.75/0.875/1，之后保持为 1。偏航成本与倾角安全上限不变。旧运行恢复时沿用保存的基础权重，但最低点及 4 mm 线性进度使用当前代码。
+所有训练阶段都在最低点位于孔口及上方时将倾角权重置零。进入 1/2/3/4 mm 时权重线性升至 0.25/0.5/0.75/1，之后保持为 1。偏航成本与 35° 倾角越界终止不变。旧运行恢复时忽略保存的 `preinsertion_tilt_weight`；若旧值非零，保留课程等级并清空旧成功率窗口。
 
 ### 为什么选择 4 mm
 
