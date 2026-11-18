@@ -16,7 +16,7 @@ from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
 from .config import ALL_SHAPES, InsertionCfg
 from .curriculum import SuccessNoiseCurriculum
-from .geometry import build_model, geometry, points_in_polygon, rough_surface_tiles, symmetry_count
+from .geometry import build_model, geometry, rough_surface_tiles
 from .transforms import (action_target, actor_observation, canonical_quat,
                          quat_inv, quat_mul, quat_rotvec, rotate,
                          rotvec_quat, tip_pose, transform_wrench)
@@ -223,8 +223,7 @@ class PlantGroup:
                                  cfg.plate_outer_radius_m, cfg.rough_surface, cfg.hole_depth_m)
         self.model = build_model(self.geometry)
         self.body_id = self.model.body("tool").id
-        nconmax = 512 if self.shape == "circle" else (384 if cfg.rough_surface else 64)
-        njmax = 2048 if self.shape == "circle" else (1536 if cfg.rough_surface else 256)
+        nconmax, njmax = self.geometry.definition.contact_limits(cfg.rough_surface)
         self.sim = Simulation(
             self.n, SimulationCfg(nconmax=nconmax, njmax=njmax,
                                  mujoco=MujocoCfg(timestep=cfg.physics_dt, gravity=(0, 0, 0),
@@ -606,8 +605,7 @@ class PlantGroup:
             if (cfg.rough_surface and cfg.rough_low_spawn_prob > 0
                     and self.surf_tile_top_z is not None and self.surf_tile_xy is not None
                     and self.surf_horiz_radius is not None):
-                poly_r = (self.geometry.radius if self.shape == "circle"
-                          else float(torch.linalg.vector_norm(self.peg_polygon, dim=-1).amax()))
+                poly_r = self.geometry.definition.peg_reach_radius(self.geometry, self.peg_polygon)
                 peg_reach = poly_r + self.geometry.peg_length * math.sin(cfg.initial_tilt) + 0.001 * cfg.scale
                 d_xy = torch.linalg.vector_norm(
                     pos[:, None, :2] - self.surf_tile_xy[ids], dim=-1)
@@ -676,11 +674,8 @@ class PlantGroup:
         w, x, y, z = q.unbind(dim=-1)
         local_vertical = torch.stack((2*(x*z-w*y), 2*(y*z+w*x),
                                       1-2*(x.square()+y.square())), dim=-1)
-        if self.shape == "circle":
-            radial_minimum = -(self.geometry.radius-self.clearance/2) * torch.linalg.vector_norm(
-                local_vertical[:, :2], dim=-1)
-        else:
-            radial_minimum = (local_vertical[:, :2] @ self.peg_polygon.T).amin(dim=-1)
+        radial_minimum = self.geometry.definition.minimum_peg_projection(
+            self.geometry, local_vertical[:, :2], self.peg_polygon)
         return radial_minimum + (local_vertical[:, 2]*self.geometry.peg_length).clamp_max(0)
 
     def initial_minimum_tip_height(self, q: torch.Tensor, *,
@@ -817,7 +812,7 @@ class PlantGroup:
         z[:, 2] = 1
         axis = rotate(q, z)
         tilt = torch.atan2(torch.linalg.vector_norm(axis[:, :2], dim=-1), axis[:, 2])
-        count = symmetry_count(self.shape)
+        count = self.geometry.definition.rotation_order
         if count == 0:
             yaw = torch.zeros_like(tilt)
         else:
@@ -980,8 +975,8 @@ class PlantGroup:
         z_disp = lowest_z - self.goal[:, 2]
         success = tip[:, 2] <= self.goal[:, 2] + 0.0002
         if cfg.success_opening_required:
-            inside = ((tip[:, :2].square().sum(-1) <= self.geometry.radius**2)
-                      if self.shape == "circle" else points_in_polygon(tip[:, :2], self.hole_polygon))
+            inside = self.geometry.definition.opening_contains(
+                self.geometry, tip[:, :2], self.hole_polygon)
             success = success & inside
         if cfg.success_alignment_required:
             success = (success & (xy < self.clearance * 0.4)

@@ -5,8 +5,9 @@ import math
 
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
-TRAIN_SHAPES = ("triangle", "square", "pentagon", "hexagon", "l")
-ALL_SHAPES = TRAIN_SHAPES + ("circle",)
+from .shapes import ALL_SHAPES, TRAIN_SHAPES
+from .shapes.circle import validate_circle_sides
+
 HOLE_DEPTH_M = 0.025
 PPO_DISCOUNT = 0.9985
 CLEARANCE_CURRICULUM_LEVELS = (0.002, 0.001, 0.0005, 0.00025, 0.00015, 0.0001)
@@ -144,9 +145,7 @@ class InsertionCfg:
             raise ValueError("rough_num_waves must be an integer in [1, 16]")
         if not math.isfinite(self.inserted_load_depth_m) or self.inserted_load_depth_m < 0:
             raise ValueError("inserted_load_depth_m must be finite and nonnegative")
-        if self.circle_sides is not None and (
-                type(self.circle_sides) is not int or self.circle_sides < 3):
-            raise ValueError("circle_sides must be an integer >= 3 or None")
+        validate_circle_sides(self.circle_sides)
         self.shapes = tuple(self.shapes)
         if not self.shapes or any(s not in ALL_SHAPES for s in self.shapes):
             raise ValueError(f"shapes must belong to {ALL_SHAPES}")

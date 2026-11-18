@@ -12,11 +12,22 @@ import numpy as np
 import torch
 
 from insertion import (ALL_SHAPES, InsertionCfg, action_target, actor_observation,
-                       build_model, canonical_quat, geometry, quat_inv,
+                       build_model, canonical_quat, geometry, get_shape, quat_inv,
                        quat_rotvec, rotate, rotvec_quat, transform_wrench)
 
 
 class GeometryAndTransformTests(unittest.TestCase):
+    def test_configured_mirror_axis_preserves_peg_and_hole_outlines(self):
+        for name in ALL_SHAPES:
+            with self.subTest(shape=name):
+                g = geometry(name)
+                axis = np.array(get_shape(name).mirror_axis_xy)
+                reflected = 2 * np.outer(axis, axis) / (axis @ axis) - np.eye(2)
+                for polygon in (g.peg_polygon, g.hole_polygon):
+                    delta = (polygon @ reflected)[:, None, :] - polygon[None, :, :]
+                    np.testing.assert_allclose(
+                        np.linalg.norm(delta, axis=-1).min(axis=1), 0.0, atol=1e-12)
+
     def test_all_holes_open_and_side_contact_exists(self):
         for shape in ALL_SHAPES:
             with self.subTest(shape=shape):
