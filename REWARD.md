@@ -36,7 +36,8 @@ $$
 | `time_cost_per_second` | 1.0 | $w_t$，每秒时间成本（50 Hz 下每步 −0.02） |
 | `position_cost_per_second` | 2.0 | $w_p$，每秒距离成本系数 |
 | `position_cost_cap` | 2.0 | $c$，距离指标饱和上限 |
-| `xy_cost_radius_fraction` | 0.25 | $k_{xy}$，平面距离参考尺度占半径 $R$ 的比例 |
+| `xy_cost_radius_fraction` | 0.25 | $k_{xy}$，平面近场漏斗参考尺度占半径 $R$ 的比例 |
+| `xy_outer_cost_weight` | 0.2 | $w_{\mathrm{out}}$，远场有界径向斜率的凸组合权重（旧检查点缺省 `0.0`） |
 | `orientation_cost_per_second` | 1.0 | $w_o$，每秒姿态成本系数 |
 | `orientation_cost_reference_deg` | 5.0° | $\alpha_0$，姿态误差参考角度尺度 |
 | `force_cost_per_second` | 1.0 | $w_F$，每秒接触力超死区成本系数 |
@@ -57,19 +58,25 @@ $$
 
 ## 3. 距离成本
 
-定义插头实际碰撞几何的最低点高度 $z_{\min}$（孔口平面为零，孔内为负），目标深度 $d>0$。非负相对剩余深度 $u_z$ 与平面归一化误差 $u_{xy}$ 为：
+定义插头实际碰撞几何的最低点高度 $z_{\min}$（孔口平面为零，孔内为负），目标深度 $d>0$，工作空间横向半径 $R_{\mathrm{ws}}$，原点平滑尺度 $\epsilon=0.05R$：
 
 $$
 u_z=\frac{\max(z_{\min}+d,0)}{d},
 \qquad
 u_{xy}=\frac{e_{xy}}{k_{xy}R},
 \qquad
-c_{1/2}=\frac{c}{2},
-\qquad
-D_t=c_{1/2}\tanh\!\left(\frac{u_{xy}^2}{c_{1/2}}\right)+c_{1/2}\tanh\!\left(\frac{u_z}{c_{1/2}}\right)
+\phi_{\mathrm{out}}(e_{xy})=\frac{\sqrt{\min(e_{xy},R_{\mathrm{ws}})^2+\epsilon^2}-\epsilon}{\sqrt{R_{\mathrm{ws}}^2+\epsilon^2}-\epsilon}
 $$
 
-位置项为 $r_p=-\Delta t\,w_p D_t$。XY 单独平方使中心附近的小幅横移代价更小，允许接触探索；Z 保持一阶项以继续鼓励下探。XY 与 Z 各自独立经过 $\tanh$ 饱和后再相加（总上界仍为 $c$），彻底消除大平面偏差（如 $e_{xy}\ge 10\text{ mm}$ 时 $u_{xy}^2\gg 1$）饱和共享外层 $\tanh$ 从而抹平 Z 轴下压奖励梯度（诱发策略在外围无代价向 $+Z$ 提刀悬停）的问题。
+$$
+c_{1/2}=\frac{c}{2},
+\qquad
+D_{xy}=c_{1/2}\left[(1-w_{\mathrm{out}})\tanh\!\left(\frac{u_{xy}^2}{c_{1/2}}\right)+w_{\mathrm{out}}\phi_{\mathrm{out}}(e_{xy})\right],
+\qquad
+D_t=D_{xy}+c_{1/2}\tanh\!\left(\frac{u_z}{c_{1/2}}\right)
+$$
+
+位置项为 $r_p=-\Delta t\,w_p D_t$。近场平方项在孔口中心导数为零以容许接触盲搜；远场项 $\phi_{\mathrm{out}}$ 在外圈维持恒定径向恢复梯度，消除纯 $\tanh(u_{xy}^2)$ 饱和后的绕行死区，同时通过凸组合严格保持 $D_{xy}\le c_{1/2}$ 与 $D_t\le c$（旧检查点缺省 $w_{\mathrm{out}}=0$）。XY 与 Z 各自独立有界，防止大平面偏差抹平 Z 轴下压奖励梯度。
 
 剩余深度与下节倾角权重均使用最低点高度，允许倾斜时一个角先进入来降低深度成本。多边形插头计算上下端面所有顶点的最低高度，圆柱使用解析最低高度；包含实际抓取偏移。最低点越过孔口高度不额外要求其 XY 位于开口内。XY 成本、策略观测、动作参考点和成功判定仍使用端面中心，不随最低点变化。
 

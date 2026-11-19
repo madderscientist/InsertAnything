@@ -387,6 +387,7 @@ def build_stage_metadata(source_saved: dict, args: argparse.Namespace,
         align_goal_z_to_observation=True,
         workspace_z_max_m=args.workspace_z_max,
         surface_z_free_m=args.surface_z_free,
+        xy_outer_cost_weight=args.xy_outer_cost_weight,
         stagnation_cost_per_second=args.stagnation_cost_per_second,
         stagnation_speed_threshold_mps=args.stagnation_speed_threshold,
         stagnation_window_seconds=args.stagnation_window_seconds,
@@ -907,6 +908,8 @@ def main() -> None:
                         help="upper Z workspace escape ceiling in meters for Stage 2")
     parser.add_argument("--surface-z-free", type=float, default=0.006,
                         help="height-free obstacle-crossing Z band [0, h] above hole plane in meters")
+    parser.add_argument("--xy-outer-cost-weight", type=float, default=0.2,
+                        help="convex weight in [0, 1] on bounded smooth outer XY radial slope")
     parser.add_argument("--min-action-std", type=float, default=0.06,
                         help="lower bound on policy action exploration std in Stage 2 to avoid KL lock")
     parser.add_argument("--max-action-std", type=float, default=0.65,

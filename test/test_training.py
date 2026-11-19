@@ -470,6 +470,7 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                            ("moment_noise", 0.001),
                            ("stiction_force", 0.0), ("stiction_moment", 0.0),
                            ("wall_friction_force", 0.0), ("action_cost_cap", 1.0),
+                           ("xy_outer_cost_weight", 0.0),
                            ("load_cost_cap", 1.0), ("overload_cost_per_second", 0.0),
                            ("terminate_on_overload", True),
                            ("success_alignment_required", True), ("success_hold_steps", 6),

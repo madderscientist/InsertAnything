@@ -69,10 +69,16 @@ def completion_cost_terms(
         remaining = eff_z_disp.clamp_min(0.0) / target_depth
     else:
         remaining = z_disp.clamp_min(0)/target_depth
-    # XY 与 Z 各自独立 tanh 饱和后再相加，防止大平面偏差饱和外层 tanh 抹平 Z 轴下压梯度
-    half_cap = 0.5*cfg.position_cost_cap
+    # XY 与 Z 各自独立有界后再相加；平面项混合近场平方漏斗与有界远场斜率，消除外圈零梯度死区
+    half_cap, w = 0.5*cfg.position_cost_cap, cfg.xy_outer_cost_weight
     xy_distance = half_cap*torch.tanh(
         (xy/(radius*cfg.xy_cost_radius_fraction)).square()/half_cap)
+    if w > 0:
+        eps, r_max = 0.05*radius, cfg.workspace_xy_radius_m
+        x2 = xy.clamp(0.0, r_max).square()
+        norm = r_max*r_max / (math.hypot(r_max, eps) + eps)
+        outer_xy = half_cap * x2 / ((torch.sqrt(x2 + eps*eps) + eps) * norm)
+        xy_distance = (1.0 - w)*xy_distance + w*outer_xy
     z_distance = half_cap*torch.tanh(remaining/half_cap)
     distance = xy_distance + z_distance
     reference = math.radians(cfg.orientation_cost_reference_deg)

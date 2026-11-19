@@ -97,6 +97,7 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
         hole_depth_m=args.hole_depth,
         align_goal_z_to_observation=args.align_goal_z_to_observation,
         stagnation_cost_per_second=args.stagnation_cost_per_second,
+        xy_outer_cost_weight=args.xy_outer_cost_weight,
         action_cost_cap=args.action_cost_cap,
         adaptive_sampling=args.adaptive_sampling, initial_xy=args.initial_xy,
         workspace_xy_radius_m=args.workspace_xy_radius_m,
@@ -229,6 +230,7 @@ def contract(cfg: InsertionCfg) -> dict:
         "success_safety_priority": True,
         "preinsertion_tilt_weight": 0.0,
         "xy_cost_radius_fraction": cfg.xy_cost_radius_fraction,
+        "xy_outer_cost_weight": cfg.xy_outer_cost_weight,
         "inserted_load_cost": {
             "enabled": cfg.inserted_load_cost,
             "activation": f"true physical tip center z < {-cfg.inserted_load_depth_m:g} m; not lowest point",
@@ -644,6 +646,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "target_depth_min_m", "target_depth_max_fraction",
                     "stagnation_cost_per_second", "stagnation_window_seconds",
                     "stagnation_speed_threshold_mps", "surface_z_free_m",
+                    "xy_cost_radius_fraction", "xy_outer_cost_weight",
                     "load_cost_cap", "overload_cost_per_second", "terminate_on_overload",
                     "enable_timeout", "rough_surface", "rough_max_amplitude_m",
                     "rough_wavelength_min_m", "rough_wavelength_max_m",
@@ -978,6 +981,8 @@ def main() -> None:
                         help="shift commanded goal Z by upright longitudinal offset (h + Z)")
     parser.add_argument("--stagnation-cost-per-second", type=float, default=0.0,
                         help="running penalty per second when pre-goal smoothed tip speed stagnates")
+    parser.add_argument("--xy-outer-cost-weight", type=float, default=0.2,
+                        help="convex weight in [0, 1] on bounded smooth outer XY radial slope")
     parser.add_argument("--action-cost-cap", type=float, default=4.0,
                         help="smooth tanh saturation scale for action and action-change costs")
     parser.add_argument("--adaptive-sampling", action="store_true",

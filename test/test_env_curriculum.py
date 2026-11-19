@@ -366,18 +366,40 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertLess(self.reward(failure=True), -cfg.completion_step_cost_bound / (1 - PPO_DISCOUNT))
 
     def test_squared_xy_and_linear_remaining_depth(self):
-        for xy in (0., 0.0002, 0.001, 0.0025, 0.005, 0.020):
+        cfg, legacy_cfg = InsertionCfg(), InsertionCfg.from_checkpoint({})
+        self.assertEqual(legacy_cfg.xy_outer_cost_weight, 0.0)
+        eps, r_max = 0.05 * 0.01, cfg.workspace_xy_radius_m
+        norm = r_max * r_max / (math.hypot(r_max, eps) + eps)
+        radii = (0., 0.0002, 0.001, 0.0025, 0.005, 0.0075, 0.010, 0.020, 0.035)
+        for xy in radii:
+            x = min(xy, r_max)
+            outer = x * x / ((math.hypot(x, eps) + eps) * norm)
+            fine = math.tanh((xy / 0.0025) ** 2)
+            xy_term = (1.0 - cfg.xy_outer_cost_weight) * fine + cfg.xy_outer_cost_weight * outer
             for z in (0.004, 0., -0.0075, -0.015, -0.02):
                 with self.subTest(xy=xy, z=z):
-                    xy_term = math.tanh((xy/0.0025)**2)
-                    z_term = math.tanh(max(z+0.015, 0.)/0.015)
-                    expected = -0.04*(xy_term + z_term)
+                    z_term = math.tanh(max(z + 0.015, 0.) / 0.015)
                     self.assertAlmostEqual(
-                        float(self.terms(xy=xy, z=z)["position_penalty"]), expected)
-            # Z-descent reward gradient must remain strictly positive even at 20 mm XY offset
+                        float(self.terms(xy=xy, z=z, cfg=cfg)["position_penalty"]),
+                        -0.04 * (xy_term + z_term))
+                    self.assertAlmostEqual(
+                        float(self.terms(xy=xy, z=z, cfg=legacy_cfg)["position_penalty"]),
+                        -0.04 * (fine + z_term))
             self.assertGreater(
-                float(self.terms(xy=xy, z=0.001)["position_penalty"]),
-                float(self.terms(xy=xy, z=0.020)["position_penalty"]))
+                float(self.terms(xy=xy, z=0.001, cfg=cfg)["position_penalty"]),
+                float(self.terms(xy=xy, z=0.020, cfg=cfg)["position_penalty"]))
+        xy_f32 = torch.tensor(radii + (0.050,), dtype=torch.float32)
+        z1 = torch.zeros_like(xy_f32)
+        z6 = torch.zeros(len(xy_f32), 6, dtype=torch.float32)
+        zb = torch.zeros(len(xy_f32), dtype=torch.bool)
+        penalties_f32 = completion_cost_terms(
+            cfg, xy_f32, z1, torch.full_like(xy_f32, 0.015), 0.01, z1, z1, z6, z6, z6, zb, zb, zb,
+        )["position_penalty"]
+        self.assertTrue(bool((penalties_f32[1:-1] < penalties_f32[:-2]).all()))
+        self.assertAlmostEqual(float(penalties_f32[-1]), float(penalties_f32[-2]), places=6)
+        for bad_weight in (-0.1, 1.1, float("nan")):
+            with self.assertRaises(ValueError):
+                InsertionCfg(xy_outer_cost_weight=bad_weight)
 
     def test_bounded_stiffness_walk_math(self):
         initial = torch.tensor([[300., 1500., 2500., 4., 8., 12.]], dtype=torch.float64)

@@ -102,6 +102,7 @@ class InsertionCfg:
     position_cost_cap: float = 2.0
     surface_z_free_m: float = 0.0
     xy_cost_radius_fraction: float = 0.25
+    xy_outer_cost_weight: float = 0.2
     orientation_cost_per_second: float = 1.0
     orientation_cost_reference_deg: float = 5.0
     force_cost_per_second: float = 1.0
@@ -250,6 +251,8 @@ class InsertionCfg:
             raise ValueError("completion cost scales must be finite and positive")
         if self.xy_cost_radius_fraction > 1:
             raise ValueError("xy_cost_radius_fraction must be in (0, 1]")
+        if not math.isfinite(self.xy_outer_cost_weight) or not 0 <= self.xy_outer_cost_weight <= 1:
+            raise ValueError("xy_outer_cost_weight must be finite and in [0, 1]")
         cost_nonnegative = (self.orientation_cost_per_second, self.force_cost_per_second,
                             self.moment_cost_per_second, self.overload_cost_per_second,
                             self.stagnation_cost_per_second, self.surface_z_free_m,
@@ -340,6 +343,7 @@ class InsertionCfg:
             "stagnation_speed_threshold_mps": 0.006,
             "stagnation_window_seconds": 0.4,
             "surface_z_free_m": 0.0,
+            "xy_outer_cost_weight": 0.0,
             "action_cost_cap": 4.0,
             "terminate_on_overload": False,
             "enable_timeout": True,
