@@ -121,7 +121,8 @@ class InsertionShape(ABC):
 
     def contact_limits(self, rough_surface: bool) -> tuple[int, int]:
         """Return the MuJoCo Warp contact and constraint capacities."""
-        return (384, 1536) if rough_surface else (64, 256)
+        # 粗糙面实测峰值：每世界约束数 ≤304、接触池利用率 <1%；溢出会被检测并终止该环境
+        return (128, 640) if rough_surface else (64, 256)
 
     def peg_reach_radius(self, g: Geometry, peg_polygon: torch.Tensor) -> float:
         return float(torch.linalg.vector_norm(peg_polygon, dim=-1).amax())

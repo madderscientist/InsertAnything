@@ -1,7 +1,7 @@
 """奖励函数、孔间隙课程与批量 GPU 物理环境测试"""
 
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from itertools import product
 from typing import Any
 from types import SimpleNamespace
@@ -14,9 +14,12 @@ import torch
 from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
                        SuccessNoiseCurriculum, TRAIN_SHAPES, bounded_stiffness_step,
                        completion_cost_terms, geometry, quat_rotvec, tip_pose)
+from insertion.config import REAL2SIM_VALUES
 from insertion.curriculum import adaptive_environment_counts
-from insertion.transforms import rotvec_quat
-from insertion.env import PlantGroup, play_hysteresis_step
+from insertion.transforms import quat_inv, rotate, rotvec_quat
+from insertion.env import PlantGroup, lowpass_velocity, play_hysteresis_step
+from real2sim.evaluate_real2sim import sign_flips, velocity_reversals
+from real2sim.train_real2sim import real2sim_config
 
 
 class RewardAndCurriculumUnitTests(unittest.TestCase):
@@ -49,10 +52,8 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(curriculum.level, 1)
         self.assertEqual(len(curriculum.windows["square"]), 0)
 
-    def test_depth_success_hold_reset_safety_and_legacy_alignment(self):
+    def test_depth_success_hold_reset_and_safety(self):
         cfg = InsertionCfg(success_opening_required=False)
-        self.assertFalse(cfg.success_alignment_required)
-        self.assertTrue(InsertionCfg.from_checkpoint({}).success_alignment_required)
         group = SimpleNamespace(
             cfg=cfg, geometry=SimpleNamespace(peg_length=0.035, radius=0.01, depth=0.025),
             clearance=0.0001, offset=torch.zeros(1, 3),
@@ -80,9 +81,6 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         position[:, 2] = -0.01481
         PlantGroup.step_outcome(group, actions)
         self.assertEqual(group.hold.item(), 1)
-        group.cfg = replace(cfg, success_alignment_required=True)
-        PlantGroup.step_outcome(group, actions)
-        self.assertEqual(group.hold.item(), 0)
         group.cfg = replace(cfg, terminate_on_overload=True)
         for field, value, reason in (("peak_force", 31., 2), ("peak_moment", 2.1, 2)):
             group.hold.fill_(4)
@@ -92,7 +90,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             self.assertEqual(info["reason"].item(), reason)
             self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
             getattr(group, field).zero_()
-        # Default training mode (terminate_on_overload=False): continues on overload, resets hold, applies overload_penalty
+        # 默认训练模式超载不终止，仅重置成功保持计数
         group.cfg = cfg
         for field, value in (("peak_force", 31.), ("peak_moment", 2.1)):
             group.hold.fill_(4)
@@ -102,7 +100,6 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             self.assertEqual(group.hold.item(), 0)
             self.assertEqual(info["reason"].item(), 0)
             self.assertEqual(group.last_reward_terms["completion_bonus"].item(), 0)
-            self.assertAlmostEqual(group.last_reward_terms["overload_penalty"].item(), -0.04)
             getattr(group, field).zero_()
         group.cfg = replace(cfg, training=False, terminate_on_overload=False)
         group.peak_force.fill_(100)
@@ -164,8 +161,10 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
                        {"wrench_bias_distribution": "invalid"},
                        {"stiction_force": -0.1}, {"stiction_moment": float("nan")},
                        {"wall_friction_force": -1.}, {"action_cost_cap": 0.},
-                       {"initial_z_min": 0.}, {"initial_z_min": 0.025},
-                       {"initial_z_max": float("nan")}, {"initial_z_max": 0.03}):
+                       {"initial_z_min": 0.}, {"initial_z_min": 0.06},
+                       {"initial_z_max": float("nan")}, {"initial_z_max": 0.07},
+                       {"mass_min_kg": 2.0}, {"stiction_force_z": -1.0},
+                       {"target_lowpass_translation_rad_s": 0.0}):
             with self.assertRaises(ValueError):
                 InsertionCfg(**kwargs)
         old = InsertionCfg.from_checkpoint({"envs_per_shape": 512})
@@ -174,12 +173,21 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(old.wall_friction_force, 0.)
         self.assertEqual(old.action_cost_cap, 4.)
         self.assertEqual((InsertionCfg().stiction_force, InsertionCfg().stiction_moment), (0.6, 0.06))
-        self.assertEqual((InsertionCfg().wall_friction_force, InsertionCfg().action_cost_cap), (4.0, 4.0))
+        self.assertEqual((InsertionCfg().wall_friction_force, InsertionCfg().action_cost_cap), (4.0, 12.0))
         self.assertEqual(old.wrench_bias_distribution, "per_axis")
         self.assertEqual(old.wrench_hysteresis_fraction, 0.)
         self.assertEqual(InsertionCfg().wrench_hysteresis_fraction, 0.001)
         self.assertEqual(old.environment_counts, (512,) * 5)
         self.assertEqual((old.initial_z_min, old.initial_z_max), (0.004, 0.02))
+        self.assertEqual((old.workspace_z_max_m, old.action_change_cost_per_second), (0.03, 0.05))
+        self.assertEqual((old.target_lowpass, old.stiction_force_z, old.stiction_moment_xy), (False, None, None))
+        self.assertEqual((old.mass_min_kg, old.damping_ratio_min, old.down_mass_max_kg), (0.7, 0.8, 0.4))
+        self.assertEqual((old.rotation_pivot_max_m, old.stick_slip_max_pp_m,
+                          old.step_bias_rate_per_second), (0., 0., 0.))
+        migrated = real2sim_config(asdict(old))
+        self.assertEqual(migrated.envs_per_shape, 512)
+        for key, expected in REAL2SIM_VALUES.items():
+            self.assertEqual(getattr(migrated, key), expected)
 
     def terms(self, z=0.001, xy=0., depth=0.015, tilt=0., yaw=0., force=0.,
               moment=0., success=False, failure=False, timeout=False, action=0., previous=0.,
@@ -331,10 +339,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertAlmostEqual(float(self.terms(force=17.5)["force_penalty"]),
                                0.25 * float(self.terms(force=30.)["force_penalty"]))
         self.assertAlmostEqual(float(self.terms(moment=1.05)["moment_penalty"]), -0.005)
-        legacy = InsertionCfg.from_checkpoint({"load_cost_power": 2})
-        self.assertFalse(hasattr(legacy, "load_cost_power"))
-        with self.assertRaisesRegex(ValueError, "explicit reward migration"):
-            InsertionCfg.from_checkpoint({"load_cost_power": 1})
+        self.assertFalse(hasattr(InsertionCfg.from_checkpoint({"load_cost_power": 1}), "load_cost_power"))
 
     def test_reward_shaping_mouth_gradient_and_safety_bound(self):
         cfg = InsertionCfg()
@@ -424,6 +429,24 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             torch.tensor([[0.01, 0., 0.]], dtype=torch.float64), slice(0, 3))
         torch.testing.assert_close(outside, torch.tensor([[0.3, -0.4, 0.]], dtype=torch.float64))
 
+    def test_target_lowpass_matches_critically_damped_step(self):
+        for omega in (30.0, 50.0):
+            x, v = torch.zeros(1), torch.zeros(1)
+            for step in range(1, 61):
+                v = lowpass_velocity(v, 1.0 - x, omega, 0.001)
+                x = x + v * 0.001
+                if step in (40, 60):
+                    t = step * 0.001
+                    self.assertAlmostEqual(float(x), 1 - (1 + omega*t)*math.exp(-omega*t), delta=0.02)
+
+    def test_action_flip_and_velocity_reversal_metrics(self):
+        flips, pairs = sign_flips(torch.tensor([[1., -1., 0.05]]), torch.tensor([[-1., -2., -1.]]))
+        self.assertEqual((int(flips), int(pairs)), (1, 2))
+        reversed_, valid = velocity_reversals(torch.tensor([[1e-3, 0.], [1e-3, 0.], [1e-5, 0.]]),
+                                              torch.tensor([[-1e-3, 0.], [0., 1e-3], [-1e-3, 0.]]))
+        self.assertEqual(reversed_.tolist(), [True, False, False])
+        self.assertEqual(valid.tolist(), [True, True, False])
+
     def test_clearance_difficulty_and_noise_curriculum(self):
         levels = (0.002, 0.001, 0.0005, 0.00025, 0.00015, 0.0001)
         curriculum = SuccessNoiseCurriculum(("square", "triangle"), clearances=levels, noise_levels=10)
@@ -464,6 +487,7 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
             tip_calibration_error=0, grasp_position_error=0, sensor_rotation_error=0,
             rotation_bias=0,
             position_noise=0, rotation_noise=0, force_noise=0, moment_noise=0,
+            initial_z_max=0.02, target_lowpass=False,
         )
         cls.env = InsertionEnv(replace(cls.cfg, physics_cuda_graph=True,
                                       observation_cuda_graph=True), cls.device)
@@ -694,6 +718,21 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(FloatingPointError, "invalid physical state"):
             group.step(actions)
 
+    def test_isolated_divergence_terminates_only_that_environment(self):
+        cfg = replace(self.cfg, shapes=("square",), envs_per_shape=128,
+                      physics_cuda_graph=True, observation_cuda_graph=True)
+        env = InsertionEnv(cfg, self.device)
+        actions = torch.zeros(env.num_envs, 6, device=self.device)
+        env.step(actions)
+        env.groups[0].sim.data.qpos[3, 0] = float("nan")
+        obs, reward, done, info = env.step(actions)
+        self.assertTrue(bool(torch.isfinite(obs["actor"]).all() & torch.isfinite(reward).all()))
+        self.assertEqual(done.nonzero().flatten().tolist(), [3])
+        self.assertEqual(int(info["terminal"]["reason"][3]), 5)
+        self.assertEqual(float(reward[3]), -cfg.safety_failure_penalty)
+        self.assertEqual(float(info["log"]["episode/simulation_failures"]), 1.0)
+        self.assertTrue(bool(torch.isfinite(env.groups[0].sim.data.qpos[:]).all()))
+
     def test_rough_surface_no_timeout_and_cuda_graph_equivalence(self):
         cfg = replace(
             self.cfg,
@@ -716,7 +755,7 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
             align_goal_z_to_observation=True,
             rotation_bias=math.radians(1.5),
             stagnation_cost_per_second=2.5,
-            safety_failure_penalty=400.0,
+            safety_failure_penalty=800.0,
             dynamics="train",
             training=False,
         )
@@ -749,6 +788,145 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
                 torch.testing.assert_close(obs_c, obs_e, rtol=1e-5, atol=2e-6)
                 torch.testing.assert_close(rew_c, rew_e, rtol=1e-5, atol=2e-6)
                 torch.testing.assert_close(done_c, done_e)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class Real2SimPlantTests(unittest.TestCase):
+    device = "cuda:0"
+
+    def test_real_plant_matches_measured_step_and_z_deadband(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=1, training=False, dynamics="real",
+                           tip_calibration_error=0., initial_tilt=0., target_lowpass=True,
+                           initial_yaw=0., initial_z_min=0.04, initial_z_max=0.05, workspace_z_max_m=0.07)
+        group = InsertionEnv(cfg, self.device).groups[0]
+        # 0.1 kg 表观质量的实机应紧跟 20 ms 延迟后的部署低通轨迹，偏差不超过 0.3 N 死区 (约 0.15) 加余量
+        ideal = [0.] + [1 - (1 + 30*t) * math.exp(-30*t) for t in (0.02*i for i in range(1, 10))]
+        for axis, step in ((0, 0.003), (2, 0.003)):
+            group.reset(torch.arange(1, device=self.device))
+            group.slip_amplitude.zero_()
+            nominal = group.nominal_offset + group.calibration
+            start = tip_pose(*group.state()[:2], nominal)
+            goal = start.clone()
+            goal[:, axis] += step
+            fractions = []
+            with torch.inference_mode():
+                for _ in range(10):
+                    actions = torch.zeros(1, 6, device=self.device)
+                    actions[:, :3] = (goal - tip_pose(*group.state()[:2], nominal)) / cfg.translation_limit
+                    group.prepare_actions(actions)
+                    group.advance_physics()
+                    fractions.append(float((tip_pose(*group.state()[:2], nominal) - start)[0, axis]) / step)
+            if axis == 0:
+                self.assertLess(fractions[0], 0.05, fractions)
+                self.assertLess(max(abs(a - b) for a, b in zip(fractions, ideal)), 0.2, (fractions, ideal))
+            else:
+                self.assertLess(max(abs(f) for f in fractions), 0.05, fractions)
+
+    def test_lowpass_off_episode_follows_light_mass_impedance_step(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=1, training=False, dynamics="real",
+                           tip_calibration_error=0., initial_tilt=0., initial_yaw=0.,
+                           initial_z_min=0.04, initial_z_max=0.05, workspace_z_max_m=0.07,
+                           target_lowpass=True, target_lowpass_off_probability=1.0)
+        group = InsertionEnv(cfg, self.device).groups[0]
+        group.reset(torch.arange(1, device=self.device))
+        group.slip_amplitude.zero_()
+        torch.testing.assert_close(group.lowpass_omega, torch.full((1, 3), math.sqrt(6500.), device=self.device))
+        nominal = group.nominal_offset + group.calibration
+        start = tip_pose(*group.state()[:2], nominal)
+        goal = start.clone()
+        goal[:, 0] += 0.003
+        fractions = []
+        with torch.inference_mode():
+            for _ in range(8):
+                actions = torch.zeros(1, 6, device=self.device)
+                actions[:, :3] = (goal - tip_pose(*group.state()[:2], nominal)) / cfg.translation_limit
+                group.prepare_actions(actions)
+                group.advance_physics()
+                fractions.append(float((tip_pose(*group.state()[:2], nominal) - start)[0, 0]) / 0.003)
+        # 20 ms 延迟后由 80 rad/s、ζ=0.35 的轻质量响应追阶跃，明显快于部署低通并带超调
+        self.assertLess(fractions[0], 0.05, fractions)
+        self.assertGreater(fractions[2], 0.7, fractions)
+        self.assertGreater(max(fractions), 1.05, fractions)
+
+    def test_motion_vibration_is_narrowband_scaled_and_free_air_change_costlier(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=256, training=False,
+                           vibration_force_min_n=1.0, vibration_force_max_n=1.0)
+        group = InsertionEnv(cfg, self.device).groups[0]
+        samples = []
+        with torch.inference_mode():
+            for step in range(400):
+                group.update_vibration()
+                if step >= 100:
+                    samples.append(group.vibration_state[:, 0].clone())
+        unit = torch.stack(samples)
+        self.assertAlmostEqual(float(unit.std()), 1.0, delta=0.08)
+        lag1 = float((unit[1:] * unit[:-1]).mean() / unit.square().mean())
+        self.assertGreater(lag1, 0.2)
+        group.sim.data.qvel[:] = 0
+        group.update_vibration()
+        self.assertEqual(float(group.vibration.abs().max()), 0.0)
+        terms = lambda contact: completion_cost_terms(
+            cfg, torch.zeros(1), torch.ones(1)*0.02, torch.ones(1)*0.01, 0.01, torch.zeros(1),
+            torch.zeros(1), torch.zeros(1, 6), torch.ones(1, 6), -torch.ones(1, 6),
+            torch.tensor([False]), torch.tensor([False]), torch.tensor([False]),
+            in_contact=torch.tensor([contact]))["action_change_penalty"]
+        self.assertAlmostEqual(float(terms(False) / terms(True)),
+                               cfg.free_air_action_change_cost_per_second / cfg.action_change_cost_per_second,
+                               places=4)
+
+    def test_downstream_inertial_wrench_uses_sensor_and_offset_com_geometry(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=64, training=False)
+        group = InsertionEnv(cfg, self.device).groups[0]
+        group.reset(torch.arange(64, device=self.device))
+        distance = (group.sensor_offset - group.nominal_offset)[:, 2]
+        self.assertTrue(bool(((distance >= 0.08 - 1e-6) & (distance <= 0.16 + 1e-6)).all()))
+        self.assertEqual((real2sim_config(asdict(cfg)).sensor_tip_min_m,
+                          InsertionCfg.from_checkpoint({}).sensor_tip_min_m), (0.18, None))
+        a = torch.tensor([2.0, -1.0, 0.5], device=self.device)
+        alpha = torch.tensor([3.0, 5.0, -2.0], device=self.device)
+        group.sim.data.qfrc_constraint[:] = 0
+        group.wall_force_z.zero_()
+        group.sim.data.qvel[:] = 0
+        group.sim.data.qacc[:, :3] = a
+        group.sim.data.qacc[:, 3:6] = alpha
+        with torch.inference_mode():
+            group.update_sensor()
+        _, q, _, _ = group.state()
+        r = group.com_offset
+        force = -group.down_mass * (rotate(quat_inv(q), a.expand(64, 3))
+                                    + torch.linalg.cross(alpha.expand(64, 3), r))
+        moment = -group.down_inertia * alpha + torch.linalg.cross(r - group.offset, force)
+        torch.testing.assert_close(group.raw_wrench, torch.cat((force, moment), -1), atol=1e-4, rtol=1e-4)
+
+    def test_hard_state_reset_restores_recorded_true_tip_pose(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=16, training=True,
+                           hard_state_reset_probability=1.0)
+        group = InsertionEnv(cfg, self.device).groups[0]
+        stored = torch.tensor([0.004, -0.003, 0.006], device=self.device)
+        group.hard_pos[:] = stored
+        group.hard_q[:] = rotvec_quat(torch.tensor([[0.02, -0.01, 0.05]], device=self.device))
+        group.hard_valid[:] = True
+        group.reset(torch.arange(16, device=self.device))
+        pos, q, _, _ = group.state()
+        self.assertTrue(bool(group.hard_start.all()))
+        torch.testing.assert_close(tip_pose(pos, q, group.offset), stored.expand(16, 3), atol=1e-5, rtol=0)
+        evaluation = InsertionEnv(replace(cfg, training=False), self.device).groups[0]
+        evaluation.hard_valid[:] = True
+        evaluation.reset(torch.arange(16, device=self.device))
+        self.assertFalse(bool(evaluation.hard_start.any()))
+
+    def test_step_wrench_bias_injected_once_within_range(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=8, training=False,
+                           force_bias=0., moment_bias=0., step_bias_rate_per_second=1e6)
+        group = InsertionEnv(cfg, self.device).groups[0]
+        with torch.inference_mode():
+            group.step(torch.zeros(8, 6, device=self.device))
+            first = group.wrench_bias.clone()
+            group.step(torch.zeros(8, 6, device=self.device))
+        torch.testing.assert_close(group.wrench_bias, first)
+        force, moment = first[:, :3].norm(dim=-1), first[:, 3:].norm(dim=-1)
+        self.assertTrue(bool(((force >= 1.0 - 1e-5) & (force <= 3.5 + 1e-5)).all()))
+        self.assertTrue(bool(((moment >= 0.1 - 1e-5) & (moment <= 0.6 + 1e-5)).all()))
 
 
 if __name__ == "__main__":

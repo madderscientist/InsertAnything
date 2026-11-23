@@ -43,6 +43,17 @@ def bounded_stiffness_step(current: torch.Tensor, target: torch.Tensor, initial:
     return torch.maximum(lower, torch.minimum(upper, current + delta.clamp(-max_delta, max_delta)))
 
 
+CONTACT_THRESHOLD_N = 0.05
+SIMULATION_FAILURE = 5
+LOWPASS_OFF_MAX_RAD_S = 100.0
+
+
+def lowpass_velocity(velocity: torch.Tensor, error: torch.Tensor,
+                     omega: float, dt: float) -> torch.Tensor:
+    # 临界阻尼二阶目标低通的半隐式欧拉速度更新，随后由调用方用新速度推进状态
+    return velocity + dt * (omega * omega * error - 2 * omega * velocity)
+
+
 def play_hysteresis_step(state: torch.Tensor, signal: torch.Tensor,
                          half_width: torch.Tensor) -> torch.Tensor:
     return torch.minimum(torch.maximum(state, signal-half_width), signal+half_width)
@@ -55,83 +66,108 @@ def completion_cost_terms(
     success: torch.Tensor, safety_failure: torch.Tensor, timeout: torch.Tensor,
     *, tip_center_z: torch.Tensor | None = None,
     hole_force: torch.Tensor | None = None,
-    overloaded: torch.Tensor | None = None,
     stagnation: torch.Tensor | None = None,
+    in_contact: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
+    # 奖励 = -dt * Σ 运行成本 + 一次性终端项；各项定义见 REWARD.md
     dt = cfg.physics_dt*cfg.decimation
-    if cfg.surface_z_free_m > 0:
-        lowest_z = z_disp - target_depth
-        eff_z_disp = (
-            target_depth
-            + lowest_z.clamp_max(0.0)
-            + (lowest_z - cfg.surface_z_free_m).clamp_min(0.0)
-        )
-        remaining = eff_z_disp.clamp_min(0.0) / target_depth
-    else:
-        remaining = z_disp.clamp_min(0)/target_depth
-    # XY 与 Z 各自独立有界后再相加；平面项混合近场平方漏斗与有界远场斜率，消除外圈零梯度死区
-    half_cap, w = 0.5*cfg.position_cost_cap, cfg.xy_outer_cost_weight
-    xy_distance = half_cap*torch.tanh(
-        (xy/(radius*cfg.xy_cost_radius_fraction)).square()/half_cap)
-    if w > 0:
-        eps, r_max = 0.05*radius, cfg.workspace_xy_radius_m
-        x2 = xy.clamp(0.0, r_max).square()
-        norm = r_max*r_max / (math.hypot(r_max, eps) + eps)
-        outer_xy = half_cap * x2 / ((torch.sqrt(x2 + eps*eps) + eps) * norm)
-        xy_distance = (1.0 - w)*xy_distance + w*outer_xy
-    z_distance = half_cap*torch.tanh(remaining/half_cap)
-    distance = xy_distance + z_distance
-    reference = math.radians(cfg.orientation_cost_reference_deg)
-    tilt_error, yaw_error = (tilt/reference).square(), (yaw/reference).square()
-    # 孔口及上方不罚倾角；最低点入孔后前 4 mm 内线性增加权重
-    tilt_weight = ((target_depth-z_disp)/0.004).clamp(0, 1)
-    tilt_cost, yaw_cost = tilt_error/(1+tilt_error), yaw_error/(1+yaw_error)
-    orientation = tilt_weight*tilt_cost + yaw_cost
-    cap = cfg.load_cost_cap
-    force_norm = torch.linalg.vector_norm(wrench[:, :3], dim=-1)
-    moment_norm = torch.linalg.vector_norm(wrench[:, 3:], dim=-1)
-    force = ((force_norm-cfg.force_cost_free_n)
-             / (cfg.max_force-cfg.force_cost_free_n)).clamp(0, cap)
-    moment = ((moment_norm-cfg.moment_cost_free_nm)
-              / (cfg.max_moment-cfg.moment_cost_free_nm)).clamp(0, cap)
-    z_weight = torch.ones_like(xy)
-    if cfg.inserted_load_cost and tip_center_z is not None and hole_force is not None:
-        if cfg.inserted_load_depth_m > 0:
-            z_weight = (1.0 + tip_center_z / cfg.inserted_load_depth_m).clamp(0.0, 1.0)
-        else:
-            z_weight = (tip_center_z >= 0.0).to(hole_force.dtype)
-        weighted_hole_f = torch.cat((
-            hole_force[:, :2], (hole_force[:, 2] * z_weight).unsqueeze(-1)), dim=-1)
-        weighted_f_norm = torch.linalg.vector_norm(weighted_hole_f, dim=-1)
-        free_f = cfg.force_cost_free_n * z_weight
-        free_m = cfg.moment_cost_free_nm * z_weight
-        force = ((weighted_f_norm - free_f) / (cfg.max_force - free_f)).clamp(0, cap)
-        moment = ((moment_norm - free_m) / (cfg.max_moment - free_m)).clamp(0, cap)
-    if overloaded is None:
-        overloaded = ((force_norm > cfg.max_force) | (moment_norm > cfg.max_moment)) & (
-            not cfg.terminate_on_overload)
+    distance = position_distance(cfg, xy, z_disp, target_depth, radius)
+    orientation = orientation_cost(cfg, z_disp, target_depth, tilt, yaw)
+    force, moment = load_costs(cfg, wrench, tip_center_z, hole_force)
+    magnitude, change = action_costs(cfg, actions, previous_actions, in_contact)
     if stagnation is None:
         stagnation = torch.zeros_like(xy)
-    applied = cfg.action_cost_cap * torch.tanh(actions / cfg.action_cost_cap)
-    previous = cfg.action_cost_cap * torch.tanh(previous_actions / cfg.action_cost_cap)
-    # 浅入孔 3 mm 内随 Z 权重从 1 渐变到 0，同步放开入孔后的向下 (-Z) 动作幅度限制
-    downward_z = torch.where(applied[:, 2] < 0, applied[:, 2] * z_weight, applied[:, 2])
-    applied_for_cost = torch.cat((applied[:, :2], downward_z.unsqueeze(-1), applied[:, 3:]), dim=-1)
     return {
         "time_penalty": torch.full_like(xy, -dt*cfg.time_cost_per_second),
         "position_penalty": -dt*cfg.position_cost_per_second*distance,
         "orientation_penalty": -dt*cfg.orientation_cost_per_second*orientation,
         "force_penalty": -dt*cfg.force_cost_per_second*force.square(),
         "moment_penalty": -dt*cfg.moment_cost_per_second*moment.square(),
-        "overload_penalty": -dt*cfg.overload_cost_per_second*overloaded.float(),
         "stagnation_penalty": -dt*cfg.stagnation_cost_per_second*stagnation,
-        "action_penalty": -dt*cfg.action_cost_per_second*torch.linalg.vector_norm(applied_for_cost, dim=-1),
-        "action_change_penalty": -dt*cfg.action_change_cost_per_second*torch.linalg.vector_norm(
-            applied-previous, dim=-1),
+        "action_penalty": -dt*cfg.action_cost_per_second*magnitude,
+        "action_change_penalty": -dt*change,
         "completion_bonus": cfg.completion_bonus*success.float(),
         "safety_failure_penalty": -cfg.safety_failure_penalty*safety_failure.float(),
         "timeout_penalty": -cfg.timeout_penalty*(timeout & ~success & ~safety_failure).float(),
     }
+
+
+def position_distance(cfg: InsertionCfg, xy: torch.Tensor, z_disp: torch.Tensor,
+                      target_depth: torch.Tensor, radius: float) -> torch.Tensor:
+    """D = D_xy + D_z，两项各自饱和于 position_cost_cap/2。"""
+    half_cap = 0.5*cfg.position_cost_cap
+    if cfg.surface_z_free_m > 0:
+        # 板面上方 surface_z_free_m 内的抬升不增加深度成本（第二阶段越障）
+        lowest_z = z_disp - target_depth
+        z_disp = (target_depth + lowest_z.clamp_max(0.0)
+                  + (lowest_z - cfg.surface_z_free_m).clamp_min(0.0))
+    remaining = z_disp.clamp_min(0.0)/target_depth
+    xy_distance = half_cap*torch.tanh(
+        (xy/(radius*cfg.xy_cost_radius_fraction)).square()/half_cap)
+    w = cfg.xy_outer_cost_weight
+    if w > 0:
+        # 远场有界径向斜率，消除近场 tanh 饱和后的零梯度
+        eps, r_max = 0.05*radius, cfg.workspace_xy_radius_m
+        x2 = xy.clamp(0.0, r_max).square()
+        norm = r_max*r_max / (math.hypot(r_max, eps) + eps)
+        outer_xy = half_cap * x2 / ((torch.sqrt(x2 + eps*eps) + eps) * norm)
+        xy_distance = (1.0 - w)*xy_distance + w*outer_xy
+    return xy_distance + half_cap*torch.tanh(remaining/half_cap)
+
+
+def orientation_cost(cfg: InsertionCfg, z_disp: torch.Tensor, target_depth: torch.Tensor,
+                     tilt: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    """O = p·h(倾角) + h(偏航)，p 为最低点入孔前 4 mm 的线性进度。"""
+    reference = math.radians(cfg.orientation_cost_reference_deg)
+    tilt_error, yaw_error = (tilt/reference).square(), (yaw/reference).square()
+    tilt_weight = ((target_depth-z_disp)/0.004).clamp(0, 1)
+    return tilt_weight*tilt_error/(1+tilt_error) + yaw_error/(1+yaw_error)
+
+
+def load_costs(cfg: InsertionCfg, wrench: torch.Tensor, tip_center_z: torch.Tensor | None,
+               hole_force: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """归一化超死区力/力矩，上限 load_cost_cap；入孔后渐撤孔系 Fz 与死区。"""
+    cap = cfg.load_cost_cap
+    moment_norm = torch.linalg.vector_norm(wrench[:, 3:], dim=-1)
+    if cfg.inserted_load_cost and tip_center_z is not None and hole_force is not None:
+        z_weight = (1.0 + tip_center_z / cfg.inserted_load_depth_m).clamp(0.0, 1.0)
+        force_norm = torch.linalg.vector_norm(torch.cat((
+            hole_force[:, :2], (hole_force[:, 2] * z_weight).unsqueeze(-1)), dim=-1), dim=-1)
+    else:
+        z_weight = torch.ones_like(moment_norm)
+        force_norm = torch.linalg.vector_norm(wrench[:, :3], dim=-1)
+    free_f = cfg.force_cost_free_n * z_weight
+    free_m = cfg.moment_cost_free_nm * z_weight
+    force = ((force_norm - free_f) / (cfg.max_force - free_f)).clamp(0, cap)
+    moment = ((moment_norm - free_m) / (cfg.max_moment - free_m)).clamp(0, cap)
+    return force, moment
+
+
+def stagnation_level(cfg: InsertionCfg, tip: torch.Tensor, tip_ema: torch.Tensor,
+                     length: torch.Tensor, goal_z: torch.Tensor) -> torch.Tensor:
+    """未达目标深度时净推进速率低于阈值的平方缺口；原地更新 tip_ema。"""
+    dt = cfg.physics_dt * cfg.decimation
+    if cfg.rough_surface:
+        # 只统计横向与向下进度，板面上方上下弹跳不算推进
+        tip = torch.cat((tip[:, :2], tip[:, 2:3].clamp_max(0.0)), dim=-1)
+    delta = tip - tip_ema
+    speed = torch.linalg.vector_norm(delta, dim=-1) / cfg.stagnation_window_seconds
+    tip_ema.add_((1.0 - math.exp(-dt / cfg.stagnation_window_seconds)) * delta)
+    warmup = (length.to(tip.dtype) * dt / cfg.stagnation_window_seconds).clamp(0.0, 1.0)
+    not_at_goal = (tip[:, 2] > goal_z + 0.0005).to(tip.dtype)
+    return warmup * not_at_goal * (1.0 - speed / cfg.stagnation_speed_threshold_mps).clamp(0.0, 1.0).square()
+
+
+def action_costs(cfg: InsertionCfg, actions: torch.Tensor, previous_actions: torch.Tensor,
+                 in_contact: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """返回 ‖ā‖ 与 w_Δa·‖ā−ā_prev‖；ā 为 tanh 软饱和动作，悬空时 w_Δa 更大。"""
+    applied = cfg.action_cost_cap * torch.tanh(actions / cfg.action_cost_cap)
+    previous = cfg.action_cost_cap * torch.tanh(previous_actions / cfg.action_cost_cap)
+    weight = torch.full_like(applied[:, 0], cfg.action_change_cost_per_second)
+    if in_contact is not None and cfg.free_air_action_change_cost_per_second is not None:
+        weight = torch.where(in_contact, weight, cfg.free_air_action_change_cost_per_second)
+    return (torch.linalg.vector_norm(applied, dim=-1),
+            weight*torch.linalg.vector_norm(applied-previous, dim=-1))
 
 
 class PlantGroup:
@@ -151,7 +187,8 @@ class PlantGroup:
                                            device=device).expand(self.n, 3)
         self.offset = self.nominal_offset.clone()
         self.sensor_offset = torch.tensor([0, 0, 0.03 * cfg.scale],
-                                          device=device).expand(self.n, 3)
+                                          device=device).repeat(self.n, 1)
+        self.com_offset = torch.zeros(self.n, 3, device=device)
         self.identity = torch.tensor([1., 0, 0, 0], device=device).expand(self.n, 4)
         self.goal = torch.zeros(self.n, 3, device=device)
         self.length = torch.zeros(self.n, device=device, dtype=torch.long)
@@ -190,6 +227,7 @@ class PlantGroup:
             cfg.seed + ALL_SHAPES.index(shape) * 10007 + 500003)
         self.gain_q = self.identity.clone()
         self.mass = torch.ones(self.n, 1, device=device)
+        self.apparent_mass = torch.ones(self.n, 1, device=device)
         self.inertia = torch.zeros(self.n, 3, device=device)
         self.down_mass = torch.zeros_like(self.mass)
         self.down_inertia = torch.zeros_like(self.inertia)
@@ -202,6 +240,32 @@ class PlantGroup:
         self.targets_q = self.identity.unsqueeze(0).repeat(3, 1, 1)
         self.physics_p_goal = torch.zeros(self.n, 3, device=device)
         self.physics_q_goal = self.identity.clone()
+        self.lowpass_p = torch.zeros(self.n, 3, device=device)
+        self.lowpass_v = torch.zeros_like(self.lowpass_p)
+        self.lowpass_q = self.identity.clone()
+        self.lowpass_w = torch.zeros_like(self.lowpass_p)
+        self.lowpass_off = torch.zeros(self.n, 1, device=device, dtype=torch.bool)
+        self.lowpass_omega = torch.full_like(self.lowpass_p, cfg.target_lowpass_translation_rad_s)
+        self.lowpass_zeta = torch.ones_like(self.lowpass_p)
+        self.pivot = torch.zeros(self.n, 3, device=device)
+        self.slip_amplitude = torch.zeros(self.n, 3, device=device)
+        self.slip_omega = torch.zeros(self.n, device=device)
+        self.slip_phase = torch.zeros(self.n, device=device)
+        self.clock = torch.zeros(self.n, device=device)
+        self.step_bias_active = torch.zeros(self.n, device=device, dtype=torch.bool)
+        self.step_peak_contact = torch.zeros(self.n, device=device)
+        self.step_contact_overflow = torch.zeros(self.n, device=device, dtype=torch.bool)
+        self.hard_capacity = 4096
+        self.hard_pos = torch.zeros(self.hard_capacity, 3, device=device)
+        self.hard_q = torch.tensor([1., 0, 0, 0], device=device).repeat(self.hard_capacity, 1)
+        self.hard_valid = torch.zeros(self.hard_capacity, device=device, dtype=torch.bool)
+        self.hard_slot = 0
+        self.hard_start = torch.zeros(self.n, device=device, dtype=torch.bool)
+        self.vibration = torch.zeros(self.n, 6, device=device)
+        self.vibration_state = torch.zeros(self.n, 2, 6, device=device)
+        self.vibration_phi = torch.zeros(self.n, 2, 6, device=device)
+        self.vibration_gain = torch.zeros(self.n, 6, device=device)
+        self.vibration_amplitude = torch.zeros(self.n, 1, device=device)
         # 使用张量视图避免 TorchArray 索引写入触发跨流切换，以便被 CUDA Graph 捕获
         self.applied_wrench = self.sim.data.xfrc_applied[:, self.body_id]
         self.physics_graph: torch.cuda.CUDAGraph | None = None
@@ -240,6 +304,9 @@ class PlantGroup:
                     if cfg.rough_surface
                     else ("body_mass", "body_inertia", "geom_friction", "geom_pos"))
         self.sim.expand_model_fields(expanded)
+        self.nefc_view = wp.to_torch(self.sim.wp_data.nefc)
+        self.nacon_view = wp.to_torch(self.sim.wp_data.nacon)
+        self.njmax, self.naconmax = int(self.sim.wp_data.njmax), int(self.sim.wp_data.naconmax)
         self.peg_geom_ids = (self.model.geom_bodyid == self.body_id).nonzero()[0].tolist()
         self.default_geom_pos = torch.tensor(
             self.model.geom_pos, device=self.device, dtype=torch.float32)
@@ -430,14 +497,109 @@ class PlantGroup:
             return torch.zeros(n, columns, device=self.device)
         return torch.randn(n, columns, generator=self.generator, device=self.device) * std
 
-    def sample_wrench_bias(self, n: int, amplitude: float) -> torch.Tensor:
-        if self.cfg.wrench_bias_distribution == "per_axis":
-            return self.uniform(n, 3, -amplitude, amplitude)
+    def unit_vector(self, n: int) -> torch.Tensor:
         azimuth = self.uniform(n, 1, -math.pi, math.pi)
         z = self.uniform(n, 1, -1., 1.)
         xy = (1-z.square()).clamp_min(0).sqrt()
-        direction = torch.cat((xy*azimuth.cos(), xy*azimuth.sin(), z), dim=-1)
-        return direction*self.uniform(n, 1, 0., amplitude)
+        return torch.cat((xy*azimuth.cos(), xy*azimuth.sin(), z), dim=-1)
+
+    def sample_wrench_bias(self, n: int, amplitude: float) -> torch.Tensor:
+        if self.cfg.wrench_bias_distribution == "per_axis":
+            return self.uniform(n, 3, -amplitude, amplitude)
+        return PlantGroup.unit_vector(self, n)*self.uniform(n, 1, 0., amplitude)
+
+    def record_hard_states(self) -> None:
+        # 每步抽查少量环境，把持续接触且未到目标的真实尖端位姿写入环形缓冲，全程无主机同步
+        k = min(8, self.n)
+        idx = torch.randint(0, self.n, (k,), generator=self.generator, device=self.device)
+        pos, q, _, _ = self.state()
+        tip = tip_pose(pos[idx], q[idx], self.offset[idx])
+        # 已入孔超过 1 mm 的状态几乎必成功；只记录挣扎 ≥2 s 仍在板面或孔口的接触状态
+        eligible = ((self.step_peak_contact[idx] > CONTACT_THRESHOLD_N) & (self.length[idx] >= 100)
+                    & (tip[:, 2] > -0.001 * self.cfg.scale))
+        slots = (self.hard_slot + torch.arange(k, device=self.device)) % self.hard_capacity
+        self.hard_slot = (self.hard_slot + k) % self.hard_capacity
+        self.hard_pos[slots] = torch.where(eligible.unsqueeze(-1), tip, self.hard_pos[slots])
+        self.hard_q[slots] = torch.where(eligible.unsqueeze(-1), q[idx], self.hard_q[slots])
+        self.hard_valid[slots] = self.hard_valid[slots] | eligible
+
+    def sample_hard_start(self, ids: torch.Tensor, pos: torch.Tensor,
+                          q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cfg, n = self.cfg, len(ids)
+        self.hard_start[ids] = False
+        if not cfg.training or cfg.hard_state_reset_probability == 0:
+            return pos, q
+        slot = torch.multinomial(self.hard_valid.float() + 1e-12, n, replacement=True,
+                                 generator=self.generator)
+        hard_pos, hard_q = self.hard_pos[slot].clone(), self.hard_q[slot]
+        use = ((self.uniform(n, 1, 0., 1.)[:, 0] < cfg.hard_state_reset_probability)
+               & self.hard_valid[slot] & (hard_pos[:, 2] > self.goal[ids, 2] + 0.002 * cfg.scale))
+        if cfg.rough_surface:
+            # 新回合地形不同，孔外位姿抬高到不穿透新地形；孔内位姿不受地形影响
+            inside = (hard_pos[:, 2] < 0) & self.geometry.definition.opening_contains(
+                self.geometry, hard_pos[:, :2], self.hole_polygon)
+            clear_z = self.initial_minimum_tip_height(
+                hard_q, margin=0.0005 * cfg.scale, surface_height=self.surface_max_height[ids])
+            hard_pos[:, 2] = torch.where(inside, hard_pos[:, 2], torch.maximum(hard_pos[:, 2], clear_z))
+        self.hard_start[ids] = use
+        return (torch.where(use.unsqueeze(-1), hard_pos, pos),
+                torch.where(use.unsqueeze(-1), hard_q, q))
+
+    def reset_vibration(self, ids: torch.Tensor) -> None:
+        # 窄带振动用 AR(2) 谐振器按策略周期离散，增益归一化使稳态标准差为 1
+        cfg, n = self.cfg, len(ids)
+        dt = cfg.physics_dt * cfg.decimation
+        omega = 2 * math.pi * self.uniform(n, 6, cfg.vibration_min_hz, cfg.vibration_max_hz)
+        zeta = self.uniform(n, 6, 0.1, 0.3)
+        amplitude = self.uniform(n, 1, cfg.vibration_force_min_n, cfg.vibration_force_max_n) * self.noise_scale
+        if self.cfg.dynamics == "real":
+            omega.fill_(2 * math.pi * 6.0)
+            zeta.fill_(0.2)
+            amplitude.fill_(1.0)
+        elif self.cfg.dynamics == "nominal":
+            amplitude.zero_()
+        radius = torch.exp(-zeta * omega * dt)
+        phi1 = 2 * radius * torch.cos(omega * dt * torch.sqrt(1 - zeta.square()))
+        phi2 = -radius.square()
+        variance = (1 - phi2) / ((1 + phi2) * ((1 - phi2).square() - phi1.square()))
+        self.vibration_phi[ids] = torch.stack((phi1, phi2), 1)
+        self.vibration_gain[ids] = variance.rsqrt()
+        self.vibration_amplitude[ids] = amplitude
+        self.vibration_state[ids] = 0
+        self.vibration[ids] = 0
+
+    def update_vibration(self) -> None:
+        cfg = self.cfg
+        excitation = torch.randn(self.n, 6, generator=self.generator, device=self.device) * self.vibration_gain
+        value = (self.vibration_phi * self.vibration_state).sum(1) + excitation
+        self.vibration_state.copy_(torch.stack((value, self.vibration_state[:, 0]), 1))
+        # 振动由自身指令运动激发（低通目标速度），接触时工具被约束不再叠加
+        if cfg.target_lowpass:
+            linear, angular = self.lowpass_v, self.lowpass_w
+        else:
+            _, q, v, angular = self.state()
+            linear = v + torch.linalg.cross(angular, rotate(q, self.nominal_offset + self.calibration))
+        speed = (torch.linalg.vector_norm(linear, dim=-1)
+                 + cfg.vibration_moment_arm_m * torch.linalg.vector_norm(angular, dim=-1))
+        free_air = (self.step_peak_contact <= CONTACT_THRESHOLD_N).float()
+        motion = ((speed / cfg.vibration_speed_ref_mps).clamp(0., 1.) * free_air).unsqueeze(-1)
+        scale = torch.cat((self.vibration_amplitude.expand(-1, 3),
+                           self.vibration_amplitude.expand(-1, 3) * cfg.vibration_moment_arm_m), -1)
+        self.vibration.copy_(value * scale * motion)
+
+    def inject_step_bias(self) -> None:
+        # 回合中途以泊松到达率注入一次持续的阶跃力旋量偏置，仅进入 actor 观测
+        cfg = self.cfg
+        probability = 1 - math.exp(-cfg.step_bias_rate_per_second * cfg.physics_dt * cfg.decimation)
+        hit = (torch.rand(self.n, generator=self.generator, device=self.device) < probability) \
+            & ~self.step_bias_active
+        bias = torch.cat((
+            self.unit_vector(self.n)*self.uniform(
+                self.n, 1, cfg.step_force_bias_min_n, cfg.step_force_bias_max_n),
+            self.unit_vector(self.n)*self.uniform(
+                self.n, 1, cfg.step_moment_bias_min_nm, cfg.step_moment_bias_max_nm)), -1)
+        self.wrench_bias.add_(bias * hit.unsqueeze(-1) * self.noise_scale)
+        self.step_bias_active |= hit
 
     def set_clearance(self, clearance: float) -> None:
         if math.isclose(clearance, self.clearance, rel_tol=0., abs_tol=1e-12):
@@ -493,6 +655,9 @@ class PlantGroup:
             low, high, rot_low, rot_high = 120., 600., 1.5, 3.
         elif cfg.dynamics == "stiff":
             low, high, rot_low, rot_high = 3000., 5000., 15., 22.
+        elif cfg.dynamics == "real":
+            low = high = 650.
+            rot_low = rot_high = 4.8
         else:
             low = high = 1500.
             rot_low = rot_high = 8.
@@ -516,17 +681,30 @@ class PlantGroup:
         self.walk_upper[ids] = torch.minimum(upper, self.initial_k[ids]*(1+cfg.impedance_walk_fraction))
         self.walk_target[ids] = self.initial_k[ids]
         self.walk_current[ids] = self.initial_k[ids]
+        # 轻刚体或低有效阻尼在 0.1 mm 间隙孔内会使 MuJoCo 接触发散，故刚体与阻尼按 0.7–1.5 kg；
+        # 实机更轻的表观质量由目标低通加速度前馈 (m - m_apparent) * a_lowpass 与相对目标速度阻尼复现
         self.mass[ids] = self.uniform(n, 1, 0.7, 1.5)
+        self.apparent_mass[ids] = self.uniform(
+            n, 1, math.log(cfg.mass_min_kg), math.log(cfg.mass_max_kg)).exp()
         inertia_parts = self.uniform(n, 3, 0.001, 0.0025)
         self.inertia[ids] = (inertia_parts.sum(-1, keepdim=True)-inertia_parts) * cfg.scale**2
         if cfg.dynamics == "nominal":
             self.mass[ids] = 1
+            self.apparent_mass[ids] = 1
             self.inertia[ids] = 0.003 * cfg.scale**2
-        inertia6 = torch.cat((self.mass[ids].expand(n, 3), self.inertia[ids]), -1)
-        self.damping_ratio[ids] = self.uniform(n, 6, 0.8, 1.3)
+        elif cfg.dynamics == "real":
+            self.mass[ids] = 1
+            self.apparent_mass[ids] = 0.1
+            self.inertia[ids] = 0.0024 * cfg.scale**2
+        if not cfg.target_lowpass:
+            self.apparent_mass[ids] = self.mass[ids]
+        inertia6 = torch.cat((self.apparent_mass[ids].expand(n, 3), self.inertia[ids]), -1)
+        self.damping_ratio[ids] = self.uniform(n, 6, cfg.damping_ratio_min, cfg.damping_ratio_max)
+        if cfg.dynamics == "real":
+            self.damping_ratio[ids] = torch.tensor([0.35]*3 + [0.5]*3, device=self.device)
         self.d[ids] = 2 * torch.sqrt(self.k[ids] * inertia6) * self.damping_ratio[ids]
         self.gain_q[ids] = rotvec_quat(self.uniform(n, 3, -0.5, 0.5))
-        self.down_mass[ids] = self.uniform(n, 1, 0.2, 0.4)
+        self.down_mass[ids] = self.uniform(n, 1, cfg.down_mass_min_kg, cfg.down_mass_max_kg)
         down_parts = self.uniform(n, 3, 0.00015, 0.00035)
         self.down_inertia[ids] = (down_parts.sum(-1, keepdim=True)-down_parts) * cfg.scale**2
         if cfg.dynamics == "nominal":
@@ -535,21 +713,77 @@ class PlantGroup:
             self.gain_q[ids] = self.identity[ids]
             self.down_mass[ids] = 0.3
             self.down_inertia[ids] = 0.0005 * cfg.scale**2
-        if cfg.dynamics == "nominal" or (cfg.stiction_force == 0 and cfg.stiction_moment == 0):
+        elif cfg.dynamics == "real":
+            self.gain_q[ids] = self.identity[ids]
+            self.down_mass[ids] = 0.6
+        if cfg.sensor_tip_min_m is not None:
+            fixed = cfg.dynamics in ("nominal", "real")
+            mid = lambda low, high: torch.full((n, 1), (low + high) / 2, device=self.device)
+            d = (mid(cfg.sensor_tip_min_m, cfg.sensor_tip_max_m) if fixed else
+                 self.uniform(n, 1, cfg.sensor_tip_min_m, cfg.sensor_tip_max_m)) * cfg.scale
+            fraction = (mid(cfg.com_fraction_min, cfg.com_fraction_max) if fixed else
+                        self.uniform(n, 1, cfg.com_fraction_min, cfg.com_fraction_max))
+            lateral = (torch.zeros(n, 2, device=self.device) if fixed else
+                       self.uniform(n, 2, -cfg.com_lateral_m, cfg.com_lateral_m) * cfg.scale)
+            sensor_z = self.nominal_offset[ids, 2:] + d
+            self.sensor_offset[ids] = torch.cat((torch.zeros_like(lateral), sensor_z), -1)
+            self.com_offset[ids] = torch.cat((lateral, sensor_z - fraction * d), -1)
+            # 细杆近似：横向 m*d^2/12，轴向按 2–3.5 cm 半径
+            transverse = self.down_mass[ids] * d**2 / 12 * (1.0 if fixed else self.uniform(n, 1, 0.6, 1.4))
+            axial = self.down_mass[ids] * (2.5e-4 if fixed else
+                                           self.uniform(n, 1, 1e-4, 4e-4)) * cfg.scale**2
+            self.down_inertia[ids] = torch.cat((transverse, transverse, axial), -1)
+        if cfg.target_lowpass:
+            off = torch.rand(n, 1, generator=self.generator, device=self.device) < cfg.target_lowpass_off_probability
+            # 无低通时实机平移按表观质量的二阶响应追阶跃；上限保证 1 kHz 积分稳定且前馈不过度饱和
+            natural = torch.sqrt(self.k[ids, :3] / self.apparent_mass[ids]).clamp_max(LOWPASS_OFF_MAX_RAD_S)
+            self.lowpass_off[ids] = off
+            self.lowpass_omega[ids] = torch.where(off, natural, cfg.target_lowpass_translation_rad_s)
+            self.lowpass_zeta[ids] = torch.where(off, self.damping_ratio[ids, :3], 1.)
+        stiction_force_z = cfg.stiction_force if cfg.stiction_force_z is None else cfg.stiction_force_z
+        stiction_moment_xy = cfg.stiction_moment if cfg.stiction_moment_xy is None else cfg.stiction_moment_xy
+        stiction_upper = [cfg.stiction_force]*2 + [stiction_force_z] + [stiction_moment_xy]*2 + [cfg.stiction_moment]
+        if cfg.dynamics == "real":
+            self.stiction[ids] = torch.tensor([0.3, 0.3, 2.5, 0.2, 0.2, 0.025], device=self.device)
+        elif cfg.dynamics == "nominal" or not any(x > 0 for x in stiction_upper):
             self.stiction[ids] = 0
         else:
-            self.stiction[ids] = torch.cat((
-                self.uniform(n, 3, 0., cfg.stiction_force),
-                self.uniform(n, 3, 0., cfg.stiction_moment)), -1) * self.difficulty
-        if cfg.dynamics == "nominal" or cfg.wall_friction_force == 0:
+            self.stiction[ids] = self.uniform(n, 6, 0., 1.) * torch.tensor(
+                stiction_upper, device=self.device) * self.difficulty
+            if cfg.stiction_reference_stiffness is not None:
+                self.stiction[ids, :3] *= (self.k[ids, :3] / cfg.stiction_reference_stiffness).clamp_max(1.)
+        if cfg.dynamics == "real":
+            self.wall_friction[ids] = 2.0
+        elif cfg.dynamics == "nominal" or cfg.wall_friction_force == 0:
             self.wall_friction[ids] = 0
         else:
             self.wall_friction[ids] = self.uniform(n, 1, 0., cfg.wall_friction_force)[:, 0] * self.difficulty
+        # 实机绕尖端旋转时整臂绕上游枢轴转动，尖端随之平移
+        self.pivot[ids] = self.unit_vector(n) * self.uniform(
+            n, 1, 0., cfg.rotation_pivot_max_m * cfg.scale) * self.difficulty
+        slip_angle = self.uniform(n, 1, -math.pi, math.pi)
+        self.slip_amplitude[ids] = torch.cat(
+            (slip_angle.cos(), slip_angle.sin(), torch.zeros_like(slip_angle)), -1) * self.uniform(
+            n, 1, 0., cfg.stick_slip_max_pp_m * cfg.scale / 2) * self.difficulty
+        self.slip_omega[ids] = 2 * math.pi * self.uniform(n, 1, cfg.stick_slip_min_hz, cfg.stick_slip_max_hz)[:, 0]
+        self.slip_phase[ids] = self.uniform(n, 1, -math.pi, math.pi)[:, 0]
+        if cfg.dynamics == "nominal":
+            self.pivot[ids] = 0
+            self.slip_amplitude[ids] = 0
+        elif cfg.dynamics == "real":
+            self.pivot[ids] = torch.tensor([0.05, 0., 0.05], device=self.device) * cfg.scale
+            self.slip_amplitude[ids] = torch.tensor([0.0005, 0., 0.], device=self.device) * cfg.scale
+            self.slip_omega[ids] = 2 * math.pi * 5.0
+        self.clock[ids] = 0
+        self.step_bias_active[ids] = False
+        self.reset_vibration(ids)
         self.sim.model.body_mass[ids, self.body_id] = self.mass[ids, 0]
         self.sim.model.body_inertia[ids, self.body_id] = self.inertia[ids]
-        friction = self.uniform(n, 1, 0.25, 1.15)
+        friction = self.uniform(n, 1, cfg.plate_friction_min, cfg.plate_friction_max)
         if cfg.dynamics == "nominal":
             friction.fill_(0.4)
+        elif cfg.dynamics == "real":
+            friction.fill_(0.5)
         self.sim.model.geom_friction[ids, :, 0] = friction
         z_grasp_err = cfg.grasp_position_error if cfg.grasp_z_error is None else cfg.grasp_z_error
         if cfg.grasp_error_distribution == "gaussian":
@@ -601,6 +835,8 @@ class PlantGroup:
         self.delay[ids] = torch.randint(0, 3, (n,), generator=self.generator, device=self.device)
         if cfg.dynamics == "nominal":
             self.delay[ids] = 0
+        elif cfg.dynamics == "real":
+            self.delay[ids] = 1
         pos = self.uniform(n, 3, -cfg.initial_xy, cfg.initial_xy) * self.difficulty
         pos[:, 2] = self.uniform(n, 1, cfg.initial_z_min, cfg.initial_z_max)[:, 0]
         q = self.sample_initial_orientation(n)
@@ -639,6 +875,7 @@ class PlantGroup:
                 pos[:, 2] = torch.where(low_mask, low_z, full_z)
             else:
                 pos[:, 2] = full_z
+        pos, q = self.sample_hard_start(ids, pos, q)
         self.sim.data.qpos[ids, :3] = pos - rotate(q, self.offset[ids])
         self.sim.data.qpos[ids, 3:7] = q
         if cfg.rough_surface:
@@ -652,10 +889,14 @@ class PlantGroup:
                                self.nominal_offset[ids] + self.calibration[ids])
         self.targets_p[:, ids] = nominal_tip.unsqueeze(0)
         self.targets_q[:, ids] = q.unsqueeze(0)
+        self.lowpass_p[ids] = nominal_tip
+        self.lowpass_q[ids] = q
+        self.lowpass_v[ids] = 0
+        self.lowpass_w[ids] = 0
         for buffer in (self.length, self.hold, self.peak_force, self.peak_moment,
                        self.step_peak_force, self.step_peak_moment,
                        self.last_action, self.wrench, self.raw_wrench, self.filtered_sensor,
-                       self.hysteresis_sensor, self.wall_force_z):
+                       self.hysteresis_sensor, self.wall_force_z, self.step_peak_contact):
             buffer[ids] = 0
         if cfg.position_observation_delay:
             self.reset_position_observation(ids, nominal_tip)
@@ -697,27 +938,32 @@ class PlantGroup:
         q = canonical_quat(self.sim.data.qpos[:, 3:7])
         return pos, q, self.sim.data.qvel[:, :3], rotate(q, self.sim.data.qvel[:, 3:6])
 
-    def impedance(self, error: torch.Tensor, velocity: torch.Tensor,
-                  part: slice) -> torch.Tensor:
+    def impedance(self, error: torch.Tensor, velocity: torch.Tensor, part: slice,
+                  feedforward: torch.Tensor | None = None,
+                  goal_velocity: torch.Tensor | None = None) -> torch.Tensor:
+        # 静摩擦死区作用于全部驱动项（弹簧、加速度前馈、目标速度阻尼），只有实际速度阻尼在死区外
         frame_inv = quat_inv(self.gain_q)
         local_e, local_v = rotate(frame_inv, error), rotate(frame_inv, velocity)
         spring = self.k[:, part] * local_e
+        if feedforward is not None:
+            spring = spring + rotate(frame_inv, feedforward)
+        if goal_velocity is not None:
+            spring = spring + self.d[:, part] * rotate(frame_inv, goal_velocity)
         spring = spring.sign() * (spring.abs() - self.stiction[:, part]).clamp_min(0.)
         return rotate(self.gain_q, spring - self.d[:, part] * local_v)
 
     def sample_impedance_walk_target(self) -> None:
-        if self.cfg.dynamics == "nominal" or self.cfg.impedance_walk_fraction == 0:
+        if self.cfg.dynamics in ("nominal", "real") or self.cfg.impedance_walk_fraction == 0:
             return
         interval = round(self.cfg.impedance_walk_interval_seconds / 0.02)
-        ids = (self.length % interval == 0).nonzero().flatten()
-        if len(ids):
-            u = torch.rand(len(ids), 6, generator=self.walk_generator, device=self.device)
-            self.walk_target[ids] = self.walk_lower[ids] + u * (
-                self.walk_upper[ids]-self.walk_lower[ids])
+        due = (self.length % interval == 0).unsqueeze(-1)
+        u = torch.rand(self.n, 6, generator=self.walk_generator, device=self.device, dtype=self.walk_target.dtype)
+        self.walk_target.copy_(torch.where(
+            due, self.walk_lower + u * (self.walk_upper - self.walk_lower), self.walk_target))
 
     def update_impedance_walk(self) -> None:
         cfg = self.cfg
-        if cfg.dynamics == "nominal" or cfg.impedance_walk_fraction == 0:
+        if cfg.dynamics in ("nominal", "real") or cfg.impedance_walk_fraction == 0:
             return
         # 使用 float64 累积物理子步，避免浮点舍入系统性突破变化率上限
         self.walk_current.copy_(bounded_stiffness_step(
@@ -725,7 +971,7 @@ class PlantGroup:
             cfg.physics_dt, cfg.impedance_walk_time_constant_seconds,
             cfg.impedance_walk_rate_per_second))
         self.k.copy_(self.walk_current)
-        inertia6 = torch.cat((self.mass.expand(self.n, 3), self.inertia), -1)
+        inertia6 = torch.cat((self.apparent_mass.expand(self.n, 3), self.inertia), -1)
         self.d.copy_(2 * self.damping_ratio * torch.sqrt(self.k * inertia6))
 
     def update_sensor(self) -> None:
@@ -736,13 +982,19 @@ class PlantGroup:
         contact_f = torch.cat((
             self.sim.data.qfrc_constraint[:, :2],
             (self.sim.data.qfrc_constraint[:, 2] + self.wall_force_z).unsqueeze(-1)), dim=-1)
+        self.step_peak_contact.copy_(torch.maximum(
+            self.step_peak_contact, torch.linalg.vector_norm(contact_f, dim=-1)))
         contact_m = rotate(q, self.sim.data.qfrc_constraint[:, 3:6])
         inertial_m = rotate(q, self.down_inertia * alpha_local
                             + torch.linalg.cross(omega_local, self.down_inertia * omega_local))
-        f = contact_f - self.down_mass * acc
-        m_com = contact_m - inertial_m
-        # 传感器下游质心位于刚体原点，等效机械臂惯量不计入腕部传感器负载
-        wrist = transform_wrench(f, m_com, quat_inv(q), self.sensor_offset)
+        r = self.com_offset
+        acc_com = acc + rotate(q, torch.linalg.cross(alpha_local, r) + torch.linalg.cross(
+            omega_local, torch.linalg.cross(omega_local, r)))
+        inertial_f = self.down_mass * acc_com
+        f = contact_f - inertial_f
+        # 关于刚体原点的力矩；等效机械臂惯量不计入腕部传感器负载
+        m_origin = contact_m - inertial_m - torch.linalg.cross(rotate(q, r), inertial_f)
+        wrist = transform_wrench(f, m_origin, quat_inv(q), self.sensor_offset)
         alpha = 1 - math.exp(-self.cfg.physics_dt / self.cfg.filter_seconds)
         self.filtered_sensor += alpha * (wrist - self.filtered_sensor)
         self.hysteresis_sensor.copy_(play_hysteresis_step(
@@ -798,7 +1050,7 @@ class PlantGroup:
         noisy_tip = observed_tip + position_noise
         noisy_q = quat_mul(rotvec_quat(rotation_noise), quat_mul(self.rotation_bias_q, q))
         obs = actor_observation(noisy_tip, noisy_q, self.goal + self.bias,
-                                self.identity, self.wrench + self.wrench_bias + noise)
+                                self.identity, self.wrench + self.wrench_bias + self.vibration + noise)
         if self.cfg.position_observation_delay:
             delayed = self.position_history.gather(
                 1, self.position_delay_frames[:, None, None].expand(-1, 1, 3)).squeeze(1)
@@ -807,7 +1059,7 @@ class PlantGroup:
         shape_id = torch.nn.functional.one_hot(
             torch.full((self.n,), ALL_SHAPES.index(self.shape), device=self.device),
             len(ALL_SHAPES)).float()
-        critic = torch.cat((clean, v, omega, self.k, self.d, self.mass, self.inertia,
+        critic = torch.cat((clean, v, omega, self.k, self.d, self.apparent_mass, self.inertia,
                             self.down_mass, self.down_inertia, self.calibration,
                             quat_rotvec(self.sensor_error), self.bias,
                             self.offset-self.nominal_offset, shape_id), -1)
@@ -830,17 +1082,41 @@ class PlantGroup:
 
     def physics_control(self) -> None:
         self.update_impedance_walk()
+        cfg = self.cfg
+        goal_p, goal_q = self.physics_p_goal, self.physics_q_goal
+        feedforward = None
+        if cfg.target_lowpass:
+            # 与部署侧一致的临界阻尼二阶目标低通，位于（延迟后的）目标与阻抗控制器之间
+            dt = cfg.physics_dt
+            omega_t, zeta_t = self.lowpass_omega, self.lowpass_zeta
+            acceleration = (omega_t * omega_t * (goal_p - self.lowpass_p)
+                            - 2 * zeta_t * omega_t * self.lowpass_v)
+            feedforward = (self.mass - self.apparent_mass) * acceleration
+            self.lowpass_v.add_(acceleration * dt)
+            self.lowpass_p.add_(self.lowpass_v * dt)
+            rotation_error = quat_rotvec(quat_mul(goal_q, quat_inv(self.lowpass_q)))
+            self.lowpass_w.copy_(lowpass_velocity(
+                self.lowpass_w, rotation_error, cfg.target_lowpass_rotation_rad_s, dt))
+            self.lowpass_q.copy_(canonical_quat(quat_mul(rotvec_quat(self.lowpass_w * dt), self.lowpass_q)))
+            goal_p = self.lowpass_p
+            goal_q = torch.where(self.lowpass_off, goal_q, self.lowpass_q)
+        self.clock.add_(cfg.physics_dt)
+        stick_slip = self.slip_amplitude * torch.sin(self.slip_omega * self.clock + self.slip_phase).unsqueeze(-1)
         pos, q, v, omega = self.state()
         r_ct = rotate(q, self.nominal_offset + self.calibration)
         p_tip = pos + r_ct
         v_tip = v + torch.linalg.cross(omega, r_ct)
-        force = self.impedance(self.physics_p_goal - p_tip, v_tip, slice(0, 3)).clamp(-40, 40)
-        angular_error = quat_rotvec(quat_mul(self.physics_q_goal, quat_inv(q)))
-        moment_tip = self.impedance(angular_error, omega, slice(3, 6)).clamp(-3, 3)
+        goal_v = goal_w = None
+        if feedforward is not None:
+            goal_v = self.lowpass_v
+            goal_w = torch.where(self.lowpass_off, 0., self.lowpass_w)
+        force = self.impedance(goal_p + stick_slip - p_tip, v_tip, slice(0, 3),
+                               feedforward, goal_v).clamp(-40, 40)
+        angular_error = quat_rotvec(quat_mul(goal_q, quat_inv(q)))
+        moment_tip = self.impedance(angular_error, omega, slice(3, 6), None, goal_w).clamp(-3, 3)
         true_tip = pos + rotate(q, self.offset)
         in_opening = (true_tip[:, :2].square().sum(-1) <= self.geometry.radius**2).float()
-        ramp_depth = self.cfg.inserted_load_depth_m if self.cfg.inserted_load_depth_m > 0 else 0.003
-        depth_scale = ((-true_tip[:, 2] - 0.0005) / ramp_depth).clamp(0., 1.) * in_opening
+        depth_scale = ((-true_tip[:, 2] - 0.0005) / self.cfg.inserted_load_depth_m).clamp(0., 1.) * in_opening
         max_wall_f = self.wall_friction * depth_scale
         wall_f = (-force[:, 2] - self.mass[:, 0] * v[:, 2] / 0.005).clamp(-max_wall_f, max_wall_f)
         self.wall_force_z.copy_(wall_f)
@@ -850,14 +1126,14 @@ class PlantGroup:
 
     def physics_sensor(self) -> None:
         self.update_sensor()
+        # 缓冲已满时约束会被静默丢弃，必须当作仿真失败处理
+        self.step_contact_overflow.logical_or_(
+            (self.nefc_view >= self.njmax) | (self.nacon_view >= self.naconmax))
         pos, q, _, _ = self.state()
         true_tip_z = (pos + rotate(q, self.offset))[:, 2]
         raw_hole_f = rotate(q, self.raw_wrench[:, :3])
         if self.cfg.inserted_load_cost:
-            if self.cfg.inserted_load_depth_m > 0:
-                z_weight = (1.0 + true_tip_z / self.cfg.inserted_load_depth_m).clamp(0.0, 1.0)
-            else:
-                z_weight = (true_tip_z >= 0.0).to(raw_hole_f.dtype)
+            z_weight = (1.0 + true_tip_z / self.cfg.inserted_load_depth_m).clamp(0.0, 1.0)
             weighted_raw_f = torch.cat((
                 raw_hole_f[:, :2], (raw_hole_f[:, 2] * z_weight).unsqueeze(-1)), dim=-1)
             step_force_norm = torch.linalg.vector_norm(weighted_raw_f, dim=-1)
@@ -925,6 +1201,12 @@ class PlantGroup:
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
         if not torch.isfinite(actions).all():
             raise FloatingPointError("non-finite policy action; no silent reset")
+        return self.finalize(*self.launch(actions))
+
+    def launch(self, actions: torch.Tensor) -> tuple:
+        # 只排队 GPU 工作、不做主机同步，使多个形状组可在不同 CUDA 流上并发
+        if self.cfg.step_bias_rate_per_second > 0 and self.cfg.dynamics != "nominal":
+            self.inject_step_bias()
         if self.cfg.physics_cuda_graph:
             self.step_actions.copy_(actions)
             if self.action_graph is None:
@@ -938,8 +1220,40 @@ class PlantGroup:
             self.prepare_actions(actions)
         self.sample_impedance_walk_target()
         self.advance_physics()
-        if not torch.isfinite(self.sim.data.qpos[:]).all() or not torch.isfinite(self.raw_wrench).all():
-            raise FloatingPointError(f"invalid physical state in {self.shape}")
+        invalid = ~(torch.isfinite(self.sim.data.qpos[:]).all(-1) & torch.isfinite(self.sim.data.qvel[:]).all(-1)
+                    & torch.isfinite(self.raw_wrench).all(-1)) | self.step_contact_overflow
+        if self.cfg.vibration_force_max_n > 0 and self.cfg.dynamics != "nominal":
+            self.update_vibration()
+        if self.cfg.training and self.cfg.hard_state_reset_probability > 0:
+            self.record_hard_states()
+        reward, done, info = self.outcome(actions)
+        return reward, done, info, invalid, self.last_reward_terms
+
+    def finalize(self, reward: torch.Tensor, done: torch.Tensor, info: dict, invalid: torch.Tensor,
+                 terms: dict) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        self.last_reward_terms = terms
+        failures = int(invalid.sum())
+        if failures > 0.01 * self.n:
+            raise FloatingPointError(f"invalid physical state in {self.shape}: {failures}/{self.n} environments")
+        if failures:
+            # 孔内接触偶发数值发散：仅终止该环境并按安全失败处罚，由上层正常重置
+            logging.warning("MuJoCo divergence or contact overflow in %s: terminating %d environment(s) "
+                            "as safety failures.",
+                            self.shape, failures)
+            reward = torch.where(invalid, -self.cfg.safety_failure_penalty, reward)
+            done = done | invalid
+            info = {key: torch.where(invalid, 0, value).to(value.dtype) if value.is_floating_point()
+                    else value for key, value in info.items()}
+            info["reason"] = torch.where(invalid, SIMULATION_FAILURE, info["reason"])
+            info["time_outs"] = info["time_outs"] & ~invalid
+            terms = {key: torch.where(invalid, 0., value) for key, value in self.last_reward_terms.items()}
+            terms["safety_failure_penalty"] = torch.where(
+                invalid, -self.cfg.safety_failure_penalty, terms["safety_failure_penalty"])
+            self.last_reward_terms = terms
+        info["simulation_failure"] = invalid
+        return reward, done, info
+
+    def outcome(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
         if not self.cfg.physics_cuda_graph:
             return self.step_outcome(actions)
         if self.outcome_graph is None:
@@ -962,9 +1276,13 @@ class PlantGroup:
         cfg = self.cfg
         self.step_peak_force.zero_()
         self.step_peak_moment.zero_()
+        self.step_peak_contact.zero_()
+        self.step_contact_overflow.zero_()
         pos, q, _, _ = self.state()
         p_target, q_target = action_target(tip_pose(pos, q, self.nominal_offset + self.calibration),
                                            q, actions, cfg.translation_limit, cfg.rotation_limit)
+        p_target = p_target + torch.linalg.cross(
+            rotate(q, self.pivot), actions[:, 3:] * cfg.rotation_limit)
         self.targets_p.copy_(torch.cat((p_target.unsqueeze(0), self.targets_p[:2]), 0))
         self.targets_q.copy_(torch.cat((q_target.unsqueeze(0), self.targets_q[:2]), 0))
         ids = torch.arange(self.n, device=self.device)
@@ -984,10 +1302,6 @@ class PlantGroup:
             inside = self.geometry.definition.opening_contains(
                 self.geometry, tip[:, :2], self.hole_polygon)
             success = success & inside
-        if cfg.success_alignment_required:
-            success = (success & (xy < self.clearance * 0.4)
-                       & (tilt < self.clearance / self.geometry.peg_length * 0.4)
-                       & (yaw < self.clearance / self.geometry.radius * 0.4))
         step_force = getattr(self, "step_peak_force", self.peak_force)
         step_moment = getattr(self, "step_peak_moment", self.peak_moment)
         overloaded = (step_force > cfg.max_force) | (step_moment > cfg.max_moment)
@@ -1000,24 +1314,9 @@ class PlantGroup:
         escaped = ((xy > cfg.workspace_xy_radius_m) | (tip[:, 2] > cfg.workspace_z_max_m * cfg.scale)
                    | (tip[:, 2] < -self.geometry.depth) | (tilt > math.radians(35)))
         self.length += 1
-        stagnation = None
         tip_ema = getattr(self, "tip_ema", None)
-        if tip_ema is not None:
-            dt = cfg.physics_dt * cfg.decimation
-            alpha_stag = 1.0 - math.exp(-dt / cfg.stagnation_window_seconds)
-            if cfg.rough_surface:
-                prog_pos = torch.cat((tip[:, :2], tip[:, 2:3].clamp_max(0.0)), dim=-1)
-                delta_tip = prog_pos - tip_ema
-            else:
-                delta_tip = tip - tip_ema
-            eff_speed = torch.linalg.vector_norm(delta_tip, dim=-1) / cfg.stagnation_window_seconds
-            tip_ema.add_(alpha_stag * delta_tip)
-            warmup = (self.length.to(tip.dtype) * dt / cfg.stagnation_window_seconds).clamp(0.0, 1.0)
-            not_at_goal = (tip[:, 2] > self.goal[:, 2] + 0.0005).to(tip.dtype)
-            stagnation = (
-                warmup * not_at_goal
-                * (1.0 - eff_speed / cfg.stagnation_speed_threshold_mps).clamp(0.0, 1.0).square()
-            )
+        stagnation = (None if tip_ema is None
+                      else stagnation_level(cfg, tip, tip_ema, self.length, self.goal[:, 2]))
         timeout = ((self.length >= math.ceil(cfg.episode_seconds / 0.02))
                    if cfg.enable_timeout else torch.zeros_like(success))
         done = success | excessive | escaped | timeout
@@ -1026,8 +1325,8 @@ class PlantGroup:
             cfg, xy, z_disp, -self.goal[:, 2], self.geometry.radius, tilt, yaw,
             self.wrench, actions, self.last_action, success, excessive | escaped, timeout,
             tip_center_z=tip[:, 2], hole_force=rotate(q, self.wrench[:, :3]),
-            overloaded=overloaded & (not cfg.terminate_on_overload),
-            stagnation=stagnation)
+            stagnation=stagnation,
+            in_contact=(getattr(self, "step_peak_contact", step_force) > CONTACT_THRESHOLD_N))
         self.last_reward_terms = terms
         reward = torch.stack(list(terms.values())).sum(0)
         self.last_action.copy_(actions)
@@ -1038,7 +1337,8 @@ class PlantGroup:
                 "tip_z_m": tip[:, 2].clone(), "tilt_rad": tilt.clone(),
                 "target_depth_m": -self.goal[:, 2].clone(),
                 "peak_force": self.peak_force.clone(), "peak_moment": self.peak_moment.clone(),
-                "time_outs": timeout & ~success & ~excessive & ~escaped}
+                "time_outs": timeout & ~success & ~excessive & ~escaped,
+                "hard_start": getattr(self, "hard_start", torch.zeros_like(success)).clone()}
         return reward, done, info
 
 
@@ -1148,15 +1448,22 @@ class InsertionEnv(VecEnv):
 
     def get_observations(self) -> TensorDict:
         pairs = [g.observations() for g in self.groups]
+        # free_air 不进入任何网络，仅供 SmoothPPO 选择悬空步
+        free_air = torch.cat([(g.step_peak_contact <= CONTACT_THRESHOLD_N).float().to(self.device)
+                              for g in self.groups]).unsqueeze(-1)
         return TensorDict({"actor": torch.cat([p[0].to(self.device) for p in pairs]),
-                           "critic": torch.cat([p[1].to(self.device) for p in pairs])},
+                           "critic": torch.cat([p[1].to(self.device) for p in pairs]),
+                           "free_air": free_air},
                           [self.num_envs])
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         if actions.shape != (self.num_envs, 6):
             raise ValueError(f"expected {(self.num_envs, 6)} action, got {actions.shape}")
-        results = [g.step(a.to(g.device)) for g, a in zip(
+        if not torch.isfinite(actions).all():
+            raise FloatingPointError("non-finite policy action; no silent reset")
+        chunks = [a.to(g.device) for g, a in zip(
             self.groups, actions.split([g.n for g in self.groups]), strict=True)]
+        results = [g.finalize(*g.launch(a)) for g, a in zip(self.groups, chunks, strict=True)]
         self.policy_steps += 1
         self.total_transitions += self.num_envs
         for g in self.groups:
@@ -1186,6 +1493,11 @@ class InsertionEnv(VecEnv):
                     self.curriculum_shape_ids, dones, terminal["reason"] == 1,
                     terminal["curriculum_eligible"]), dim=1))
         logs = {}
+        logs["episode/simulation_failures"] = terminal["simulation_failure"].float().sum()
+        hard = terminal["hard_start"] & dones
+        logs["episode/hard_start_fraction"] = hard.float().sum() / dones.float().sum().clamp_min(1)
+        logs["episode/hard_start_success"] = (
+            (hard & (terminal["reason"] == 1)).float().sum() / hard.float().sum().clamp_min(1))
         logs["curriculum/noise_scale"] = torch.tensor(
             self.groups[0].noise_scale, device=self.device)
         for key in self.groups[0].last_reward_terms:

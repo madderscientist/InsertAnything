@@ -32,8 +32,12 @@ def replay_index(elapsed: float, count: int) -> int:
 
 
 def replay_config(environment: dict, shape: str, zero_noise: bool = False,
-                  ignore_overload: bool = False) -> InsertionCfg:
-    cfg = replace(InsertionCfg.from_checkpoint(environment),
+                  ignore_overload: bool = False, real_profile: bool = False) -> InsertionCfg:
+    cfg = InsertionCfg.from_checkpoint(environment)
+    if real_profile:
+        from real2sim.evaluate_real2sim import REAL_PROFILE
+        cfg = replace(cfg, **REAL_PROFILE)
+    cfg = replace(cfg,
                   shapes=(shape,), shape_env_counts=(), adaptive_sampling=False,
                   envs_per_shape=1, training=False, terminate_on_overload=not ignore_overload)
     if zero_noise:
@@ -49,9 +53,10 @@ class PolicyReplay:
     """Generate complete episodes separately, then display them at real-time speed."""
 
     def __init__(self, run_dir: Path, device: str, shape: str, zero_noise: bool = False,
-                 ignore_overload: bool = False):
+                 ignore_overload: bool = False, real_profile: bool = False):
         self.run_dir, self.device, self.shape = run_dir, device, shape
         self.zero_noise, self.ignore_overload = zero_noise, ignore_overload
+        self.real_profile = real_profile
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.episode = None
@@ -83,7 +88,7 @@ class PolicyReplay:
                 started = time.monotonic()
                 metadata, actor = load_checkpoint(self.run_dir / "checkpoint.pt", self.device)
                 cfg = replay_config(metadata["environment"], shape, self.zero_noise,
-                                    self.ignore_overload)
+                                    self.ignore_overload, self.real_profile)
                 if env is None or current_cfg != cfg:
                     env = InsertionEnv(cfg, self.device)
                     current_cfg = cfg
@@ -700,7 +705,7 @@ class RealtimePlant(PlantGroup):
         pf = float(self.peak_force[0])
         pm = float(self.peak_moment[0])
         r_sq = self.geometry.radius ** 2
-        ramp_depth = cfg.inserted_load_depth_m if cfg.inserted_load_depth_m > 0 else 0.003
+        ramp_depth = cfg.inserted_load_depth_m
         wall_fz = 0.0
         wrench_out = np.zeros(6, dtype=np.float64)
         raw_out = np.zeros(6, dtype=np.float64)
@@ -771,10 +776,7 @@ class RealtimePlant(PlantGroup):
             m_norm = float(np.linalg.norm(raw_out[3:]))
             if cfg.inserted_load_cost:
                 tz = float((d.qpos[:3] + _np_rotate(q2, offset))[2])
-                if cfg.inserted_load_depth_m > 0:
-                    zw = min(max(1.0 + tz / cfg.inserted_load_depth_m, 0.0), 1.0)
-                else:
-                    zw = 1.0 if tz >= 0.0 else 0.0
+                zw = min(max(1.0 + tz / cfg.inserted_load_depth_m, 0.0), 1.0)
                 rhf = _np_rotate(q2, raw_out[:3])
                 step_fn = float(np.hypot(np.hypot(rhf[0], rhf[1]), rhf[2] * zw))
             else:
@@ -1240,6 +1242,8 @@ def main() -> None:
                         help="disable observation noise and fixed measurement/grasp errors in policy replay")
     parser.add_argument("--ignore-overload", action="store_true",
                         help="simulation replay only: continue past force/moment limits")
+    parser.add_argument("--real-profile", action="store_true",
+                        help="policy replay with the real2sim evaluation plant and deployment low-pass")
     args = parser.parse_args()
     if args.frames < 0 or not 1 <= args.port <= 65535:
         parser.error("frames must be nonnegative and port must be valid")
@@ -1247,9 +1251,9 @@ def main() -> None:
     if args.mode == "interactive":
         run_interactive(args)
         return
-    replay_only = args.zero_noise or args.ignore_overload
+    replay_only = args.zero_noise or args.ignore_overload or args.real_profile
     if replay_only and args.mode != "policy":
-        parser.error("--zero-noise and --ignore-overload require --mode policy")
+        parser.error("--zero-noise, --ignore-overload and --real-profile require --mode policy")
     metadata = json.loads((args.run_dir / "config.json").read_text())
     cfg = InsertionCfg.from_checkpoint(metadata["environment"])
     if args.shape is not None and args.shape not in cfg.shapes and args.mode != "policy":
@@ -1321,7 +1325,7 @@ def main() -> None:
                 if mode.value == "Latest policy replay":
                     if replay is None:
                         replay = PolicyReplay(args.run_dir, args.device, shape, args.zero_noise,
-                                              args.ignore_overload)
+                                              args.ignore_overload, args.real_profile)
                     replay.select(shape)
                     episode = replay.latest()
                     if (frozen.value and displayed_episode is not None

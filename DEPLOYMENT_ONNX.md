@@ -84,6 +84,8 @@ q_target_HT = canonical(ExpQuaternion(dr_H) * CURRENT q_HT)
 
 Rotation is an H-frame rotation vector applied by **left multiplication**, about the nominal tip. Actions are increments, not velocities: do not multiply by 0.02 or integrate onto the previous commanded target. ONNX performs no clipping; clipping externally changes the policy and requires validation. Independent hardware safety envelopes remain mandatory.
 
+If `contract.json` has `target_lowpass.enabled = true`, the policy was trained with a critically damped second-order low-pass between the target above and the impedance controller (`translation/rotation_natural_frequency_rad_s`, reset to the measured pose with zero velocity at each start). Deployment must apply the identical filter; omitting or retuning it is outside the training distribution.
+
 Transform targets back to B and convert tip targets to flange targets using calibrated geometry. Training uses high-rate compliant impedance control, not a stiff position servo; its randomized gains are not approved hardware gains. The 50 Hz policy does not replace the low-level controller.
 
 ## 5. Minimal inference

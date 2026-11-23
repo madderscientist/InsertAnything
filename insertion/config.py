@@ -1,6 +1,6 @@
 """仿真与训练参数配置，仅用于物理仿真环境"""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 import math
 
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
@@ -11,6 +11,28 @@ from .shapes.circle import validate_circle_sides
 HOLE_DEPTH_M = 0.025
 PPO_DISCOUNT = 0.9985
 CLEARANCE_CURRICULUM_LEVELS = (0.002, 0.001, 0.0005, 0.00025, 0.00015, 0.0001)
+# real2sim/ 续训覆盖到源配置上的真机实测取值；数据类默认值为第一阶段（无部署低通）
+REAL2SIM_VALUES = {
+    "initial_z_max": 0.055, "workspace_z_max_m": 0.070,
+    "action_change_cost_per_second": 0.2, "free_air_action_change_cost_per_second": 0.6,
+    "action_cost_cap": 12.0,
+    "stiction_force_z": 3.0, "stiction_moment_xy": 0.25, "stiction_reference_stiffness": 650.0,
+    "mass_min_kg": 0.08, "damping_ratio_min": 0.25, "plate_friction_min": 0.15,
+    "down_mass_min_kg": 0.4, "down_mass_max_kg": 0.9,
+    "sensor_tip_min_m": 0.18, "sensor_tip_max_m": 0.22,
+    "com_fraction_min": 0.3, "com_fraction_max": 0.6, "com_lateral_m": 0.005,
+    "target_lowpass": True, "target_lowpass_translation_rad_s": 30.0,
+    "target_lowpass_rotation_rad_s": 50.0, "target_lowpass_off_probability": 0.15,
+    "rotation_pivot_max_m": 0.09,
+    "stick_slip_max_pp_m": 0.0015, "stick_slip_min_hz": 3.0, "stick_slip_max_hz": 6.0,
+    "step_bias_rate_per_second": 0.05, "step_force_bias_min_n": 1.0, "step_force_bias_max_n": 3.5,
+    "step_moment_bias_min_nm": 0.1, "step_moment_bias_max_nm": 0.6,
+    "vibration_force_min_n": 0.5, "vibration_force_max_n": 1.5,
+    "vibration_min_hz": 2.0, "vibration_max_hz": 10.0,
+    "vibration_moment_arm_m": 0.1, "vibration_speed_ref_mps": 0.02,
+    "hard_state_reset_probability": 0.25,
+}
+REAL2SIM_FIELDS = tuple(REAL2SIM_VALUES)
 
 
 @dataclass
@@ -87,7 +109,6 @@ class InsertionCfg:
     dynamics: str = "train"
     training: bool = True
     success_hold_steps: int = 5
-    success_alignment_required: bool = False
     success_opening_required: bool = True
     curriculum_steps: int = 256000
     impedance_walk_fraction: float = 0.1
@@ -96,6 +117,49 @@ class InsertionCfg:
     impedance_walk_time_constant_seconds: float = 1.0
     stiction_force: float = 0.6
     stiction_moment: float = 0.06
+    # None 表示与 stiction_force/stiction_moment 相同；real2sim 使用实测 Z/XY 转动独立死区
+    stiction_force_z: float | None = None
+    stiction_moment_xy: float | None = None
+    # 设定时低于该刚度按比例缩小平移死区，保持等效位移不超过标定值
+    stiction_reference_stiffness: float | None = None
+    # 阻抗表观质量（仅启用目标低通时生效）；MuJoCo 刚体质量固定在 0.7–1.5 kg
+    mass_min_kg: float = 0.7
+    mass_max_kg: float = 1.5
+    damping_ratio_min: float = 0.8
+    damping_ratio_max: float = 1.3
+    down_mass_min_kg: float = 0.4
+    down_mass_max_kg: float = 0.9
+    # 传感器沿轴位于尖端上方 d；下游质心在传感器下方 fraction*d 并有横向偏移；None 为旧模型
+    sensor_tip_min_m: float | None = 0.08
+    sensor_tip_max_m: float = 0.16
+    com_fraction_min: float = 0.3
+    com_fraction_max: float = 0.6
+    com_lateral_m: float = 0.005
+    plate_friction_min: float = 0.25
+    plate_friction_max: float = 1.15
+    target_lowpass: bool = False
+    target_lowpass_translation_rad_s: float = 30.0
+    target_lowpass_rotation_rad_s: float = 50.0
+    # 以此概率按回合关闭部署低通：平移改为轻表观质量阻抗的自身响应 sqrt(k/m)、转动直接跟随阶跃目标
+    target_lowpass_off_probability: float = 0.0
+    rotation_pivot_max_m: float = 0.0
+    stick_slip_max_pp_m: float = 0.0
+    stick_slip_min_hz: float = 3.0
+    stick_slip_max_hz: float = 6.0
+    step_bias_rate_per_second: float = 0.0
+    step_force_bias_min_n: float = 1.0
+    step_force_bias_max_n: float = 3.5
+    step_moment_bias_min_nm: float = 0.1
+    step_moment_bias_max_nm: float = 0.6
+    # 训练时以此概率从近期记录的接触难点位姿（贴板、孔口卡滞、半插入）开始回合
+    hard_state_reset_probability: float = 0.0
+    # 运动引起的夹爪/工具振动力：2–10 Hz 低阻尼窄带有色噪声，幅值随尖端速度增长，仅进入 actor 观测
+    vibration_force_min_n: float = 0.5
+    vibration_force_max_n: float = 1.5
+    vibration_min_hz: float = 2.0
+    vibration_max_hz: float = 10.0
+    vibration_moment_arm_m: float = 0.1
+    vibration_speed_ref_mps: float = 0.02
     wall_friction_force: float = 4.0
     time_cost_per_second: float = 1.0
     position_cost_per_second: float = 2.0
@@ -108,17 +172,19 @@ class InsertionCfg:
     force_cost_per_second: float = 1.0
     moment_cost_per_second: float = 1.0
     load_cost_cap: float = 1.5
-    overload_cost_per_second: float = 2.0
-    stagnation_cost_per_second: float = 0.0
+    stagnation_cost_per_second: float = 2.0
     stagnation_speed_threshold_mps: float = 0.006
     stagnation_window_seconds: float = 0.4
     force_cost_free_n: float = 5.0
     moment_cost_free_nm: float = 0.1
     action_cost_per_second: float = 0.05
-    action_change_cost_per_second: float = 0.05
-    action_cost_cap: float = 4.0
+    action_change_cost_per_second: float = 0.1
+    # 悬空时更强的动作变化成本；接触时允许晃动以搜索孔口
+    free_air_action_change_cost_per_second: float | None = 0.5
+    # 让 ~20 单位的大动作仍有代价梯度
+    action_cost_cap: float = 12.0
     completion_bonus: float = 20.0
-    safety_failure_penalty: float = 250.0
+    safety_failure_penalty: float = 800.0
     timeout_penalty: float = 10.0
 
     def __post_init__(self) -> None:
@@ -144,8 +210,8 @@ class InsertionCfg:
             raise ValueError("rough_flat_probability must be finite and in [0, 1]")
         if type(self.rough_num_waves) is not int or not 1 <= self.rough_num_waves <= 16:
             raise ValueError("rough_num_waves must be an integer in [1, 16]")
-        if not math.isfinite(self.inserted_load_depth_m) or self.inserted_load_depth_m < 0:
-            raise ValueError("inserted_load_depth_m must be finite and nonnegative")
+        if not math.isfinite(self.inserted_load_depth_m) or self.inserted_load_depth_m <= 0:
+            raise ValueError("inserted_load_depth_m must be finite and positive")
         validate_circle_sides(self.circle_sides)
         self.shapes = tuple(self.shapes)
         if not self.shapes or any(s not in ALL_SHAPES for s in self.shapes):
@@ -179,8 +245,49 @@ class InsertionCfg:
             raise ValueError("clearance_levels must be finite, strictly decreasing and < 0.005 * scale")
         if self.clearance_curriculum and self.clearance_levels[0] <= self.clearance:
             raise ValueError("clearance curriculum requires an initial clearance above target clearance")
-        if self.dynamics not in ("train", "nominal", "soft", "stiff"):
+        if self.dynamics not in ("train", "nominal", "soft", "stiff", "real"):
             raise ValueError("unknown dynamics profile")
+        if not isinstance(self.target_lowpass, bool):
+            raise ValueError("target_lowpass must be a boolean")
+        if not 0 <= self.target_lowpass_off_probability <= 1:
+            raise ValueError("target_lowpass_off_probability must be in [0, 1]")
+        ranges = ((self.mass_min_kg, self.mass_max_kg), (self.damping_ratio_min, self.damping_ratio_max),
+                  (self.down_mass_min_kg, self.down_mass_max_kg),
+                  (self.plate_friction_min, self.plate_friction_max),
+                  (self.stick_slip_min_hz, self.stick_slip_max_hz),
+                  (self.step_force_bias_min_n, self.step_force_bias_max_n),
+                  (self.step_moment_bias_min_nm, self.step_moment_bias_max_nm),
+                  (self.vibration_min_hz, self.vibration_max_hz))
+        if any(not (math.isfinite(a) and math.isfinite(b) and 0 < a <= b) for a, b in ranges):
+            raise ValueError("plant randomization ranges must be finite, positive and ordered")
+        if self.sensor_tip_min_m is not None and (
+                not 0 < self.sensor_tip_min_m <= self.sensor_tip_max_m < 1
+                or not 0 <= self.com_fraction_min <= self.com_fraction_max <= 1
+                or not 0 <= self.com_lateral_m < 0.05):
+            raise ValueError("sensor/COM geometry ranges must be ordered and physical")
+        if (not math.isfinite(self.vibration_force_max_n)
+                or not 0 <= self.vibration_force_min_n <= self.vibration_force_max_n
+                or not math.isfinite(self.vibration_moment_arm_m) or self.vibration_moment_arm_m < 0
+                or not math.isfinite(self.vibration_speed_ref_mps) or self.vibration_speed_ref_mps <= 0
+                or self.vibration_max_hz >= 0.5 / (self.physics_dt * self.decimation)):
+            raise ValueError("vibration noise must be finite, ordered and below the policy Nyquist rate")
+        if not math.isfinite(self.hard_state_reset_probability) or not 0 <= self.hard_state_reset_probability <= 1:
+            raise ValueError("hard_state_reset_probability must be finite and in [0, 1]")
+        if self.stiction_reference_stiffness is not None and (
+                not math.isfinite(self.stiction_reference_stiffness) or self.stiction_reference_stiffness <= 0):
+            raise ValueError("stiction reference stiffness must be None or finite and positive")
+        if self.free_air_action_change_cost_per_second is not None and (
+                not math.isfinite(self.free_air_action_change_cost_per_second)
+                or self.free_air_action_change_cost_per_second < 0):
+            raise ValueError("free-air action change cost must be None or finite and nonnegative")
+        plant_nonnegative = (self.rotation_pivot_max_m, self.stick_slip_max_pp_m,
+                             self.step_bias_rate_per_second,
+                             *(x for x in (self.stiction_force_z, self.stiction_moment_xy) if x is not None))
+        if any(not math.isfinite(x) or x < 0 for x in plant_nonnegative):
+            raise ValueError("plant disturbance magnitudes must be finite and nonnegative")
+        if any(not math.isfinite(x) or x <= 0 for x in (
+                self.target_lowpass_translation_rad_s, self.target_lowpass_rotation_rad_s)):
+            raise ValueError("target low-pass natural frequencies must be finite and positive")
         if self.success_hold_steps < 1 or self.curriculum_steps < 1:
             raise ValueError("success hold and curriculum horizon must be positive")
         noise = (self.initial_xy, self.initial_tilt, self.initial_yaw, self.position_bias,
@@ -203,7 +310,7 @@ class InsertionCfg:
                 < self.workspace_xy_radius_m + footprint + .001*self.scale):
             raise ValueError("plate must cover workspace plus tilted peg footprint and 1 mm margin")
         if (not math.isfinite(self.initial_z_min) or not math.isfinite(self.initial_z_max)
-                or not 0 < self.initial_z_min <= self.initial_z_max < 0.03 * self.scale):
+                or not 0 < self.initial_z_min <= self.initial_z_max < self.workspace_z_max_m * self.scale):
             raise ValueError("initial Z bounds must be positive, ordered and below the workspace ceiling")
         if (not math.isfinite(self.initial_plane_margin)
                 or not 0 <= self.initial_plane_margin <= self.initial_z_max):
@@ -254,7 +361,7 @@ class InsertionCfg:
         if not math.isfinite(self.xy_outer_cost_weight) or not 0 <= self.xy_outer_cost_weight <= 1:
             raise ValueError("xy_outer_cost_weight must be finite and in [0, 1]")
         cost_nonnegative = (self.orientation_cost_per_second, self.force_cost_per_second,
-                            self.moment_cost_per_second, self.overload_cost_per_second,
+                            self.moment_cost_per_second,
                             self.stagnation_cost_per_second, self.surface_z_free_m,
                             self.action_cost_per_second,
                             self.action_change_cost_per_second, self.timeout_penalty,
@@ -286,10 +393,14 @@ class InsertionCfg:
         return self.physics_dt*self.decimation*(
             self.time_cost_per_second + self.position_cost_per_second*self.position_cost_cap
             + 2*self.orientation_cost_per_second + self.force_cost_per_second*load_cap_sq
-            + self.moment_cost_per_second*load_cap_sq + self.overload_cost_per_second
+            + self.moment_cost_per_second*load_cap_sq
             + self.stagnation_cost_per_second
             + self.action_cost_per_second*self.action_cost_cap*math.sqrt(6)
-            + self.action_change_cost_per_second*2*self.action_cost_cap*math.sqrt(6))
+            + self.max_action_change_cost_per_second*2*self.action_cost_cap*math.sqrt(6))
+
+    @property
+    def max_action_change_cost_per_second(self) -> float:
+        return max(self.action_change_cost_per_second, self.free_air_action_change_cost_per_second or 0.)
 
     @property
     def environment_counts(self) -> tuple[int, ...]:
@@ -324,10 +435,8 @@ class InsertionCfg:
     def from_checkpoint(cls, environment: dict) -> "InsertionCfg":
         values = dict(environment)
         defaults = {
-            "success_alignment_required": True,
             "position_observation_delay": False,
             "inserted_load_cost": False,
-            "inserted_load_depth_m": 0.0,
             "force_bias": 0.0,
             "moment_bias": 0.0,
             "rotation_bias": 0.0,
@@ -338,7 +447,6 @@ class InsertionCfg:
             "stiction_moment": 0.0,
             "wall_friction_force": 0.0,
             "load_cost_cap": 1.5,
-            "overload_cost_per_second": 2.0,
             "stagnation_cost_per_second": 0.0,
             "stagnation_speed_threshold_mps": 0.006,
             "stagnation_window_seconds": 0.4,
@@ -365,17 +473,36 @@ class InsertionCfg:
             "workspace_xy_radius_m": 0.025 * values.get("scale", 1.0),
             "plate_outer_radius_m": 0.0,
             "success_opening_required": False,
+            "initial_z_max": 0.02,
+            "action_change_cost_per_second": 0.05,
+            "safety_failure_penalty": 250.0,
+            "stiction_force_z": None,
+            "stiction_moment_xy": None,
+            "mass_min_kg": 0.7,
+            "mass_max_kg": 1.5,
+            "damping_ratio_min": 0.8,
+            "damping_ratio_max": 1.3,
+            "down_mass_min_kg": 0.2,
+            "down_mass_max_kg": 0.4,
+            "plate_friction_min": 0.25,
+            "plate_friction_max": 1.15,
+            "target_lowpass": False,
+            "rotation_pivot_max_m": 0.0,
+            "stick_slip_max_pp_m": 0.0,
+            "step_bias_rate_per_second": 0.0,
+            "free_air_action_change_cost_per_second": None,
+            "vibration_force_min_n": 0.0,
+            "vibration_force_max_n": 0.0,
+            "stiction_reference_stiffness": None,
+            "hard_state_reset_probability": 0.0,
+            "sensor_tip_min_m": None,
+            "target_lowpass_off_probability": 0.0,
         }
         for key, default in defaults.items():
             values.setdefault(key, default)
-        for retired in (
-            "preinsertion_tilt_weight",
-            "stagnation_lift_cost_per_second", "stagnation_lift_target",
-            "stagnation_lift_scale", "stagnation_lateral_target", "stagnation_lateral_scale",
-        ):
-            values.pop(retired, None)
-        if values.pop("load_cost_power", 2) != 2:
-            raise ValueError("linear-load experimental checkpoints require explicit reward migration")
+        # 忽略已退役字段
+        known = {f.name for f in fields(cls)}
+        values = {key: value for key, value in values.items() if key in known}
         if "shapes" in values:
             values["shapes"] = tuple(values["shapes"])
         if "clearance_levels" in values:
@@ -407,4 +534,8 @@ def runner_config(steps: int = 256) -> dict:
             desired_kl=0.008, entropy_coef=0.0,
         ),
     )
-    return asdict(cfg)
+    config = asdict(cfg)
+    # 悬空力旋量观测平滑正则，抑制策略对自身惯性力/振动的反应
+    config["algorithm"].update(class_name="insertion.ppo:SmoothPPO", smooth_coef=0.0125,
+                               smooth_force_std=0.5, smooth_moment_std=0.05)
+    return config

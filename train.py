@@ -22,6 +22,7 @@ from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils.logger import Logger
 
 from insertion import InsertionCfg, InsertionEnv, TRAIN_SHAPES, runner_config
+from insertion.config import REAL2SIM_FIELDS
 from insertion.curriculum import adaptive_environment_counts
 from insertion.env import capture_graph
 
@@ -154,6 +155,25 @@ def contract(cfg: InsertionCfg) -> dict:
         "translation_limit_m": cfg.translation_limit,
         "rotation_component_limit_rad": cfg.rotation_limit,
         "target_composition": "p_target=p_current+dp; q_target=Exp(dr)*q_current",
+        "target_lowpass": {
+            "enabled": cfg.target_lowpass,
+            "deployment_required": cfg.target_lowpass,
+            "requirement": (
+                "deployment MUST pass every policy target through this identical low-pass before the "
+                "impedance controller; omitting or retuning it is outside the training distribution"
+                if cfg.target_lowpass else "none; targets go directly to the impedance controller"),
+            "training_off_probability": cfg.target_lowpass_off_probability,
+            "training_off_model": (
+                "per episode: translation follows a second-order response with wn=min(sqrt(k/m_apparent), 100) "
+                "and the impedance damping ratio; rotation steps directly; deployment should still use the low-pass"),
+            "form": "critically damped second order per component: a = wn^2*(target-x) - 2*wn*v",
+            "translation_natural_frequency_rad_s": cfg.target_lowpass_translation_rad_s,
+            "rotation_natural_frequency_rad_s": cfg.target_lowpass_rotation_rad_s,
+            "rotation_error": "rotation vector of target * inverse(filtered), H frame, left-multiplied update",
+            "input": "latest 50 Hz target held between policy ticks",
+            "reset": "filtered pose = measured nominal-tip pose, zero velocity, at each policy start",
+            "simulation_integration": "1 kHz semi-implicit Euler",
+        },
         "nominal_body_to_tip_m": [0, 0, -0.05 * cfg.scale],
         "nominal_body_to_sensor_m": [0, 0, 0.03 * cfg.scale],
         "filter_seconds": cfg.filter_seconds,
@@ -206,7 +226,7 @@ def contract(cfg: InsertionCfg) -> dict:
         "plate_outer_radius_m": cfg.plate_outer_radius_m,
         "plate_coverage": "minimum outer inradius; zero retains legacy footprint",
         "workspace_z_low_m": -cfg.hole_depth_m * cfg.scale,
-        "workspace_z_high_m": 0.03 * cfg.scale,
+        "workspace_z_high_m": cfg.workspace_z_max_m * cfg.scale,
         "max_tilt_rad": 0.6108652381980153,
         "hidden_state": [2, "batch", 128],
         "training_shapes": list(cfg.shapes),
@@ -223,12 +243,10 @@ def contract(cfg: InsertionCfg) -> dict:
         "target_depth_bounds_m": list(cfg.target_depth_bounds_m),
         "target_depth_sampling": "uniform per episode" if cfg.fixed_target_depth_m is None else "fixed",
         "depth_success": "reach or exceed target, with existing 0.2 mm tolerance",
-        "success_alignment_required": cfg.success_alignment_required,
         "success_opening_required": cfg.success_opening_required,
         "success_opening": "true physical bottom-center XY inside hole outline, inclusive boundary; circle analytic",
         "success_hold_steps": cfg.success_hold_steps,
         "success_safety_priority": True,
-        "preinsertion_tilt_weight": 0.0,
         "xy_cost_radius_fraction": cfg.xy_cost_radius_fraction,
         "xy_outer_cost_weight": cfg.xy_outer_cost_weight,
         "inserted_load_cost": {
@@ -256,9 +274,66 @@ def contract(cfg: InsertionCfg) -> dict:
         },
         "actuator_stiction_deadband": {
             "force_max_n": cfg.stiction_force,
+            "force_z_max_n": cfg.stiction_force if cfg.stiction_force_z is None else cfg.stiction_force_z,
             "moment_max_nm": cfg.stiction_moment,
+            "moment_xy_max_nm": (
+                cfg.stiction_moment if cfg.stiction_moment_xy is None else cfg.stiction_moment_xy),
+            "sampling": "independent uniform [0, max] per axis in the gain frame, per episode",
+            "reference_stiffness_n_per_m": cfg.stiction_reference_stiffness,
+            "stiffness_scaling": "translational deadband times min(1, k / reference_stiffness); none if null",
             "difficulty_scaled": True,
             "nominal_disabled": True,
+        },
+        "plant_randomization": {
+            "equivalent_mass_kg": [cfg.mass_min_kg, cfg.mass_max_kg],
+            "mass_sampling": (
+                "apparent impedance mass, log-uniform per episode; MuJoCo body stays 0.7-1.5 kg and "
+                "receives (body - apparent) * low-pass target acceleration feedforward; damping uses body mass "
+                "and acts on velocity relative to the low-pass target"
+                if cfg.target_lowpass else "legacy: apparent mass equals MuJoCo body mass 0.7-1.5 kg"),
+            "damping_ratio": [cfg.damping_ratio_min, cfg.damping_ratio_max],
+            "downstream_sensor_mass_kg": [cfg.down_mass_min_kg, cfg.down_mass_max_kg],
+            "downstream_inertial_load": (
+                "minus rigid-body inertial wrench of the downstream part (mass at offset COM, rod inertia), "
+                "measured at the wrist sensor, in actor wrench"),
+            "sensor_to_tip_m": (None if cfg.sensor_tip_min_m is None
+                                else [cfg.sensor_tip_min_m, cfg.sensor_tip_max_m]),
+            "downstream_com_below_sensor_fraction": [cfg.com_fraction_min, cfg.com_fraction_max],
+            "downstream_com_lateral_m": cfg.com_lateral_m,
+            "plate_friction": [cfg.plate_friction_min, cfg.plate_friction_max],
+            "action_delay_policy_frames": [0, 1, 2],
+            "rotation_pivot_max_m": cfg.rotation_pivot_max_m,
+            "rotation_pivot_coupling": "tip target += cross(pivot_offset, dr); isotropic pivot direction",
+            "stick_slip_peak_to_peak_max_m": cfg.stick_slip_max_pp_m,
+            "stick_slip_frequency_hz": [cfg.stick_slip_min_hz, cfg.stick_slip_max_hz],
+            "stick_slip": "sinusoidal horizontal impedance-target offset, always active, per episode",
+            "step_wrench_bias": {
+                "rate_per_second": cfg.step_bias_rate_per_second,
+                "force_magnitude_n": [cfg.step_force_bias_min_n, cfg.step_force_bias_max_n],
+                "moment_magnitude_nm": [cfg.step_moment_bias_min_nm, cfg.step_moment_bias_max_nm],
+                "sampling": "at most one isotropic step per episode, persists until reset; actor only",
+            },
+        },
+        "action_change_cost_per_second": cfg.action_change_cost_per_second,
+        "hard_state_reset": {
+            "probability": cfg.hard_state_reset_probability,
+            "training_only": True,
+            "buffer": ("per-shape ring of 4096 true-tip poses sampled from in-contact, not-yet-at-goal states "
+                       "after >=0.5 s of an episode; 8 random environments probed per policy step"),
+            "restore": ("true tip pose and orientation only; fresh episode randomization, zero velocity, "
+                        "zero GRU state; lifted above new rough terrain unless inside the hole opening"),
+        },
+        "free_air_action_change_cost_per_second": cfg.free_air_action_change_cost_per_second,
+        "action_change_contact": "privileged true constraint force > 0.05 N within the 20 ms step",
+        "motion_vibration_wrench": {
+            "force_std_n": [cfg.vibration_force_min_n, cfg.vibration_force_max_n],
+            "frequency_hz": [cfg.vibration_min_hz, cfg.vibration_max_hz],
+            "damping_ratio": [0.1, 0.3],
+            "moment_arm_m": cfg.vibration_moment_arm_m,
+            "motion_scaling": ("min(1, (|v_cmd| + arm*|omega_cmd|) / speed_ref) from low-pass target velocity "
+                               "(actual tip velocity without low-pass); zero while in true contact"),
+            "speed_ref_mps": cfg.vibration_speed_ref_mps,
+            "sampling": "independent AR(2) resonator per axis at 50 Hz, per-episode frequency/amplitude; actor only",
         },
         "hole_wall_axial_friction": {
             "force_max_n": cfg.wall_friction_force,
@@ -268,7 +343,6 @@ def contract(cfg: InsertionCfg) -> dict:
         },
         "action_cost_cap": cfg.action_cost_cap,
         "load_cost_cap": cfg.load_cost_cap,
-        "overload_cost_per_second": cfg.overload_cost_per_second,
         "stagnation_cost_per_second": cfg.stagnation_cost_per_second,
         "workspace_z_max_m": cfg.workspace_z_max_m,
         "rough_low_spawn_prob": cfg.rough_low_spawn_prob,
@@ -508,12 +582,8 @@ class ContinuousRunner(OnPolicyRunner):
             return
         saved = self.alg.save()
         saved["iter"] = self.current_learning_iteration
-        environment = dict(self.metadata["environment"])
-        environment.pop("preinsertion_tilt_weight", None)
         saved["infos"] = {
             **self.metadata,
-            "environment": environment,
-            "contract": {**self.metadata["contract"], "preinsertion_tilt_weight": 0.0},
             "progress": {"policy_steps": self.env.policy_steps,
                          "transitions": self.env.total_transitions},
         }
@@ -635,7 +705,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                 env.noise_curriculum.load_state_dict(saved["infos"]["noise_curriculum_state"])
                 previous_cfg = InsertionCfg.from_checkpoint(source_cfg)
                 changed_fields = (
-                    "success_alignment_required", "success_hold_steps", "success_opening_required",
+                    "success_hold_steps", "success_opening_required",
                     "position_observation_delay", "inserted_load_cost", "inserted_load_depth_m",
                     "workspace_xy_radius_m", "plate_outer_radius_m", "initial_xy",
                     "force_bias", "moment_bias", "wrench_bias_distribution", "wrench_hysteresis_fraction",
@@ -647,16 +717,15 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "stagnation_cost_per_second", "stagnation_window_seconds",
                     "stagnation_speed_threshold_mps", "surface_z_free_m",
                     "xy_cost_radius_fraction", "xy_outer_cost_weight",
-                    "load_cost_cap", "overload_cost_per_second", "terminate_on_overload",
+                    "load_cost_cap", "terminate_on_overload",
                     "enable_timeout", "rough_surface", "rough_max_amplitude_m",
                     "rough_wavelength_min_m", "rough_wavelength_max_m",
                     "action_cost_cap",
-                    "initial_z_min", "initial_z_max",
-                    "initial_tilt", "initial_yaw", "initial_plane_margin",
+                    "initial_z_min", "initial_tilt", "initial_yaw", "initial_plane_margin",
+                    *REAL2SIM_FIELDS, "mass_max_kg", "damping_ratio_max", "down_mass_min_kg",
+                    "plate_friction_max",
                 )
-                if (source_cfg.get("preinsertion_tilt_weight", 0.0) != 0.0
-                        or any(getattr(previous_cfg, key) != getattr(cfg, key)
-                               for key in changed_fields)):
+                if any(getattr(previous_cfg, key) != getattr(cfg, key) for key in changed_fields):
                     for window in env.noise_curriculum.windows.values():
                         window.clear()
                     logging.warning("Initial pose, observation/reward contract or success criteria changed; retaining curriculum level, clearing windows.")
@@ -979,11 +1048,11 @@ def main() -> None:
     parser.add_argument("--align-goal-z-to-observation",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="shift commanded goal Z by upright longitudinal offset (h + Z)")
-    parser.add_argument("--stagnation-cost-per-second", type=float, default=0.0,
+    parser.add_argument("--stagnation-cost-per-second", type=float, default=2.0,
                         help="running penalty per second when pre-goal smoothed tip speed stagnates")
     parser.add_argument("--xy-outer-cost-weight", type=float, default=0.2,
                         help="convex weight in [0, 1] on bounded smooth outer XY radial slope")
-    parser.add_argument("--action-cost-cap", type=float, default=4.0,
+    parser.add_argument("--action-cost-cap", type=float, default=12.0,
                         help="smooth tanh saturation scale for action and action-change costs")
     parser.add_argument("--adaptive-sampling", action="store_true",
                         help="supervised continuous training: gently rebalance shape environments")

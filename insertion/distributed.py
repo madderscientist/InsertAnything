@@ -18,13 +18,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.multiprocessing.spawn import ProcessContext, spawn
 from tensordict import TensorDict
-from rsl_rl.algorithms import PPO
 from rsl_rl.models import RNNModel
 from rsl_rl.modules.normalization import EmpiricalNormalization
 from rsl_rl.utils import check_nan
 
 from .config import InsertionCfg
 from .env import InsertionEnv
+from .ppo import SMOOTH_PPO, SmoothPPO
 from train import (ContinuousRunner, LiveInsertionEnv, TrainingStopped, atomic_json,
                    load_recovery_checkpoint, resume_training)
 
@@ -41,7 +41,7 @@ def validate_layout(metadata: dict, device: str) -> int:
             or any(n % world_size for n in cfg.environment_counts)
             or sum(cfg.environment_counts)//world_size % 4):
         raise ValueError("each rank must have whole shape shards and an environment count divisible by four")
-    if metadata["runner"]["algorithm"]["class_name"] != "PPO" or any(
+    if metadata["runner"]["algorithm"]["class_name"] not in ("PPO", SMOOTH_PPO) or any(
             metadata["runner"][key]["class_name"] != "RNNModel" for key in ("actor", "critic")):
         raise ValueError("distributed insertion training requires the existing recurrent PPO configuration")
     return world_size
@@ -73,7 +73,7 @@ def global_advantages(raw: torch.Tensor) -> torch.Tensor:
     return (raw-mean.to(raw.dtype))/(variance.sqrt().to(raw.dtype)+1e-8)
 
 
-class SharedPPO(PPO):
+class SharedPPO(SmoothPPO):
     def compute_returns(self, obs: TensorDict) -> None:
         super().compute_returns(obs)
         if not self.normalize_advantage_per_mini_batch:

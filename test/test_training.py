@@ -18,7 +18,6 @@ from rsl_rl.models import RNNModel
 
 from export_policy import OfflinePolicy, export_onnx
 from evaluate import load_checkpoint
-from migrate_policy_std import migrate_checkpoint
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv, SuccessNoiseCurriculum, runner_config
 from insertion.distributed import run_distributed, validate_layout
 from train import (ContinuousRunner, GroupedLogger, LiveInsertionEnv, TrainingStopped,
@@ -64,94 +63,6 @@ class PolicyAndViewerTests(unittest.TestCase):
         cfg.pop("class_name")
         obs = TensorDict({"actor": torch.zeros(2, 13)}, [2])
         self.actor = RNNModel(obs, {"actor": ["actor"]}, "actor", 6, **cfg).eval()
-
-    def test_state_dependent_std_migration_and_optimizer(self):
-        config = runner_config()
-        config["actor"]["distribution_cfg"]["class_name"] = "GaussianDistribution"
-        actor_config = prepare_runner_config(config)["actor"]
-        actor_config.pop("class_name")
-        obs = TensorDict({"actor": torch.randn(2, 13)}, [2])
-        old = RNNModel(obs, {"actor": ["actor"]}, "actor", 6, **actor_config)
-        critic = torch.nn.Parameter(torch.ones(1))
-        optimizer = torch.optim.Adam([*old.parameters(), critic])
-        sum(p.square().sum() for p in [*old.parameters(), critic]).backward()
-        optimizer.step()
-        cfg = InsertionCfg(adaptive_sampling=True, noise_curriculum=True,
-                           noise_curriculum_mode="success", shape_env_counts=(8, 12, 16, 20, 24))
-        saved = {
-            "actor_state_dict": old.state_dict(), "critic_state_dict": {"weight": critic.detach()},
-            "optimizer_state_dict": optimizer.state_dict(), "iter": 10,
-            "infos": {"runner": config, "environment": asdict(cfg), "contract": contract(cfg),
-                      "noise_curriculum_state": {"level": 9},
-                      "adaptive_sampling_state": {"failures": [1.] * 5}}}
-        migrated = migrate_checkpoint(saved)
-        self.actor.load_state_dict(migrated["actor_state_dict"], strict=True)
-        self.assertFalse(any(name.startswith("distribution.")
-                             for name, _ in self.actor.named_parameters()))
-        self.assertNotIn("distribution.log_std_param", migrated["actor_state_dict"])
-        old_std_id = optimizer.state_dict()["param_groups"][0]["params"][0]
-        self.assertNotIn(old_std_id, migrated["optimizer_state_dict"]["state"])
-        self.assertNotIn(old_std_id, migrated["optimizer_state_dict"]["param_groups"][0]["params"])
-        with tempfile.TemporaryDirectory() as folder:
-            checkpoint = Path(folder) / "checkpoint.pt"
-            torch.save(migrated, checkpoint)
-            metadata, loaded = load_checkpoint(checkpoint, "cpu")
-            self.assertEqual(tuple(metadata["runner"]["actor"]["distribution_cfg"]["std_range"]),
-                             (0.02, 1.0))
-            self.assertEqual(metadata["runner"]["actor"]["distribution_cfg"]["class_name"],
-                             "HeteroscedasticGaussianDistribution")
-            self.assertEqual(type(loaded.distribution).__name__, "HeteroscedasticGaussianDistribution")
-        old.eval()
-        self.actor.eval()
-        for _ in range(5):
-            obs["actor"] = torch.randn(2, 13)
-            torch.testing.assert_close(self.actor(obs), old(obs))
-        old.reset()
-        self.actor.reset()
-        old(obs, stochastic_output=True)
-        self.actor(obs, stochastic_output=True)
-        torch.testing.assert_close(self.actor.distribution.std, old.distribution.std)
-        self.assertEqual(migrated["infos"]["noise_curriculum_state"]["level"], 0)
-        self.assertNotIn("adaptive_sampling_state", migrated["infos"])
-        self.assertEqual(migrated["infos"]["environment"]["shape_env_counts"], ())
-        self.assertEqual(saved["infos"]["noise_curriculum_state"]["level"], 9)
-        restarted = migrate_checkpoint(saved, initial_std=0.1, noise_level=1)
-        self.actor.load_state_dict(restarted["actor_state_dict"])
-        self.actor.reset()
-        self.actor(obs, stochastic_output=True)
-        torch.testing.assert_close(self.actor.distribution.std, torch.full((2, 6), 0.1))
-        self.actor.zero_grad()
-        self.actor.distribution.std.sum().backward()
-        head = [layer for layer in self.actor.mlp.modules()
-                if isinstance(layer, torch.nn.Linear)][-1]
-        self.assertGreater(head.weight.grad[6:].abs().sum().item(), 0.)
-        self.assertGreater(head.bias.grad[6:].abs().sum().item(), 0.)
-        self.assertEqual(restarted["infos"]["noise_curriculum_state"]["level"],
-                         len(cfg.active_clearance_levels))
-        for kwargs in ({"initial_std": 0.001}, {"initial_std": float("nan")},
-                       {"noise_level": -1}, {"noise_level": 11}):
-            with self.assertRaises(ValueError):
-                migrate_checkpoint(saved, **kwargs)
-        self.actor.load_state_dict(migrated["actor_state_dict"])
-        self.actor.reset()
-        self.actor.zero_grad()
-        self.actor(obs, stochastic_output=True)
-        new_optimizer = torch.optim.Adam([*self.actor.parameters(), critic])
-        new_optimizer.load_state_dict(migrated["optimizer_state_dict"])
-        old_parameters = dict(old.named_parameters())
-        for name, parameter in self.actor.named_parameters():
-            moment = new_optimizer.state[parameter]["exp_avg"]
-            expected = optimizer.state[old_parameters[name]]["exp_avg"]
-            if moment.shape != expected.shape:
-                torch.testing.assert_close(moment[:6], expected)
-                self.assertEqual(moment[6:].count_nonzero(), 0)
-            else:
-                torch.testing.assert_close(moment, expected)
-        self.actor.distribution.std.sum().backward()
-        new_optimizer.step()
-        self.actor.reset()
-        self.actor(obs, stochastic_output=True)
-        self.assertTrue(torch.isfinite(self.actor.distribution.log_prob(torch.zeros(2, 6))).all())
 
     def test_state_dependent_std_bounds_and_kl(self):
         distribution = self.actor.distribution
@@ -471,41 +382,23 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                            ("stiction_force", 0.0), ("stiction_moment", 0.0),
                            ("wall_friction_force", 0.0), ("action_cost_cap", 1.0),
                            ("xy_outer_cost_weight", 0.0),
-                           ("load_cost_cap", 1.0), ("overload_cost_per_second", 0.0),
-                           ("terminate_on_overload", True),
-                           ("success_alignment_required", True), ("success_hold_steps", 6),
+                           ("load_cost_cap", 1.0), ("terminate_on_overload", True),
+                           ("success_hold_steps", 6),
                            ("position_observation_delay", False), ("inserted_load_cost", False),
                            ("inserted_load_depth_m", .006),
                            ("workspace_xy_radius_m", .04), ("plate_outer_radius_m", 0.),
                            ("wrench_bias_distribution", "per_axis"),
                            ("wrench_hysteresis_fraction", 0.),
-                           ("success_opening_required", False)):
+                           ("success_opening_required", False),
+                           ("target_lowpass", True), ("stiction_force_z", 3.0)):
             changed = InsertionCfg.from_checkpoint({**asdict(cfg), key: value})
             with self.assertLogs(level="WARNING"):
                 restore_environment_progress(env, changed, saved, 2)
             self.assertEqual(curriculum.level, 4)
             self.assertTrue(all(not w for w in curriculum.windows.values()))
         del saved["infos"]["environment"]["initial_z_min"]
-        del saved["infos"]["environment"]["initial_z_max"]
         restore_environment_progress(env, cfg, saved, 3)
         self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
-
-        saved["infos"]["environment"]["preinsertion_tilt_weight"] = 0.5
-        with self.assertLogs(level="WARNING"):
-            restore_environment_progress(env, cfg, saved, 4)
-        self.assertEqual(curriculum.level, 4)
-        self.assertTrue(all(not w for w in curriculum.windows.values()))
-
-        saved["infos"]["environment"]["preinsertion_tilt_weight"] = 0.0
-        restore_environment_progress(env, cfg, saved, 5)
-        self.assertTrue(all(len(w) == 999 for w in curriculum.windows.values()))
-        del saved["infos"]["environment"]["preinsertion_tilt_weight"]
-
-        saved["infos"]["environment"].pop("success_alignment_required")
-        with self.assertLogs(level="WARNING"):
-            restore_environment_progress(env, cfg, saved, 6)
-        self.assertEqual(curriculum.level, 4)
-        self.assertTrue(all(not w for w in curriculum.windows.values()))
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_biased_nonuniform_ppo_checkpoint_resume(self):
@@ -517,6 +410,7 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                            physics_cuda_graph=True, observation_cuda_graph=True)
         config = runner_config(4)
         config["save_interval"] = 1
+        config["algorithm"].update(class_name="insertion.ppo:SmoothPPO", smooth_coef=0.05)
         metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg)}
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

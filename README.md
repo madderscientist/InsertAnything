@@ -2,9 +2,8 @@
 
 本项目使用 `mjlab` 批量 MuJoCo GPU 仿真与双层 GRU 循环 PPO，训练**单一策略网络**同时完成三角形、方形、正五边形、正六边形和 L 形的高精度力控插孔，并在未见过的圆形孔上检验零样本泛化能力。
 
-奖励函数、运行成本上界与终止判据详见 [REWARD.md](./REWARD.md)。
+奖励函数、运行成本上界与终止判据详见 [REWARD.md](./REWARD.md)；真机适配见第 6 节。
 
-观测误差消融及限制见 [OBSERVATION_ERROR_ANALYSIS.md](./OBSERVATION_ERROR_ANALYSIS.md)。
 方形和 L 形使用 box 组合，其他多边形使用凸 mesh。仿真容量
 `nconmax/njmax=64/256`，圆形为 `512/2048`；接触池按同组环境数共享。
 
@@ -18,7 +17,7 @@
 | **控制自由度** | **假 6 轴、实 4 轴**：虽然声明 6 维动作空间，但在 `_apply_action` 中每步硬编码覆盖 `roll = π, pitch = 0`，强行锁死两个倾角自由度，不允许插头发生任何倾斜 | **真 6 自由度全姿态控制**：开放完整三维平移 + 三维旋转增量控制，初始状态即包含 `±3°` 随机倾角，配合 6 轴各向异性阻抗控制、刚度主轴随机旋转与时变刚度游走 |
 | **多形状泛化与观测作弊** | **一形状一模型 + 观测预折叠**：每个形状与公差单独训练一个网络；且在输入给 Actor 前先用已知几何的 `symmetry_angles_deg` 将相对四元数折叠到最近对称轴 | **单一权重通吃 5 种形状 + 未见圆形测试**：Actor 严格只接收 **13 维物理观测**，不输入形状 ID，也不对 Actor 观测做对称性折叠，完全依靠双层 GRU 从接触力旋量历史中隐式推断几何约束 |
 | **力觉传感器物理** | 仅读取 3 维线性接触力（无力矩），关闭重力且忽略传感器下游质量惯性与陀螺力矩；在多个任务配置中甚至默认关闭了力观测 | **完整 6 轴腕部力/力矩传感器建模**：建模接触载荷减去下游质量加速度与陀螺力矩，经低通滤波后从腕部变换至名义尖端（$M_T = M_S - r_{ST}\times F_S$），并叠加传感器安装角误差、尖端标定误差与真实夹持偏移 |
-| **成功与安全标准** | 成功判据硬编码为 `xy_dist < 2.5 mm`（远大于孔间隙）、仅固定插到底部、无倾角与过载检查，且单步擦边即记为成功 | **随机目标深度 + 深度保持判据**：目标深度每回合在 `5–22.5 mm` 随机采样；真实尖端达到目标深度（允许浅 `0.2 mm`）并**连续保持 5 步**，不额外要求 XY/倾角/偏航对齐，依赖孔壁物理约束；峰值力 `> 30 N` 或力矩 `> 2 N·m` 触发 `-200` 安全失败终止 |
+| **成功与安全标准** | 成功判据硬编码为 `xy_dist < 2.5 mm`（远大于孔间隙）、仅固定插到底部、无倾角与过载检查，且单步擦边即记为成功 | **随机目标深度 + 深度保持判据**：目标深度每回合在 `5–22.5 mm` 随机采样；真实尖端达到目标深度（允许浅 `0.2 mm`）并**连续保持 5 步**，不额外要求 XY/倾角/偏航对齐，依赖孔壁物理约束；峰值力 `> 30 N` 或力矩 `> 2 N·m` 施加过载惩罚，越界触发 `-800` 安全失败终止 |
 | **课程学习机制** | 无自动课程，依赖人工拆分为 `_I (2 mm)`、`_II (0.5 mm)`、`_III (0.1 mm)` 等独立配置分别调参 | **全自动孔间隙 + 难度 + 噪声课程**：从 `2.0 mm` 孔间隙自动按五种形状 `80%` 成功率逐级收紧至 `0.1 mm`，同步提升初始位姿/刚度难度，达标后再逐级开启全量传感器与标定噪声 |
 
 
@@ -204,24 +203,11 @@ X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
 - **动作语义**：输出 `H` 系下无裁剪的三维平移与三维旋转向量；分别乘以 `1 mm` 与 `0.5°` 的每分量尺度，以估计名义尖端为旋转中心合成下一策略周期的阻抗目标：
   $$p_{\mathrm{target}} = p_{\mathrm{current}} + \Delta p, \qquad q_{\mathrm{target}} = \mathrm{Exp}(\Delta r) \otimes q_{\mathrm{current}}$$
 
-旧运行不会自动切换分布。安全停止后，可迁移到**新的输出目录**，保留原运行用于对照和回退：
-
-```bash
-python migrate_policy_std.py runs/continuous_single/checkpoint.pt \
-  --output runs/continuous_state_std
-python train.py --resume --output runs/continuous_state_std --device cuda:0
-```
-
-迁移保留均值策略、GRU、归一化、Critic、进度及兼容的优化器状态；
-std 新权重置零、偏置继承旧 `log_std`，新增优化器矩置零，删除旧全局 std。
-课程和采样历史重置，环境均分。可选 `--initial-std 0.1 --noise-level 1`
-指定初始 std 和 10% 噪声；省略时继承旧 std，从课程 0 开始。迁移收益需另行评估。
-
 ### 4.2 参数化凸几何与物理模型
 - **几何构建**（[insertion/geometry.py](./insertion/geometry.py)）：无需外部 USD 资产，程序化生成正三角形、方形、正五边形、正六边形、L 形及测试用圆形。正多边形外接圆半径 `10 mm`，L 形包络 `20 mm`，孔深 `25 mm`，插头长 `35 mm`。孔壁拆分为独立凸棱柱以保持中心孔贯通，L 形插头拆分为双盒体保留凹口。
   圆孔默认自适应选择边数，也可通过 `InsertionCfg.circle_sides` 显式指定；圆柱插头不变。`clearance` 为总间隙（直径差），例如 `0.0002 m`、64 边形圆孔的最小实际单侧间隙约为 `87.95 μm`；过低边数导致几何干涉时会报错。该配置不影响其他形状。
 - **形状定义**（[insertion/shapes/](./insertion/shapes/)）：每种形状一个文件，集中定义插头与孔板的截面、碰撞体和对称性；通用场景组装仍由几何模块负责。`get_shape(name).mirror_axis_xy` 是孔坐标系中穿过原点的镜像轴方向，例如 `(0, 1)` 表示 `x → −x`，L 形用 `(1, 1)` 表示 `x ↔ y`。维护注册表时不要重排已有形状，顺序决定 Critic 的形状通道和随机种子偏移。
-- **传感器动力学**（[insertion/env.py](./insertion/env.py)）：关闭重力代表理想重力补偿。腕部传感器测量外部接触载荷减去传感器下游质量加速度与陀螺力矩，经时间常数 `15 ms` 的一阶低通滤波后搬移至名义尖端。
+- **传感器动力学**（[insertion/env.py](./insertion/env.py)）：关闭重力代表理想重力补偿。腕部传感器位于尖端上方 8–16 cm（real2sim 18–22 cm），测量外部接触载荷减去下游刚体（0.4–0.9 kg、质心在传感器下方 0.3–0.6 倍距离并横向偏移 ±5 mm、细杆惯量）的惯性力旋量，经时间常数 `15 ms` 的一阶低通滤波后搬移至名义尖端。
 - **各向异性阻抗与时变游走**：支持 `train`、`nominal`、`soft`、`stiff` 四种动力学模式。训练模式下刚度主轴随机旋转，且刚度在回合初始值 `±10%` 范围内每秒采样局部目标并以 `1 s` 时间常数平滑游走（变化率上限 `5%/s`）。
 - **CUDA Graph 加速**：`--physics-cuda-graph` 分别捕获动作处理、完整 20 个物理子步、奖励/终止计算及重置时的模型常量重计算；`--observation-cuda-graph` 捕获确定性观测变换。保持 `1000 Hz` 物理步长和逐子步控制/传感器更新；有限值检查、随机采样、动态重置和课程推进仍在图外。预热后捕获，模型重建后重新捕获，返回张量不受后续重放覆盖。启用 mjlab NaN 调试守卫时保留逐子步调用以执行调试回调。单卡与多卡各 rank 共用优化路径，多卡端到端收益尚未实测。
 
@@ -237,11 +223,14 @@ std 新权重置零、偏置继承旧 `log_std`，新增优化器矩置零，删
 ### 4.4 当前训练与独立诊断
 
 运行参数以对应 `config.json` 和 checkpoint 为准，不以代码默认值推断历史训练。
-普通入口不启用失败池、随机意图或恢复课程；独立恢复试验见
-[RECOVERY_EXPERIMENT.md](./RECOVERY_EXPERIMENT.md)。
-观测消融入口为 [evaluate_noise_ablation.py](./evaluate_noise_ablation.py)，
-结果及限制见 [OBSERVATION_ERROR_ANALYSIS.md](./OBSERVATION_ERROR_ANALYSIS.md)；
-oracle 对照不代表部署能力。
+
+第二阶段 [train_rough_surface.py](./train_rough_surface.py) 在孔口外侧铺设随机凹凸微砖块并取消超时，训练自主越障与脱困：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 micromamba run -n mj python -u train_rough_surface.py \
+  --output runs/rough_surface_no_timeout \
+  --source-checkpoint runs/continuous_single/checkpoint.pt --device cuda:0
+```
 
 ## 5. 离线推理接口
 
@@ -266,4 +255,32 @@ from export_policy import OfflinePolicy
 policy = OfflinePolicy(Path("runs/export"))
 policy.reset()  # 每个新回合开始或异常中止后重置 GRU 隐状态
 p_target, q_target = policy.step(p_tip, q_tool, p_goal, q_goal, wrench_tip)
+```
+
+## 6. real2sim 真机适配
+
+[real2sim/](./real2sim/) 从已部署 checkpoint 续训，将 `REAL2SIM_VALUES`（[insertion/config.py](./insertion/config.py)）的实测对象参数覆盖到源配置；第一阶段默认不启用部署低通及下列对象非理想性；观测 13 维、动作 6 维与契约坐标约定不变，旧检查点缺字段时由 `InsertionCfg.from_checkpoint` 恢复历史行为。主要建模：
+
+- **部署目标低通**：临界阻尼二阶（平移 30、转动 50 rad/s）写入 contract；表观质量 0.08–1.5 kg 对数均匀，经低通加速度前馈复现；按 `target_lowpass_off_probability` 随机关闭低通，此时平移按 $\min(\sqrt{k/m},100)$ rad/s 的轻质量响应追阶跃。
+- **对象非理想性**：Z 向与 XY 转动独立静摩擦死区、转动→平移杠杆耦合、接触粘滑、阶跃力旋量零偏、由自身运动激发且仅在悬空时存在的 2–10 Hz 窄带振动力，以及上节传感器几何与下游惯性力。
+- **训练**：从难点状态（贴板、孔口卡滞、半插入）重置；悬空/接触动作变化成本 0.6/0.2；`SmoothPPO` 系数由监控在 0.0125–0.05 间自动调整。
+- **第一阶段已并入的通用平滑手段**：悬空/接触动作变化成本 0.5/0.1、动作成本饱和尺度 12、安全罚分 800、传感器几何与下游惯性力、悬空振动噪声（随噪声课程缩放），以及 [insertion/ppo.py](./insertion/ppo.py) 的 `SmoothPPO`（仅在悬空步扰动力旋量观测并惩罚动作均值变化，系数 0.0125）。
+
+```bash
+# 从部署 checkpoint 准备并启动守护式续训
+micromamba run -n mj python -m real2sim.train_real2sim \
+  --source runs/releases/stage2-outer-xy-best-961/checkpoint.pt \
+  --output runs/real2sim/stage10 --envs-per-shape 1024 --steps 128
+
+# 每小时健康巡检：存活/停滞重启、开/关低通两档实机评估、最佳保存、停滞/过慢/退化自动调参与回滚
+nohup setsid micromamba run -n mj python -m real2sim.monitor --run runs/real2sim/stage10 &
+
+# 实机档评估（固定实测对象参数；--lowpass-off 评估无低通部署）
+micromamba run -n mj python -m real2sim.evaluate_real2sim \
+  baseline=runs/releases/stage2-outer-xy-best-961/checkpoint.pt \
+  new=runs/real2sim/stage10/best_real_checkpoint.pt --output runs/real2sim/eval_real
+
+# 实机档策略回放
+micromamba run -n mj python viser_view.py --run-dir runs/real2sim/stage10 \
+  --mode policy --real-profile --ignore-overload --device cuda:0
 ```

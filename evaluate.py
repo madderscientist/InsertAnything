@@ -14,7 +14,7 @@ from tensordict import TensorDict
 
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv
 
-REASONS = {1: "success", 2: "wrench_limit", 3: "workspace", 4: "timeout"}
+REASONS = {1: "success", 2: "wrench_limit", 3: "workspace", 4: "timeout", 5: "simulation_failure"}
 
 
 def load_checkpoint(path: Path, device: str) -> tuple[dict, RNNModel]:

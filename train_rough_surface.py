@@ -63,7 +63,7 @@ class RoughLiveInsertionEnv(LiveInsertionEnv):
             tip = tip_pose(pos, q, group.offset)
             xy = torch.linalg.vector_norm(tip[:, :2], dim=-1)
             lowest_z = tip[:, 2] + group.minimum_peg_height_offset(q)
-            if cfg.inserted_load_cost and cfg.inserted_load_depth_m > 0:
+            if cfg.inserted_load_cost:
                 z_weight = (1.0 + tip[:, 2] / cfg.inserted_load_depth_m).clamp(0.0, 1.0)
             else:
                 z_weight = (tip[:, 2] >= 0.0).to(tip.dtype)
