@@ -32,14 +32,18 @@ def replay_index(elapsed: float, count: int) -> int:
 
 
 def replay_config(environment: dict, shape: str, zero_noise: bool = False,
-                  ignore_overload: bool = False, real_profile: bool = False) -> InsertionCfg:
+                  ignore_overload: bool = False, real_profile: bool = False,
+                  training_level: bool = False) -> InsertionCfg:
     cfg = InsertionCfg.from_checkpoint(environment)
     if real_profile:
         from real2sim.evaluate_real2sim import REAL_PROFILE
         cfg = replace(cfg, **REAL_PROFILE)
+    # training_level 保留训练态采样，由调用方按检查点课程等级设置难度、间隙与噪声
     cfg = replace(cfg,
                   shapes=(shape,), shape_env_counts=(), adaptive_sampling=False,
-                  envs_per_shape=1, training=False, terminate_on_overload=not ignore_overload)
+                  envs_per_shape=1, training=training_level,
+                  terminate_on_overload=cfg.terminate_on_overload if training_level else not ignore_overload,
+                  hard_state_reset_probability=0. if training_level else cfg.hard_state_reset_probability)
     if zero_noise:
         cfg = replace(cfg, noise_curriculum=False, noise_curriculum_mode="steps",
                       position_noise=0., rotation_noise=0., force_noise=0., moment_noise=0.,
@@ -53,9 +57,11 @@ class PolicyReplay:
     """Generate complete episodes separately, then display them at real-time speed."""
 
     def __init__(self, run_dir: Path, device: str, shape: str, zero_noise: bool = False,
-                 ignore_overload: bool = False, real_profile: bool = False):
+                 ignore_overload: bool = False, real_profile: bool = False,
+                 training_level: bool = False):
         self.run_dir, self.device, self.shape = run_dir, device, shape
         self.zero_noise, self.ignore_overload = zero_noise, ignore_overload
+        self.training_level = training_level
         self.real_profile = real_profile
         self.stop = threading.Event()
         self.lock = threading.Lock()
@@ -88,14 +94,20 @@ class PolicyReplay:
                 started = time.monotonic()
                 metadata, actor = load_checkpoint(self.run_dir / "checkpoint.pt", self.device)
                 cfg = replay_config(metadata["environment"], shape, self.zero_noise,
-                                    self.ignore_overload, self.real_profile)
+                                    self.ignore_overload, self.real_profile, self.training_level)
                 if env is None or current_cfg != cfg:
                     env = InsertionEnv(cfg, self.device)
                     current_cfg = cfg
-                else:
-                    env.groups[0].reset(torch.arange(1, device=self.device))
                 group = env.groups[0]
+                if self.training_level and env.noise_curriculum is not None:
+                    curriculum = env.noise_curriculum
+                    curriculum.level = metadata["noise_curriculum_state"]["level"]
+                    group.difficulty = curriculum.difficulty
+                    group.noise_scale = curriculum.scale if curriculum.noise_levels > 0 else 0.
+                    group.set_clearance(curriculum.clearance)
+                group.reset(torch.arange(1, device=self.device))
                 obs = env.get_observations()
+                actor.reset()
                 frames = []
                 reason = "timeout"
                 with torch.inference_mode():
@@ -1228,6 +1240,377 @@ def run_interactive(args: argparse.Namespace) -> None:
         server.stop()
 
 
+class EnvScene:
+    """按 GPU 仿真第 0 个世界的实际碰撞体渲染，包含逐回合形状参数与凸台"""
+
+    def __init__(self, server: viser.ViserServer | Any, group: Any):
+        self.server, self.group, self.model = server, group, group.model
+        tool = self.model.body("tool").id
+        self.peg_ids = set(np.flatnonzero(self.model.geom_bodyid == tool).tolist())
+        self.rim_ids = set(group.rim_geom_ids)
+        self.root = server.scene.add_frame(f"/env/{uuid4().hex}", show_axes=False)
+        self.handles: dict[int, Any] = {}
+        self.tip = server.scene.add_frame(f"{self.root.name}/tip", axes_length=0.006, axes_radius=0.0002)
+        self.goal = server.scene.add_frame(f"{self.root.name}/goal", axes_length=0.006, axes_radius=0.0002)
+        self.prior = server.scene.add_frame(f"{self.root.name}/prior", axes_length=0.004, axes_radius=0.0002)
+        self.wrench_frame = server.scene.add_frame(f"{self.root.name}/wrench", show_axes=False)
+        self.wrench_vectors = [server.scene.add_line_segments(
+            f"{self.wrench_frame.name}/{name}", vector_arrow(np.zeros(3)), color,
+            thickness=6., thickness_units="screen", position=(0., offset, 0.))
+            for name, color, offset in (("force", (255, 80, 60), 0.008), ("torque", (80, 140, 255), -0.008))]
+
+    def rebuild(self, frame: dict) -> None:
+        # 碰撞体尺寸逐回合改写，每回合按当前尺寸重建网格
+        size = self.group.sim.model.geom_size[0].detach().cpu().numpy().astype(np.float64)
+        for i in range(self.model.ngeom):
+            if self.model.geom_type[i] == mjtGeom.mjGEOM_BOX:
+                mesh = trimesh.creation.box(extents=2*size[i])
+            else:
+                mesh = geom_mesh(self.model, i)
+            rgba = self.model.geom_rgba[i]
+            opacity = 1.0 if i in self.peg_ids else 0.95 if i in self.rim_ids else 0.4
+            self.handles[i] = self.server.scene.add_mesh_simple(
+                f"{self.root.name}/geom_{i}", mesh.vertices, mesh.faces,
+                color=tuple(int(c*255) for c in rgba[:3]), opacity=opacity, side="double")
+        self.prior.position = frame["prior"]
+        self.goal.position = frame["goal"]
+        self.update(frame, static=True)
+
+    def update(self, frame: dict, static: bool = False) -> None:
+        with self.server.atomic():
+            for i, handle in self.handles.items():
+                if not static and i not in self.peg_ids:
+                    continue
+                position = frame["xpos"][i]
+                # 停放到远处的未启用碰撞体不显示
+                handle.visible = bool(np.linalg.norm(position) < 0.5)
+                q = np.empty(4)
+                mju_mat2Quat(q, np.ascontiguousarray(frame["xmat"][i].reshape(-1)))
+                handle.position = position
+                handle.wxyz = q
+            self.tip.position, self.tip.wxyz = frame["tip"], frame["q"]
+            self.wrench_frame.position = frame["tip"] + np.array([0.03, 0., 0.02])
+            self.wrench_frame.wxyz = frame["q"]
+            for handle, value, reference in zip(self.wrench_vectors, (frame["wrench"][:3], frame["wrench"][3:]),
+                                                (5., 0.1), strict=True):
+                vector = visible_wrench_vector(value, reference)
+                length = np.linalg.norm(vector)
+                # 撞击力可达数百牛，箭头长度截断在 6 cm
+                handle.points = vector_arrow(vector*min(1., 0.06/max(length, 1e-12)))
+
+    def remove(self) -> None:
+        self.root.remove()
+
+
+def run_env_interactive(args: argparse.Namespace) -> None:
+    """GPU 单环境逐步实时仿真：物理、观测与训练完全一致，回合参数可在 GUI 中覆盖"""
+    from evaluate import load_checkpoint, REASONS
+    from insertion import InsertionEnv
+    from insertion.env import LOWPASS_OFF_MAX_RAD_S
+    from insertion.shapes.base import ScaledPolygonShape
+
+    torch.set_num_threads(1)
+    device = args.device
+    ckpt_path = args.run_dir / "checkpoint.pt"
+
+    def load_policy():
+        saved = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        metadata, actor = load_checkpoint(ckpt_path, device)
+        return int(saved["iter"]), metadata, actor
+
+    ckpt_iter, metadata, actor = load_policy()
+    base = InsertionCfg.from_checkpoint(metadata["environment"])
+    level = metadata.get("noise_curriculum_state", {}).get("level")
+    probe = replay_config(metadata["environment"], base.shapes[0], training_level=True)
+    env_cache: dict[str, Any] = {"env": None, "key": None, "scene": None}
+
+    def build_env(shape: str, terminate: bool):
+        key = (shape, terminate)
+        if env_cache["key"] != key:
+            if env_cache["scene"] is not None:
+                env_cache["scene"].remove()
+            cfg = replace(replay_config(metadata["environment"], shape, training_level=True),
+                          terminate_on_overload=terminate, enable_timeout=False)
+            env = InsertionEnv(cfg, device)
+            if env.noise_curriculum is not None and level is not None:
+                env.noise_curriculum.level = level
+            env_cache.update(env=env, key=key, scene=EnvScene(server, env.groups[0]))
+        return env_cache["env"], env_cache["scene"]
+
+    server = viser.ViserServer(host=args.host, port=args.port, label="Live GPU insertion")
+
+    @server.on_client_connect
+    def configure_camera(client: viser.ClientHandle) -> None:
+        client.camera.position = (0.05, -0.07, 0.06)
+        client.camera.look_at = (0., 0., -0.003)
+        client.camera.up_direction = (0., 0., 1.)
+
+    status_md = server.gui.add_markdown("正在构建 GPU 仿真环境...")
+    # 课程默认值取检查点当前等级
+    probe_env, _ = build_env(args.shape if args.shape in base.shapes else
+                             ("dual" if "dual" in base.shapes else base.shapes[0]), False)
+    curriculum = probe_env.noise_curriculum
+    default_clearance = (curriculum.clearance if curriculum is not None else base.clearance)*1000
+    default_difficulty = curriculum.difficulty if curriculum is not None else 1.
+    default_noise = (curriculum.scale if curriculum is not None and curriculum.noise_levels > 0
+                     else probe_env.groups[0].noise_scale)
+    mm = lambda value: round(value*1000/base.scale, 2)
+
+    with server.gui.add_folder("0. 运行控制", expand_by_default=True):
+        btn_run = server.gui.add_button("▶ 开始 / 继续", color="green")
+        btn_pause = server.gui.add_button("⏸ 暂停")
+        btn_step = server.gui.add_button("⏭ 单步（暂停时）")
+        btn_new = server.gui.add_button("🔄 新回合（按下方设置重新采样）")
+        gui_speed = server.gui.add_slider("播放速度倍率", min=0.05, max=2.0, step=0.05, initial_value=1.0)
+        gui_stochastic = server.gui.add_checkbox("按策略 std 随机采样动作", initial_value=False)
+        gui_auto = server.gui.add_checkbox("回合结束后自动开新回合", initial_value=False)
+        btn_reload = server.gui.add_button("重载最新 checkpoint")
+    with server.gui.add_folder("1. 课程与终止（新回合生效）", expand_by_default=True):
+        gui_shape = server.gui.add_dropdown("形状", options=base.shapes,
+                                            initial_value=env_cache["key"][0])
+        gui_clearance = server.gui.add_slider("间隙 (mm)", min=0.05, max=2.0, step=0.05,
+                                              initial_value=round(default_clearance, 2))
+        gui_difficulty = server.gui.add_slider("难度", min=0., max=1., step=0.05,
+                                               initial_value=round(default_difficulty, 2))
+        gui_noise = server.gui.add_slider("噪声倍率（实时）", min=0., max=1.5, step=0.05,
+                                          initial_value=round(default_noise, 2))
+        gui_overload = server.gui.add_checkbox("超限立即终止（评估口径，训练不终止）", initial_value=False)
+    with server.gui.add_folder("2. 凸台与形状参数（新回合生效）", expand_by_default=True):
+        gui_rim = server.gui.add_dropdown("凸台", options=("随机", "无凸台", "有凸台"), initial_value="随机")
+        gui_rim_h = server.gui.add_slider("凸台高度 (mm)", min=mm(probe.rim_height_min_m),
+                                          max=mm(probe.rim_height_max_m), step=0.1,
+                                          initial_value=mm(probe.rim_height_max_m))
+        gui_rim_w = server.gui.add_slider("凸台宽度 (mm)", min=mm(probe.rim_width_min_m),
+                                          max=mm(probe.rim_width_max_m), step=0.1,
+                                          initial_value=mm(probe.rim_width_min_m))
+        gui_shape_random = server.gui.add_checkbox("形状参数随机", initial_value=True)
+        gui_params = [server.gui.add_slider(label, min=0.8, max=1.2, step=0.01, initial_value=1.0)
+                      for label in ("参数0倍率（dual 插脚厚）", "参数1倍率（dual 插脚宽）",
+                                    "参数2倍率（dual 槽距 p）")]
+    with server.gui.add_folder("3. 初始位姿（新回合生效）", expand_by_default=True):
+        gui_pose_random = server.gui.add_checkbox("初始位姿随机", initial_value=True)
+        xy_max = mm(probe.initial_xy)
+        gui_x = server.gui.add_slider("初始 X (mm)", min=-xy_max, max=xy_max, step=0.25, initial_value=0.)
+        gui_y = server.gui.add_slider("初始 Y (mm)", min=-xy_max, max=xy_max, step=0.25, initial_value=0.)
+        gui_z = server.gui.add_slider("初始尖端高度 (mm)", min=mm(probe.initial_z_min),
+                                      max=mm(probe.initial_z_max), step=0.5, initial_value=15.)
+        gui_rx = server.gui.add_slider("初始 Rx (deg)", min=-8., max=8., step=0.5, initial_value=0.)
+        gui_ry = server.gui.add_slider("初始 Ry (deg)", min=-8., max=8., step=0.5, initial_value=0.)
+        gui_rz = server.gui.add_slider("初始偏航 Rz (deg)", min=-15., max=15., step=0.5, initial_value=0.)
+    with server.gui.add_folder("4. 动力学（新回合生效，倍率作用于采样值）", expand_by_default=False):
+        gui_k = server.gui.add_slider("平移刚度倍率", min=0.25, max=4., step=0.05, initial_value=1.)
+        gui_lowpass = server.gui.add_dropdown("目标低通", options=("随机", "开", "关"), initial_value="随机")
+        gui_stiction = server.gui.add_slider("静摩擦死区倍率", min=0., max=2., step=0.05, initial_value=1.)
+        gui_wall = server.gui.add_slider("孔壁摩擦倍率", min=0., max=2., step=0.05, initial_value=1.)
+        gui_pivot = server.gui.add_slider("上游枢轴倍率", min=0., max=2., step=0.05, initial_value=1.)
+
+    lock = threading.Lock()
+    state = {"mode": "paused", "new": True, "step": False, "reload": False}
+    for button, key in ((btn_new, "new"), (btn_step, "step"), (btn_reload, "reload")):
+        def request(event, key=key) -> None:
+            del event
+            with lock:
+                state[key] = True
+        button.on_click(request)
+
+    @btn_run.on_click
+    def _on_run(event) -> None:
+        del event
+        with lock:
+            if state["mode"] == "finished":
+                state["new"] = True
+            state["mode"] = "running"
+
+    @btn_pause.on_click
+    def _on_pause(event) -> None:
+        del event
+        with lock:
+            if state["mode"] == "running":
+                state["mode"] = "paused"
+
+    ids = torch.arange(1, device=device)
+
+    def override_episode(g: Any) -> None:
+        cfg, scale = g.cfg, g.cfg.scale
+        definition = g.geometry.definition
+        changed = False
+        if not gui_shape_random.value and not isinstance(definition, ScaledPolygonShape):
+            nominal = torch.tensor(definition.nominal_params(g.geometry), device=device)
+            factor = torch.tensor([s.value for s in gui_params[:len(nominal)]], device=device)
+            g.shape_params[0, :len(nominal)] = nominal*factor
+            changed = True
+        if gui_rim.value != "随机" and g.rim_geom_ids:
+            g.rim_height[0] = gui_rim_h.value/1000*scale if gui_rim.value == "有凸台" else 0.
+            g.rim_width[0] = gui_rim_w.value/1000*scale
+            changed = True
+        if changed:
+            g.apply_shape(ids)
+            g.apply_geom_pos(ids, g.offset[ids]-g.nominal_offset[ids])
+        if not gui_pose_random.value:
+            rv = torch.tensor([[gui_rx.value, gui_ry.value, gui_rz.value]], device=device)*math.pi/180
+            q = rotvec_quat(rv)
+            tip = torch.tensor([[gui_x.value, gui_y.value, gui_z.value]], device=device)/1000*scale
+            tip[:, 2] = tip[:, 2].clamp_min(0.0005*scale - g.minimum_peg_height_offset(q, ids))
+            # 与 reset_state 的初始放置一致：位姿、目标、低通与延迟位置观测同步改写
+            qpos = g.sim.data.qpos[:]
+            qpos[ids, :3] = tip - rotate(q, g.offset[ids])
+            qpos[ids, 3:7] = q
+            g.tip_ema[ids] = tip
+            nominal_tip = tip_pose(qpos[ids, :3], q, g.nominal_offset[ids] + g.calibration[ids])
+            g.targets_p[:, ids] = nominal_tip.unsqueeze(0)
+            g.targets_q[:, ids] = q.unsqueeze(0)
+            g.lowpass_p[ids] = nominal_tip
+            g.lowpass_q[ids] = q
+            if cfg.position_observation_delay:
+                g.reset_position_observation(ids, nominal_tip)
+        for tensor in (g.k, g.initial_k, g.walk_lower, g.walk_upper, g.walk_target, g.walk_current):
+            tensor[0, :3] *= gui_k.value
+        inertia6 = torch.cat((g.apparent_mass[ids].expand(-1, 3), g.inertia[ids]), -1)
+        g.d[ids] = 2*torch.sqrt(g.k[ids]*inertia6)*g.damping_ratio[ids]
+        if cfg.target_lowpass:
+            if gui_lowpass.value != "随机":
+                g.lowpass_off[ids] = torch.full_like(g.lowpass_off[ids], gui_lowpass.value == "关")
+            off = g.lowpass_off[ids]
+            natural = torch.sqrt(g.k[ids, :3]/g.apparent_mass[ids]).clamp_max(LOWPASS_OFF_MAX_RAD_S)
+            g.lowpass_omega[ids] = torch.where(off, natural, cfg.target_lowpass_translation_rad_s)
+            g.lowpass_zeta[ids] = torch.where(off, g.damping_ratio[ids, :3], 1.)
+        g.stiction[0] *= gui_stiction.value
+        g.wall_friction[0] *= gui_wall.value
+        g.pivot[0] *= gui_pivot.value
+
+    def grab(g: Any) -> dict:
+        pos, q, _, _ = g.state()
+        tilt, yaw = g.alignment(q)
+        to_np = lambda t: t.detach().cpu().numpy().astype(np.float64)
+        return {
+            "xpos": to_np(g.sim.data.geom_xpos[0]), "xmat": to_np(g.sim.data.geom_xmat[0]),
+            "tip": to_np(tip_pose(pos, q, g.offset)[0]), "q": to_np(q[0]),
+            "goal": to_np(g.goal[0]), "prior": np.r_[to_np(g.bias[0, :2]), 0.],
+            "wrench": to_np(g.wrench[0]),
+            "peak_force": float(g.peak_force[0]), "peak_moment": float(g.peak_moment[0]),
+            "tilt": math.degrees(float(tilt[0])), "yaw": math.degrees(float(yaw[0])),
+            "length": int(g.length[0]), "hold": int(g.hold[0]),
+        }
+
+    episode: dict[str, Any] = {}
+    tally: dict[str, list[int]] = {}
+
+    def episode_info(g: Any) -> str:
+        params = (g.shape_params[0]*1000).tolist()
+        k = g.k[0].tolist()
+        off = bool(g.lowpass_off[0].any()) if g.cfg.target_lowpass else True
+        bias = (g.bias[0, :2]*1000).tolist()
+        return (f"形状参数 `{', '.join(f'{p:.2f}' for p in params)}` mm | "
+                f"凸台 `h={float(g.rim_height[0])*1000:.2f} w={float(g.rim_width[0])*1000:.2f}` mm  \n"
+                f"目标偏差 `[{bias[0]:+.2f}, {bias[1]:+.2f}]` mm | "
+                f"间隙 `{g.clearance*1000:.2f}` mm | 难度 `{g.difficulty:.2f}`  \n"
+                f"K `[{k[0]:.0f}, {k[1]:.0f}, {k[2]:.0f}] N/m` | 低通 `{'关' if off else '开'}` | "
+                f"孔壁摩擦 `{float(g.wall_friction[0]):.2f} N` | "
+                f"静摩擦 `{float(g.stiction[0, 2]):.2f} N` | "
+                f"枢轴 `{float(torch.linalg.vector_norm(g.pivot[0]))*1000:.1f} mm`")
+
+    def render_status(frame: dict) -> None:
+        a = episode.get("action", [0.]*6)
+        f = frame["wrench"]
+        tip_rel = (frame["tip"]-frame["goal"])*1000
+        results = " | ".join(f"{s} {v[0]}/{v[1]}" for s, v in tally.items()) or "无"
+        labels = {"running": "运行中", "paused": "已暂停", "finished": f"回合结束：**{episode.get('reason', '')}**"}
+        status_md.content = (
+            f"**{labels[state['mode']]}** | 迭代 `{ckpt_iter}` | 课程等级 `{level}` | "
+            f"终止口径 `{'超限终止' if env_cache['key'][1] else '训练（超限不终止）'}`  \n"
+            f"{episode.get('info', '')}  \n"
+            f"步数 `{frame['length']}` (`{frame['length']*0.02:.2f} s`) | 保持 `{frame['hold']}`  \n"
+            f"尖端相对真孔 `[{tip_rel[0]:+6.2f}, {tip_rel[1]:+6.2f}, {tip_rel[2]:+6.2f}]` mm | "
+            f"倾角 `{frame['tilt']:.2f}°` 偏航 `{frame['yaw']:+.2f}°`  \n"
+            f"力 `[{f[0]:+6.2f}, {f[1]:+6.2f}, {f[2]:+6.2f}]` N (|F| `{np.linalg.norm(f[:3]):.2f}`) | "
+            f"本回合峰值 `{max(frame['peak_force'], episode.get('peak', 0.)):.1f} N`  \n"
+            f"动作 dp `[{a[0]:+6.2f}, {a[1]:+6.2f}, {a[2]:+6.2f}]` mm | "
+            f"dr `[{a[3]:+5.2f}, {a[4]:+5.2f}, {a[5]:+5.2f}]`  \n"
+            f"本次会话结果（成功/回合）: {results}"
+        )
+
+    def new_episode() -> tuple[Any, Any, TensorDict]:
+        env, scene = build_env(gui_shape.value, gui_overload.value)
+        g = env.groups[0]
+        g.difficulty = gui_difficulty.value
+        g.noise_scale = gui_noise.value
+        g.set_clearance(gui_clearance.value/1000*g.cfg.scale)
+        with g.warp_on_current_stream():
+            g.reset_state(ids)
+            override_episode(g)
+            g.finish_reset()
+        actor.reset()
+        frame = grab(g)
+        scene.rebuild(frame)
+        episode.clear()
+        episode.update(info=episode_info(g), peak=0.)
+        return env, scene, env.get_observations()
+
+    frames = 0
+    next_step = time.monotonic()
+    finished_at = 0.
+    try:
+        with torch.inference_mode():
+            env, scene, obs = new_episode()
+            state["new"] = False
+            last_frame = grab(env.groups[0])
+            render_status(last_frame)
+            while args.frames == 0 or frames < args.frames:
+                with lock:
+                    request = dict(state)
+                    state["step"] = state["new"] = state["reload"] = False
+                if request["reload"]:
+                    ckpt_iter, metadata, actor = load_policy()
+                    request["new"] = True
+                auto = (request["mode"] == "finished" and gui_auto.value
+                        and time.monotonic()-finished_at > 1.)
+                if request["new"] or auto:
+                    env, scene, obs = new_episode()
+                    with lock:
+                        if state["mode"] == "finished":
+                            state["mode"] = "running" if auto else "paused"
+                    last_frame = grab(env.groups[0])
+                    render_status(last_frame)
+                    next_step = time.monotonic()
+                    continue
+                now = time.monotonic()
+                if not ((request["mode"] == "running" and now >= next_step)
+                        or (request["mode"] == "paused" and request["step"])):
+                    time.sleep(0.002)
+                    continue
+                next_step = max(next_step + 0.02/gui_speed.value, now - 0.1)
+                g = env.groups[0]
+                sampled = actor(obs, stochastic_output=True)
+                action = sampled if gui_stochastic.value else actor.distribution.mean.clone()
+                episode["action"] = action[0].tolist()
+                obs, _, dones, info = env.step(action)
+                actor.reset(dones)
+                # 课程标量在步内会被环境改回检查点值，按 GUI 恢复
+                g.difficulty, g.noise_scale = gui_difficulty.value, gui_noise.value
+                frames += 1
+                if bool(dones[0]):
+                    # 结束步已自动重置，画面停在结束前一步
+                    terminal = info["terminal"]
+                    code = int(terminal["reason"][0])
+                    episode["reason"] = REASONS.get(code, str(code))
+                    episode["peak"] = float(terminal["peak_force"][0])
+                    record = tally.setdefault(gui_shape.value, [0, 0])
+                    record[0] += code == 1
+                    record[1] += 1
+                    with lock:
+                        state["mode"] = "finished"
+                    finished_at = time.monotonic()
+                    render_status(last_frame)
+                    continue
+                last_frame = grab(g)
+                episode["peak"] = max(episode["peak"], last_frame["peak_force"])
+                scene.update(last_frame)
+                if frames % 3 == 0 or request["mode"] == "paused":
+                    render_status(last_frame)
+    finally:
+        server.stop()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -1244,16 +1627,24 @@ def main() -> None:
                         help="simulation replay only: continue past force/moment limits")
     parser.add_argument("--real-profile", action="store_true",
                         help="policy replay with the real2sim evaluation plant and deployment low-pass")
+    parser.add_argument("--training-level", action="store_true",
+                        help="policy replay at the checkpoint curriculum level (training clearance/difficulty/noise)")
     args = parser.parse_args()
     if args.frames < 0 or not 1 <= args.port <= 65535:
         parser.error("frames must be nonnegative and port must be valid")
     logging.basicConfig(level=logging.INFO)
     if args.mode == "interactive":
-        run_interactive(args)
+        environment = json.loads((args.run_dir / "config.json").read_text())["environment"]
+        cfg = InsertionCfg.from_checkpoint(environment)
+        # CPU 实时植物不含形状随机化与凸台，这类运行改用 GPU 训练环境逐步仿真
+        if cfg.shape_randomization:
+            run_env_interactive(args)
+        else:
+            run_interactive(args)
         return
-    replay_only = args.zero_noise or args.ignore_overload or args.real_profile
+    replay_only = args.zero_noise or args.ignore_overload or args.real_profile or args.training_level
     if replay_only and args.mode != "policy":
-        parser.error("--zero-noise, --ignore-overload and --real-profile require --mode policy")
+        parser.error("--zero-noise, --ignore-overload, --real-profile and --training-level require --mode policy")
     metadata = json.loads((args.run_dir / "config.json").read_text())
     cfg = InsertionCfg.from_checkpoint(metadata["environment"])
     if args.shape is not None and args.shape not in cfg.shapes and args.mode != "policy":
@@ -1325,7 +1716,7 @@ def main() -> None:
                 if mode.value == "Latest policy replay":
                     if replay is None:
                         replay = PolicyReplay(args.run_dir, args.device, shape, args.zero_noise,
-                                              args.ignore_overload, args.real_profile)
+                                              args.ignore_overload, args.real_profile, args.training_level)
                     replay.select(shape)
                     episode = replay.latest()
                     if (frozen.value and displayed_episode is not None

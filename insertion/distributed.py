@@ -24,6 +24,7 @@ from rsl_rl.utils import check_nan
 
 from .config import InsertionCfg
 from .env import InsertionEnv
+from .model import SKIP_RNN_MODEL, SkipRNNModel
 from .ppo import SMOOTH_PPO, SmoothPPO
 from train import (ContinuousRunner, LiveInsertionEnv, TrainingStopped, atomic_json,
                    load_recovery_checkpoint, resume_training)
@@ -42,7 +43,7 @@ def validate_layout(metadata: dict, device: str) -> int:
             or sum(cfg.environment_counts)//world_size % 4):
         raise ValueError("each rank must have whole shape shards and an environment count divisible by four")
     if metadata["runner"]["algorithm"]["class_name"] not in ("PPO", SMOOTH_PPO) or any(
-            metadata["runner"][key]["class_name"] != "RNNModel" for key in ("actor", "critic")):
+            metadata["runner"][key]["class_name"] not in SHARED_MODELS for key in ("actor", "critic")):
         raise ValueError("distributed insertion training requires the existing recurrent PPO configuration")
     return world_size
 
@@ -54,13 +55,25 @@ def gather_batch(value: torch.Tensor) -> torch.Tensor:
     return gathered
 
 
-class SharedRNNModel(RNNModel):
+class SharedNormalization:
     def update_normalization(self, obs: TensorDict) -> None:
         if self.obs_normalization:
             if not isinstance(self.obs_normalizer, EmpiricalNormalization):
                 raise TypeError("expected the repository's empirical observation normalizer")
             values = torch.cat([obs[key] for key in self.obs_groups], dim=-1)
             self.obs_normalizer.update(gather_batch(values))
+
+
+class SharedRNNModel(SharedNormalization, RNNModel):
+    pass
+
+
+class SharedSkipRNNModel(SharedNormalization, SkipRNNModel):
+    pass
+
+
+SHARED_MODELS = {"RNNModel": "insertion.distributed:SharedRNNModel",
+                 SKIP_RNN_MODEL: "insertion.distributed:SharedSkipRNNModel"}
 
 
 def global_advantages(raw: torch.Tensor) -> torch.Tensor:
@@ -134,7 +147,7 @@ class DistributedRunner(ContinuousRunner):
         config = copy.deepcopy(metadata["runner"])
         config["algorithm"]["class_name"] = "insertion.distributed:SharedPPO"
         for key in ("actor", "critic"):
-            config[key]["class_name"] = "insertion.distributed:SharedRNNModel"
+            config[key]["class_name"] = SHARED_MODELS[config[key]["class_name"]]
         super().__init__(env, config, output, metadata)
         self.env = env
         size = env.num_envs*self.gpu_world_size

@@ -25,6 +25,8 @@ class Geometry:
     circle_error: float = 0.0
     plate_outer_radius_m: float = 0.0
     rough_surface: bool = False
+    # 逐环境尺寸与孔口围框随机化；关闭时模型与旧版完全一致
+    randomized: bool = False
 
 
     @property
@@ -34,7 +36,8 @@ class Geometry:
 
 def geometry(shape: str, clearance: float = 0.0001, scale: float = 1,
              circle_sides: int | None = None, plate_outer_radius_m: float = 0.0,
-             rough_surface: bool = False, hole_depth_m: float = HOLE_DEPTH_M) -> Geometry:
+             rough_surface: bool = False, hole_depth_m: float = HOLE_DEPTH_M,
+             randomized: bool = False) -> Geometry:
     if shape not in ALL_SHAPES:
         raise ValueError(f"unsupported shape {shape}")
     r, c = 0.01 * scale, clearance / 2
@@ -47,8 +50,10 @@ def geometry(shape: str, clearance: float = 0.0001, scale: float = 1,
         raise ValueError("rough_surface must be a boolean")
     if not math.isfinite(hole_depth_m) or hole_depth_m <= 0:
         raise ValueError("hole_depth_m must be finite and positive")
+    if randomized and rough_surface:
+        raise ValueError("shape randomization does not support the rough surface terrain")
     return Geometry(shape, r, clearance, hole_depth_m * scale, 0.035 * scale,
-                    p, peg, error, plate_outer_radius_m, rough_surface)
+                    p, peg, error, plate_outer_radius_m, rough_surface, randomized)
 
 
 def rough_surface_tiles(g: Geometry) -> tuple[RoughTile, ...]:
@@ -111,9 +116,13 @@ def model_xml(g: Geometry) -> str:
     assets = ET.SubElement(root, "asset")
     world = ET.SubElement(root, "worldbody")
     ET.SubElement(world, "light", pos="0 0 0.2")
-    hole = ET.SubElement(world, "body", name="hole")
+    # mujoco_warp 只在建数据时计算世界静态碰撞体位姿；逐环境改写孔板碰撞体需挂在 mocap 物体上
+    hole = (ET.SubElement(world, "body", name="hole", mocap="true") if g.randomized
+            else ET.SubElement(world, "body", name="hole"))
     definition = g.definition
     definition.add_plate_colliders(hole, assets, g)
+    if g.randomized:
+        definition.add_rim_colliders(hole, g)
     body = ET.SubElement(world, "body", name="tool", pos="0 0 0.06")
     ET.SubElement(body, "freejoint", name="tool_free")
     ET.SubElement(body, "inertial", pos="0 0 0", mass="1",

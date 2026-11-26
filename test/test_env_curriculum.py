@@ -18,6 +18,7 @@ from insertion.config import REAL2SIM_VALUES
 from insertion.curriculum import adaptive_environment_counts
 from insertion.transforms import quat_inv, rotate, rotvec_quat
 from insertion.env import PlantGroup, lowpass_velocity, play_hysteresis_step
+from insertion.shapes.base import PreparedGeometry
 from real2sim.evaluate_real2sim import sign_flips, velocity_reversals
 from real2sim.train_real2sim import real2sim_config
 
@@ -30,6 +31,10 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             curriculum_cohort=None, curriculum_cohort_seen=None, curriculum_cohort_armed=None)
         batch = torch.zeros(1000, 4)
         batch[:, 3] = 1
+        # 起始回合不计入，先让全部环境结束一次
+        batch[:, 1] = 1
+        env.curriculum_pending.append(batch.clone())
+        batch[:, 1] = 0
         batch[:799, 1:3] = 1
         env.curriculum_pending.append(batch.clone())
         InsertionEnv.advance_noise_curriculum(env)
@@ -73,12 +78,10 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         everyone = torch.ones(1000, dtype=torch.bool)
         nobody = torch.zeros(1000, dtype=torch.bool)
         fast = torch.arange(1000) < 700
-        step(everyone, nobody)
-        self.assertEqual(sum(curriculum.windows["square"]), 0)
-        # 新队列开始时已在进行的回合按时长偏向失败，不计入
-        step(fast, everyone)
-        step(~fast, nobody)
-        self.assertEqual(sum(curriculum.windows["square"]), 0)
+        # 起始回合计时被错开，不计入
+        step(fast, nobody)
+        step(~fast, everyone)
+        self.assertEqual(len(curriculum.windows["square"]), 0)
         self.assertFalse(env.curriculum_cohort_seen.any())
         step(fast, everyone)
         self.assertEqual(curriculum.level, 0)
@@ -349,9 +352,11 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         for shape in (*TRAIN_SHAPES, "circle"):
             with self.subTest(shape=shape):
                 g = geometry(shape)
+                peg_polygon = torch.tensor(g.peg_polygon, dtype=q.dtype)
                 group = SimpleNamespace(
-                    shape=shape, geometry=g, clearance=g.clearance,
-                    peg_polygon=torch.tensor(g.peg_polygon, dtype=q.dtype))
+                    shape=shape, geometry=g, clearance=g.clearance, peg_polygon=peg_polygon,
+                    geo=PreparedGeometry(g, torch.tensor(g.hole_polygon, dtype=q.dtype), peg_polygon),
+                    shape_params=q.new_tensor(g.definition.nominal_params(g)).expand(len(q), -1))
                 actual = PlantGroup.minimum_peg_height_offset(group, q)
                 if shape == "circle":
                     angles = torch.arange(8192, dtype=q.dtype)*2*math.pi/8192
@@ -484,13 +489,13 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         levels = (0.002, 0.001, 0.0005, 0.00025, 0.00015, 0.0001)
         curriculum = SuccessNoiseCurriculum(("square", "triangle"), clearances=levels, noise_levels=10)
         self.assertEqual(curriculum.clearance, 0.002)
-        self.assertAlmostEqual(curriculum.difficulty, 0.25)
+        self.assertAlmostEqual(curriculum.difficulty, 0.)
         self.assertEqual(curriculum.scale, 0.)
         self.assertFalse(curriculum.update({"square": [True] * 999, "triangle": [True] * 1000}))
         for i, expected_clearance in enumerate(levels[1:], start=1):
             self.assertTrue(curriculum.update({"square": [True] * 1000, "triangle": [True] * 1000}))
             self.assertEqual(curriculum.clearance, expected_clearance)
-            self.assertAlmostEqual(curriculum.difficulty, 0.25 + 0.75 * (i / 5))
+            self.assertAlmostEqual(curriculum.difficulty, i / 5)
             self.assertEqual(curriculum.scale, 0.)
         self.assertTrue(curriculum.update({"square": [True] * 1000, "triangle": [True] * 1000}))
         self.assertEqual(curriculum.clearance, 0.0001)
@@ -597,9 +602,10 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
                 self.assertTrue(bool((values.abs() <= bound + 1e-7).all()))
                 self.assertLess(float(values.min()), -0.9 * bound)
                 self.assertGreater(float(values.max()), 0.9 * bound)
-            self.assertTrue(bool(((tip[:, 2] >= 0.001-1e-7) & (tip[:, 2] <= 0.01+1e-7)).all()))
-            self.assertLess(float(tip[:, 2].min()), 0.0019)
-            self.assertGreater(float(tip[:, 2].max()), 0.0091)
+            z_max = 0.001 + 0.009 * difficulty
+            self.assertTrue(bool(((tip[:, 2] >= 0.001-1e-7) & (tip[:, 2] <= z_max+1e-7)).all()))
+            self.assertLess(float(tip[:, 2].min()), 0.001 + 0.1 * (z_max - 0.001))
+            self.assertGreater(float(tip[:, 2].max()), z_max - 0.1 * (z_max - 0.001))
             for axis in range(3):
                 bound = math.radians(20) * difficulty
                 self.assertTrue(bool((rv[:, axis].abs() <= bound + 1e-6).all()))
@@ -653,12 +659,15 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         self.assertEqual(group.clearance, 0.002)
         self.assertEqual(group.sim.wp_data.naconmax, group.n * 64)
         self.assertEqual(group.sim.wp_data.njmax, 256)
-        self.assertAlmostEqual(group.difficulty, 0.25)
+        self.assertAlmostEqual(group.difficulty, 0.)
         env.step(torch.zeros(4, 6, device=self.device))
         self.assertIsNotNone(group.physics_rollout_graph)
         self.assertIsNotNone(group.reset_constants_graph)
         self.assertIsNotNone(group.action_graph)
         self.assertIsNotNone(group.outcome_graph)
+        # 起始回合不计入，先让全部环境结束一次
+        env.record_curriculum_outcomes(torch.tensor([[0, 1, 0, 1]] * 4, device=self.device))
+        env.advance_noise_curriculum()
         env.noise_curriculum.windows["square"].extend([True] * 996)
         env.record_curriculum_outcomes(torch.tensor([[0, 1, 1, 1]] * 4, device=self.device))
         logs = env.advance_noise_curriculum()
@@ -669,7 +678,7 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         self.assertIsNone(group.reset_constants_graph)
         self.assertIsNone(group.action_graph)
         self.assertIsNone(group.outcome_graph)
-        self.assertAlmostEqual(group.difficulty, 0.40)
+        self.assertAlmostEqual(group.difficulty, 0.2)
         torch.testing.assert_close(group.peg_polygon, torch.tensor(
             group.geometry.peg_polygon, dtype=torch.float32, device=self.device))
         self.assertAlmostEqual(float(logs["curriculum/clearance_mm"]), 1.0)
@@ -912,7 +921,8 @@ class Real2SimPlantTests(unittest.TestCase):
         group = InsertionEnv(cfg, self.device).groups[0]
         group.reset(torch.arange(64, device=self.device))
         distance = (group.sensor_offset - group.nominal_offset)[:, 2]
-        self.assertTrue(bool(((distance >= 0.08 - 1e-6) & (distance <= 0.16 + 1e-6)).all()))
+        self.assertTrue(bool(((distance >= cfg.sensor_tip_min_m - 1e-6)
+                              & (distance <= cfg.sensor_tip_max_m + 1e-6)).all()))
         self.assertEqual((real2sim_config(asdict(cfg)).sensor_tip_min_m,
                           InsertionCfg.from_checkpoint({}).sensor_tip_min_m), (0.18, None))
         a = torch.tensor([2.0, -1.0, 0.5], device=self.device)
@@ -935,6 +945,7 @@ class Real2SimPlantTests(unittest.TestCase):
         cfg = InsertionCfg(shapes=("square",), envs_per_shape=16, training=True,
                            hard_state_reset_probability=1.0)
         group = InsertionEnv(cfg, self.device).groups[0]
+        group.difficulty = 1.
         stored = torch.tensor([0.004, -0.003, 0.006], device=self.device)
         group.hard_pos[:] = stored
         group.hard_q[:] = rotvec_quat(torch.tensor([[0.02, -0.01, 0.05]], device=self.device))

@@ -53,10 +53,8 @@ class SuccessNoiseCurriculum:
         if self.max_level == 0:
             return 1.0
         if self.clearance_stages > 0:
-            progress = min(1.0, self.level / self.clearance_stages)
-        else:
-            progress = min(1.0, self.level / self.max_level)
-        return 0.25 + 0.75 * progress
+            return min(1.0, self.level / self.clearance_stages)
+        return min(1.0, self.level / self.max_level)
 
     @property
     def scale(self) -> float:

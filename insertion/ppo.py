@@ -21,6 +21,29 @@ class SmoothPPO(PPO):
             raise ValueError("SmoothPPO does not support RND or symmetry extensions")
         self.smooth_coef = smooth_coef
         self.smooth_std = torch.tensor([smooth_force_std]*3 + [smooth_moment_std]*3, device=self.device)
+        # KL 自适应学习率只调 actor；critic 不改变动作分布，随 KL 压低会拖慢价值学习
+        self.optimizer = type(self.optimizer)(
+            [{"params": list(self.actor.parameters())}, {"params": list(self.critic.parameters())}],
+            lr=self.learning_rate)
+        self.fixed_rates = [self.learning_rate]
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        saved = loaded_dict.get("optimizer_state_dict")
+        groups = self.optimizer.param_groups
+        if saved and len(saved["param_groups"]) != len(groups):
+            # 旧检查点参数编号同为 actor 在前、critic 在后，仅分组不同，按当前分组重新切分
+            ids = [i for group in saved["param_groups"] for i in group["params"]]
+            if len(ids) != sum(len(group["params"]) for group in groups):
+                raise ValueError("checkpoint optimizer parameter count does not match the model")
+            regrouped, start = [], 0
+            for group in groups:
+                regrouped.append({**saved["param_groups"][0], "params": ids[start:start + len(group["params"])]})
+                start += len(group["params"])
+            loaded_dict = {**loaded_dict, "optimizer_state_dict": {**saved, "param_groups": regrouped}}
+        loaded = super().load(loaded_dict, load_cfg, strict)
+        for group, rate in zip(self.optimizer.param_groups[1:], self.fixed_rates, strict=True):
+            group["lr"] = rate
+        return loaded
 
     def process_env_step(self, obs, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
         # 采样期间冻结归一化，否则存储的旧策略与更新时重算的不一致；整批在 update 末尾合并
@@ -50,7 +73,7 @@ class SmoothPPO(PPO):
         return ((mean - clean_mean).square().sum(-1, keepdim=True) * weight).sum() / weight.sum().clamp_min(1.)
 
     def update(self) -> dict[str, float]:
-        totals = {"value": 0., "surrogate": 0., "entropy": 0., "smooth": 0.}
+        totals = {"value": 0., "surrogate": 0., "entropy": 0., "smooth": 0., "kl": 0.}
         generator = (self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
                      if self.actor.is_recurrent or self.critic.is_recurrent
                      else self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs))
@@ -73,6 +96,7 @@ class SmoothPPO(PPO):
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
+                    totals["kl"] += kl_mean.item()
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -82,8 +106,7 @@ class SmoothPPO(PPO):
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                    self.optimizer.param_groups[0]["lr"] = self.learning_rate
 
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))
             advantages = torch.squeeze(batch.advantages)

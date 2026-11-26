@@ -5,7 +5,7 @@ import math
 
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
-from .shapes import ALL_SHAPES, TRAIN_SHAPES
+from .shapes import ALL_SHAPES, LEGACY_SHAPE_COUNT, TRAIN_SHAPES
 from .shapes.circle import validate_circle_sides
 
 HOLE_DEPTH_M = 0.025
@@ -22,7 +22,7 @@ REAL2SIM_VALUES = {
     "sensor_tip_min_m": 0.18, "sensor_tip_max_m": 0.22,
     "com_fraction_min": 0.3, "com_fraction_max": 0.6, "com_lateral_m": 0.005,
     "target_lowpass": True, "target_lowpass_translation_rad_s": 30.0,
-    "target_lowpass_rotation_rad_s": 50.0, "target_lowpass_off_probability": 0.15,
+    "target_lowpass_rotation_rad_s": 50.0, "target_lowpass_off_probability": 1.0,
     "rotation_pivot_max_m": 0.09,
     "stick_slip_max_pp_m": 0.0015, "stick_slip_min_hz": 3.0, "stick_slip_max_hz": 6.0,
     "step_bias_rate_per_second": 0.05, "step_force_bias_min_n": 1.0, "step_force_bias_max_n": 3.5,
@@ -81,10 +81,10 @@ class InsertionCfg:
     wrench_hysteresis_fraction: float = 0.001
     initial_xy: float = 0.020
     workspace_xy_radius_m: float = 0.035
-    workspace_z_max_m: float = 0.030
+    workspace_z_max_m: float = 0.070
     plate_outer_radius_m: float = 0.080
     initial_z_min: float = 0.004
-    initial_z_max: float = 0.02
+    initial_z_max: float = 0.055
     initial_plane_margin: float = 0.0
     initial_tilt: float = math.radians(8)
     initial_yaw: float = math.radians(15)
@@ -125,13 +125,13 @@ class InsertionCfg:
     # 阻抗表观质量（仅启用目标低通时生效）；MuJoCo 刚体质量固定在 0.7–1.5 kg
     mass_min_kg: float = 0.7
     mass_max_kg: float = 1.5
-    damping_ratio_min: float = 0.8
+    damping_ratio_min: float = 0.25
     damping_ratio_max: float = 1.3
     down_mass_min_kg: float = 0.4
     down_mass_max_kg: float = 0.9
     # 传感器沿轴位于尖端上方 d；下游质心在传感器下方 fraction*d 并有横向偏移；None 为旧模型
     sensor_tip_min_m: float | None = 0.08
-    sensor_tip_max_m: float = 0.16
+    sensor_tip_max_m: float = 0.22
     com_fraction_min: float = 0.3
     com_fraction_max: float = 0.6
     com_lateral_m: float = 0.005
@@ -152,7 +152,14 @@ class InsertionCfg:
     step_moment_bias_min_nm: float = 0.1
     step_moment_bias_max_nm: float = 0.6
     # 训练时以此概率从近期记录的接触难点位姿（贴板、孔口卡滞、半插入）开始回合
-    hard_state_reset_probability: float = 0.0
+    hard_state_reset_probability: float = 0.25
+    # 逐环境随机形状尺寸，并以一定概率在孔口加一圈高出周围平面的围框（孔口顶面始终为 z=0）
+    shape_randomization: bool = False
+    rim_probability: float = 0.5
+    rim_height_min_m: float = 0.0002
+    rim_height_max_m: float = 0.002
+    rim_width_min_m: float = 0.0025
+    rim_width_max_m: float = 0.0035
     # 运动引起的夹爪/工具振动力：2–10 Hz 低阻尼窄带有色噪声，幅值随尖端速度增长，仅进入 actor 观测
     vibration_force_min_n: float = 0.5
     vibration_force_max_n: float = 1.5
@@ -305,6 +312,15 @@ class InsertionCfg:
             raise ValueError("lateral workspace radius must be positive and contain the full initial X/Y square")
         if not math.isfinite(self.plate_outer_radius_m) or self.plate_outer_radius_m < 0:
             raise ValueError("plate outer radius must be finite and nonnegative; zero selects legacy geometry")
+        if not isinstance(self.shape_randomization, bool) or (self.shape_randomization and not (
+                0 <= self.rim_probability <= 1
+                and 0 < self.rim_height_min_m <= self.rim_height_max_m < self.hole_depth_m
+                and 0 < self.rim_width_min_m <= self.rim_width_max_m)):
+            raise ValueError("shape randomization requires a valid rim probability, height and width range")
+        if self.shape_randomization and self.rough_surface:
+            raise ValueError("shape randomization does not support the rough surface terrain")
+        if not self.shape_randomization and any(ALL_SHAPES.index(s) >= LEGACY_SHAPE_COUNT for s in self.shapes):
+            raise ValueError("rectangle and dual shapes require shape_randomization")
         footprint = self.scale*(math.sqrt(2)*.01 + .035*math.sin(math.radians(35)))
         if (self.plate_outer_radius_m and self.plate_outer_radius_m
                 < self.workspace_xy_radius_m + footprint + .001*self.scale):
@@ -407,6 +423,10 @@ class InsertionCfg:
     @property
     def max_action_change_cost_per_second(self) -> float:
         return max(self.action_change_cost_per_second, self.free_air_action_change_cost_per_second or 0.)
+
+    @property
+    def critic_shape_count(self) -> int:
+        return len(ALL_SHAPES) if self.shape_randomization else LEGACY_SHAPE_COUNT
 
     @property
     def environment_counts(self) -> tuple[int, ...]:

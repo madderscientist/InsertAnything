@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import torch
 
-from .base import InsertionShape, inset_polygon, regular_polygon
+from .base import InsertionShape, PreparedGeometry, inset_polygon, regular_polygon
 
 if TYPE_CHECKING:
     from ..geometry import Geometry
@@ -48,13 +48,14 @@ class CircleShape(InsertionShape):
     def peg_reach_radius(self, g: Geometry, peg_polygon: torch.Tensor) -> float:
         return g.radius
 
-    def minimum_peg_projection(self, g: Geometry, direction_xy: torch.Tensor,
-                               peg_polygon: torch.Tensor) -> torch.Tensor:
+    def minimum_peg_projection(self, geo: PreparedGeometry, params: torch.Tensor,
+                               direction_xy: torch.Tensor) -> torch.Tensor:
+        g = geo.g
         return -(g.radius-g.clearance/2) * torch.linalg.vector_norm(direction_xy, dim=-1)
 
-    def opening_contains(self, g: Geometry, points_xy: torch.Tensor,
-                         hole_polygon: torch.Tensor) -> torch.Tensor:
-        return points_xy.square().sum(-1) <= g.radius**2
+    def opening_contains(self, geo: PreparedGeometry, params: torch.Tensor,
+                         points_xy: torch.Tensor) -> torch.Tensor:
+        return points_xy.square().sum(-1) <= geo.g.radius**2
 
 
 SHAPE = CircleShape("circle", rotation_order=0, mirror_axis_xy=(0.0, 1.0), train_by_default=False)

@@ -1,3 +1,3 @@
-from .base import RegularPolygonShape
+from .base import ScaledPolygonShape
 
-SHAPE = RegularPolygonShape("hexagon", rotation_order=6, mirror_axis_xy=(0.0, 1.0))
+SHAPE = ScaledPolygonShape("hexagon", rotation_order=6, mirror_axis_xy=(0.0, 1.0))

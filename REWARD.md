@@ -129,6 +129,8 @@ $C_{\text{hold}}$ 是零动作悬停时仍不可避免的单步成本上界（�
 | `episode_seconds` / `timeout_penalty` | 8 s / 10 | 30 s / 60 | 30 s / 60 |
 | `safety_failure_penalty` | 250 | 600 | 250 |
 
+搜索训练第一阶段（`search_prior/train_search.py`，从零训练）在 real2sim 取值基础上把 `stagnation_cost_per_second` 固定为 0，后续微调阶段如需再启用须从已学会插入的检查点开始：从零训练时停滞项会让策略远离板面在空中游荡，见 README 的对照实验。
+
 第二阶段那一列取自产出 961 的那次训练。之后从第一阶段新训练进入第二阶段时，会沿用新的平滑默认值。
 
 旧检查点缺少的字段，由 `InsertionCfg.from_checkpoint` 填入历史取值；已退役的字段在加载时直接忽略。

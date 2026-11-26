@@ -59,7 +59,8 @@ def export_onnx(checkpoint: Path, output: Path, samples: int = 500,
     session = ort.InferenceSession(str(path), sess_options=options,
                                    providers=["CPUExecutionProvider"])
     rng = np.random.default_rng(17)
-    hidden = np.zeros((2, 1, 128), dtype=np.float32)
+    hidden_shape = [actor.rnn.rnn.num_layers, 1, actor.rnn.rnn.hidden_size]
+    hidden = np.zeros(hidden_shape, dtype=np.float32)
     actor.reset()
     max_action_error = max_hidden_error = 0.
     elapsed = []
@@ -92,8 +93,8 @@ def export_onnx(checkpoint: Path, output: Path, samples: int = 500,
     contract = {
         **metadata["contract"],
         "onnx": {
-            "inputs": {"obs": [1, 13], "h_in": [2, 1, 128]},
-            "outputs": {"actions": [1, 6], "h_out": [2, 1, 128]},
+            "inputs": {"obs": [1, 13], "h_in": hidden_shape},
+            "outputs": {"actions": [1, 6], "h_out": hidden_shape},
             "dtype": "float32", "batch_size": 1, "deterministic": True,
             "normalization_in_model": True, "action_clipping_in_model": False,
             "preprocessing_in_model": False, "safety_checks_in_model": False,

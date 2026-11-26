@@ -115,6 +115,7 @@ def environment_config(args: argparse.Namespace) -> InsertionCfg:
 
 
 def contract(cfg: InsertionCfg) -> dict:
+    lowpass_required = cfg.target_lowpass and cfg.target_lowpass_off_probability < 1
     if cfg.wrench_bias_distribution == "uniform_magnitude":
         bias_contract = {
             "force_bias_max_magnitude_n": cfg.force_bias,
@@ -156,16 +157,16 @@ def contract(cfg: InsertionCfg) -> dict:
         "rotation_component_limit_rad": cfg.rotation_limit,
         "target_composition": "p_target=p_current+dp; q_target=Exp(dr)*q_current",
         "target_lowpass": {
-            "enabled": cfg.target_lowpass,
-            "deployment_required": cfg.target_lowpass,
+            "enabled": lowpass_required,
+            "deployment_required": lowpass_required,
             "requirement": (
                 "deployment MUST pass every policy target through this identical low-pass before the "
                 "impedance controller; omitting or retuning it is outside the training distribution"
-                if cfg.target_lowpass else "none; targets go directly to the impedance controller"),
+                if lowpass_required else "none; targets go directly to the impedance controller"),
             "training_off_probability": cfg.target_lowpass_off_probability,
             "training_off_model": (
                 "per episode: translation follows a second-order response with wn=min(sqrt(k/m_apparent), 100) "
-                "and the impedance damping ratio; rotation steps directly; deployment should still use the low-pass"),
+                "and the impedance damping ratio; rotation steps directly"),
             "form": "critically damped second order per component: a = wn^2*(target-x) - 2*wn*v",
             "translation_natural_frequency_rad_s": cfg.target_lowpass_translation_rad_s,
             "rotation_natural_frequency_rad_s": cfg.target_lowpass_rotation_rad_s,
@@ -681,14 +682,17 @@ def worker(output: Path, device: str, attempt: int) -> None:
 
 def resume_training(runner: ContinuousRunner, cfg: InsertionCfg, attempt: int,
                     rank: int = 0, world_size: int = 1) -> None:
-    if not (runner.output / "checkpoint.pt").exists():
-        return
-    saved = load_recovery_checkpoint(runner.output, str(runner.env.device))
-    restore_training_state(runner, saved)
-    runner.current_learning_iteration = saved["iter"]+1
-    restore_environment_progress(runner.env, cfg, saved, attempt, rank, world_size)
-    logging.info("Resumed iteration %d, policy steps %d; episodes and GRU state reset.",
-                 runner.current_learning_iteration, runner.env.policy_steps)
+    if (runner.output / "checkpoint.pt").exists():
+        saved = load_recovery_checkpoint(runner.output, str(runner.env.device))
+        restore_training_state(runner, saved)
+        runner.current_learning_iteration = saved["iter"]+1
+        restore_environment_progress(runner.env, cfg, saved, attempt, rank, world_size)
+        logging.info("Resumed iteration %d, policy steps %d; episodes and GRU state reset.",
+                     runner.current_learning_iteration, runner.env.policy_steps)
+    # 错开回合计时，避免全部环境同步超时使逐轮统计成波浪起伏
+    for group in runner.env.groups:
+        group.length.random_(0, runner.env.max_episode_length, generator=group.generator)
+        group.position_history_length.copy_(group.length)
 
 
 def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: dict,
@@ -722,6 +726,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "rough_wavelength_min_m", "rough_wavelength_max_m",
                     "action_cost_cap",
                     "initial_z_min", "initial_tilt", "initial_yaw", "initial_plane_margin",
+                    "episode_seconds",
                     *REAL2SIM_FIELDS, "mass_max_kg", "damping_ratio_max", "down_mass_min_kg",
                     "plate_friction_max",
                 )
@@ -746,7 +751,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
             if hasattr(group, "set_clearance"):
                 group.set_clearance(env.noise_curriculum.clearance)
         else:
-            group.difficulty = min(1., 0.25 + 0.75*env.policy_steps/cfg.curriculum_steps)
+            group.difficulty = min(1., env.policy_steps/cfg.curriculum_steps)
             group.noise_scale = cfg.noise_scale(env.policy_steps)
         seed = cfg.seed + (index*world_size + rank)*10007 + env.policy_steps + attempt
         group.generator.manual_seed(seed)
@@ -1015,7 +1020,7 @@ def main() -> None:
     parser.add_argument("--initial-z-min", type=float, default=0.004)
     parser.add_argument("--initial-plane-margin", type=float, default=0.,
                         help="minimum whole-peg height above hole plane in meters; zero disables")
-    parser.add_argument("--initial-z-max", type=float, default=0.02)
+    parser.add_argument("--initial-z-max", type=float, default=0.055)
     parser.add_argument("--initial-tilt-deg", type=float, default=8.,
                         help="initial rotation-vector X/Y component half range in degrees")
     parser.add_argument("--initial-yaw-deg", type=float, default=15.,

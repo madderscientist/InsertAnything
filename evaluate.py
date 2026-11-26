@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 from rsl_rl.models import RNNModel
+from rsl_rl.utils import resolve_callable
 from tensordict import TensorDict
 
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv
@@ -23,10 +24,10 @@ def load_checkpoint(path: Path, device: str) -> tuple[dict, RNNModel]:
     if metadata["contract"]["version"] != 1:
         raise ValueError("unsupported policy contract")
     config = copy.deepcopy(metadata["runner"]["actor"])
-    config.pop("class_name")
+    model_class = resolve_callable(config.pop("class_name"))
     config.pop("cnn_cfg", None)
     dummy = TensorDict({"actor": torch.zeros(1, 13, device=device)}, [1])
-    actor = RNNModel(dummy, {"actor": ["actor"]}, "actor", 6, **config).to(device)
+    actor = model_class(dummy, {"actor": ["actor"]}, "actor", 6, **config).to(device)
     actor.load_state_dict(saved["actor_state_dict"], strict=True)
     actor.eval()
     return metadata, actor

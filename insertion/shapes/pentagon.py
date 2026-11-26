@@ -1,3 +1,3 @@
-from .base import RegularPolygonShape
+from .base import ScaledPolygonShape
 
-SHAPE = RegularPolygonShape("pentagon", rotation_order=5, mirror_axis_xy=(0.0, 1.0))
+SHAPE = ScaledPolygonShape("pentagon", rotation_order=5, mirror_axis_xy=(0.0, 1.0))

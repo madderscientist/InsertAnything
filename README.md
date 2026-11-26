@@ -157,6 +157,7 @@ Release 续训需要完整 checkpoint 和对应 `config.json`；ONNX 仅供推�
 窗口每批等待所有环境各完成一个回合，避免快速成功造成偏差；重启丢弃未完成批次。
 布局在保存后重建，保留模型、优化器及课程，重置回合和 GRU；
 调整记录见 `sampling_<iteration>.json`，心跳记录各形状环境数。
+搜索训练（`search_prior/train_search.py`）默认开启自适应采样；课程要求所有形状达标才升级，双插头 dual 常是最慢的一个。
 
 ### 初始位姿范围
 
@@ -200,6 +201,37 @@ X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
 - **Critic 特权输入（57 维）**：包含无噪真实状态、线速度/角速度、6 轴刚度与阻尼、质量/主惯量、下游质量/惯量、标定误差、夹持偏移及几何类别独热编码。
 - **循环策略网络**：观测经验归一化 → 两层 `GRU(128)` → `ELU MLP(128, 64)` → 每个动作的均值和 `log_std`（各 6 维）。采用 rsl_rl 原生 `HeteroscedasticGaussianDistribution`，各维独立采样，标准差限制为 `[0.02, 1.0]`；根据观测与循环历史学习探索强度，不硬编码入孔阶段。评估和 TorchScript/ONNX 导出仍只使用 6 维均值动作。
   不再维护独立的全局 std 参数；`init_std` 只用于新网络的输出层初始化。日志 `Mean action std` 是最后一次策略分布计算中 std 张量的整体均值，不是按入孔阶段统计的 rollout 均值。
+- **搜索训练网络**：actor 与 critic 同构，均为 [insertion/model.py](./insertion/model.py) 的 `SkipRNNModel`：归一化观测 → 两层 `GRU(256)`，GRU 输出与当前观测拼接 → `ELU MLP(256, 128)`。GRU 用 chrono 初始化（更新门偏置 $\log U(1, 499)$，初始记忆时间常数铺满 2–500 步），输出不加 LayerNorm；默认初始化的更新门约 0.5，记忆只有约 2 步。critic 也需记忆：只看当前特权状态的 MLP critic 在部分可观测任务中有偏，两次训练均崩塌。
+
+  ```mermaid
+  flowchart LR
+    subgraph A["Actor（部署，GRU 隐状态 2×256 逐步传递）"]
+      direction TB
+      ao["观测 13 维<br/>位置误差 3 + 相对四元数 4 + 力旋量 6"] --> an["经验归一化"]
+      an --> ag["GRU 256 × 2 层<br/>chrono 初始化"]
+      an -->|跳连| ac(("拼接 269"))
+      ag --> ac
+      ac --> am1["Linear 256 + ELU"] --> am2["Linear 128 + ELU<br/>末层特征 z"] --> amu["Linear 6<br/>均值 μ"]
+      am2 -.->|截断梯度、单位化| gs["gSDE 噪声 z·(ε⊙σ)<br/>σ 为 128×6 参数，ε 每 25 步重抽"]
+      amu --> act(["动作 = μ + 噪声（训练）/ μ（部署）<br/>平移 ×1 mm，旋转 ×0.5°"])
+      gs -.-> act
+    end
+    subgraph C["Critic（仅训练）"]
+      direction TB
+      co["特权观测 63 维"] --> cn["经验归一化"] --> cg["GRU 256 × 2 层"]
+      cn -->|跳连| cc(("拼接 319"))
+      cg --> cc --> cm["ELU MLP 256, 128"] --> v(["价值 V"])
+    end
+  ```
+- **搜索训练的探索噪声（gSDE）**：[search_prior/train_search.py](./search_prior/train_search.py) 改用 [insertion/model.py](./insertion/model.py) 中的 `GSDEDistribution`（generalized State-Dependent Exploration）。逐步独立的高斯噪声在 50 Hz 下会相互抵消，累计位移只按 $\sqrt{N}$ 增长且被动作变化惩罚压制；gSDE 使探索在一段时间内方向连贯。
+  - 记 MLP 最后一个隐层特征为 $z(s)$（截断梯度并单位化，$\lVert z\rVert=1$），可学习参数为 $d\times 6$ 的 $\log\sigma$。每个环境保存探索矩阵 $\varepsilon\sim\mathcal N(0,1)^{d\times 6}$，动作为
+    $$a = \mu(s) + z(s)^\top(\varepsilon\odot\sigma)$$
+    给定状态时 $a\mid s\sim\mathcal N(\mu(s),\hat\sigma^2(s))$，$\hat\sigma_j^2(s)=\sum_i z_i^2\sigma_{ij}^2$；PPO 的对数概率、熵与 KL 均按该对角高斯计算，忽略 $\varepsilon$ 的跨步相关（与原论文及 Stable-Baselines3 一致）。$\hat\sigma$ 截断到 `std_range` 时噪声同比缩放，采样与似然保持一致。
+  - $\varepsilon$ 在回合结束时按环境重抽，并每 `--gsde-resample-steps`（默认 25 步即 0.5 s）整体重抽；持有期间同一状态得到同一扰动。存储的是标准正态 $\varepsilon$，噪声尺度始终跟随当前 $\sigma$。
+  - 初始化 $\sigma_{ij}=$ `init_std`（特征单位化后即 $\hat\sigma=0.4$），探索强度不随特征模长漂移；日志 `Mean action std` 为 $\hat\sigma$ 均值。
+  - 训练批次只重算 $\hat\sigma$ 不采样；评估与 TorchScript/ONNX 导出只用均值，输出层即 6 维均值（无 std 头，`--prune-std` 不适用）。
+  - 对照（单卡 1024 环境/形状，课程第 0 级，无初始下压偏置，60 轮）：gSDE 约 25 轮后自行学会下压，第 29 轮成功率 0.80，第 59 轮 0.93；逐步独立噪声 40 轮成功率始终约 0，悬停在板面上方约 1 mm 且 std 收缩到 0.29。
+- **搜索训练第一阶段固定关闭停滞惩罚**（从零训练，`search_prior/train_search.py` 写死为 0，不提供开关）：停滞项只在尖端净推进慢于阈值时扣分，板面受阻时必然触发，空中漂移则可规避。从零训练时它把策略推离板面：开启时（其余同上）超时尖端高度中位数从 14 mm 升到 54 mm，60 轮成功率为 0；关闭后同配置达到 0.93。安全罚分 800/250/100 对成功率无影响，不是原因。
 - **动作语义**：输出 `H` 系下无裁剪的三维平移与三维旋转向量；分别乘以 `1 mm` 与 `0.5°` 的每分量尺度，以估计名义尖端为旋转中心合成下一策略周期的阻抗目标：
   $$p_{\mathrm{target}} = p_{\mathrm{current}} + \Delta p, \qquad q_{\mathrm{target}} = \mathrm{Exp}(\Delta r) \otimes q_{\mathrm{current}}$$
 
@@ -210,12 +242,13 @@ X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
 - **传感器动力学**（[insertion/env.py](./insertion/env.py)）：关闭重力代表理想重力补偿。腕部传感器位于尖端上方 8–16 cm（real2sim 18–22 cm），测量外部接触载荷减去下游刚体（0.4–0.9 kg、质心在传感器下方 0.3–0.6 倍距离并横向偏移 ±5 mm、细杆惯量）的惯性力旋量，经时间常数 `15 ms` 的一阶低通滤波后搬移至名义尖端。
 - **各向异性阻抗与时变游走**：支持 `train`、`nominal`、`soft`、`stiff` 四种动力学模式。训练模式下刚度主轴随机旋转，且刚度在回合初始值 `±10%` 范围内每秒采样局部目标并以 `1 s` 时间常数平滑游走（变化率上限 `5%/s`）。
 - **CUDA Graph 加速**：`--physics-cuda-graph` 分别捕获动作处理、完整 20 个物理子步、奖励/终止计算及重置时的模型常量重计算；`--observation-cuda-graph` 捕获确定性观测变换。保持 `1000 Hz` 物理步长和逐子步控制/传感器更新；有限值检查、随机采样、动态重置和课程推进仍在图外。预热后捕获，模型重建后重新捕获，返回张量不受后续重放覆盖。启用 mjlab NaN 调试守卫时保留逐子步调用以执行调试回调。单卡与多卡各 rank 共用优化路径，多卡端到端收益尚未实测。
+- **物理步长不改 2 ms（已评估否决）**：单卡 10240 环境基准中 1 ms→2 ms 每步只从 92 ms 降到 52 ms（1.75×，策略推理、重置、观测是固定开销），而 0.1 mm 间隙下接触变软、单步位移接近间隙、力观测失真和低阻尼发散的风险不可接受。求解器迭代从 50/20 降到 20/10 或 10/5 也无加速（求解提前收敛）。提速请走形状组并发流与图捕获，勿再尝试这两项。
 
 ### 4.3 孔间隙、难度与噪声三阶段自动课程
 [insertion/curriculum.py](./insertion/curriculum.py) 中的 `SuccessNoiseCurriculum` 按每种形状最近 **1000 个完成回合**的真实成功率推进课程（所有训练形状成功率均达到 **80%** 时升级，清空窗口并过滤跨等级旧回合）：
 
 1. **阶段一（孔间隙与初始难度课程，零噪声）**：
-   孔间隙按 `2.0 mm → 1.0 mm → 0.5 mm → 0.25 mm → 0.15 mm → 0.10 mm` 逐级收紧；同时初始位姿与刚度随机化难度 `difficulty` 从 `0.25` 线性提升至 `1.0`。升级瞬间自动重建 MuJoCo 几何模型并重捕获 CUDA Graph。成功要求达到目标深度并连续保持 100 ms，不额外施加严格居中或姿态门槛。
+   孔间隙按 `2.0 mm → 1.0 mm → 0.5 mm → 0.25 mm → 0.15 mm → 0.10 mm` 逐级收紧；同时域随机化难度 `difficulty` 从 `0` 线性提升至 `1.0`，各采样区间按难度从中心值放大到全幅：初始位姿与高度（从 `initial_z_min` 起）、刚度、表观质量、阻尼比（中心 1.0）、下游质量、传感器距离与质心、板面摩擦、静摩擦、孔壁摩擦、枢轴（搜索训练不施加粘滑）；凸沿与困难初态重放的概率乘以难度。升级瞬间自动重建 MuJoCo 几何模型并重捕获 CUDA Graph。成功要求达到目标深度并连续保持 100 ms，不额外施加严格居中或姿态门槛。
 2. **阶段二（传感器与标定噪声课程，固定 `0.10 mm` 间隙与 `1.0` 难度）**：
    在目标 `0.10 mm` 间隙下，每次达标将 `noise_scale` 提升 `0.1` 直至 `1.0`，逐步激活逐步观测噪声（位置 `0.5 mm`、姿态 `1.5°`、力 `0.2 N`、力矩 `0.015 N·m`）与回合固定误差（真实夹持偏移 `1.25 mm`、尖端标定误差 `0.5 mm`、目标位置偏差 `0.5 mm`、传感器旋转误差 `0.5°`）。
 
@@ -261,7 +294,7 @@ p_target, q_target = policy.step(p_tip, q_tool, p_goal, q_goal, wrench_tip)
 
 [real2sim/](./real2sim/) 从已部署 checkpoint 续训，将 `REAL2SIM_VALUES`（[insertion/config.py](./insertion/config.py)）的实测对象参数覆盖到源配置；第一阶段默认不启用部署低通及下列对象非理想性；观测 13 维、动作 6 维与契约坐标约定不变，旧检查点缺字段时由 `InsertionCfg.from_checkpoint` 恢复历史行为。主要建模：
 
-- **部署目标低通**：临界阻尼二阶（平移 30、转动 50 rad/s）写入 contract；表观质量 0.08–1.5 kg 对数均匀，经低通加速度前馈复现；按 `target_lowpass_off_probability` 随机关闭低通，此时平移按 $\min(\sqrt{k/m},100)$ rad/s 的轻质量响应追阶跃。
+- **部署目标低通**：临界阻尼二阶（平移 30、转动 50 rad/s）写入 contract；表观质量 0.08–1.5 kg 对数均匀，经低通加速度前馈复现；按 `target_lowpass_off_probability`（默认 1，即实机部署不加低通）关闭低通，此时平移按 $\min(\sqrt{k/m},100)$ rad/s 的轻质量响应追阶跃。
 - **对象非理想性**：Z 向与 XY 转动独立静摩擦死区、转动→平移杠杆耦合、接触粘滑、阶跃力旋量零偏、由自身运动激发且仅在悬空时存在的 2–10 Hz 窄带振动力，以及上节传感器几何与下游惯性力。
 - **训练**：从难点状态（贴板、孔口卡滞、半插入）重置；悬空/接触动作变化成本 0.6/0.2；`SmoothPPO` 系数由监控在 0.0125–0.05 间自动调整。
 - **第一阶段已并入的通用平滑手段**：悬空/接触动作变化成本 0.5/0.1、动作成本饱和尺度 12、安全罚分 250、传感器几何与下游惯性力、悬空振动噪声（随噪声课程缩放），以及 [insertion/ppo.py](./insertion/ppo.py) 的 `SmoothPPO`（仅在悬空步扰动力旋量观测并惩罚动作均值变化，系数 0.0125）。

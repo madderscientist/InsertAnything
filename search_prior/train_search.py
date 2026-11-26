@@ -1,0 +1,92 @@
+"""随机形状插孔策略从零训练：双卡分布式 PPO，初始化与任务同 main，只换成随机尺寸的插头与插孔
+
+用法（仓库根目录）:
+    python -m search_prior.train_search --output runs/search/baseline
+"""
+
+import argparse
+from dataclasses import asdict, replace
+import logging
+import os
+from pathlib import Path
+
+# 更新批次大小随轨迹长度变化，默认分配器碎片化导致频繁 OOM 重试；须在 CUDA 初始化前设置，worker 子进程继承
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+from insertion import InsertionCfg
+from insertion.config import REAL2SIM_VALUES, runner_config
+from insertion.model import GSDE_DISTRIBUTION, SKIP_RNN_MODEL
+from train import atomic_json, contract, supervise
+
+SEARCH_SHAPES = ("triangle", "pentagon", "hexagon", "l", "rectangle", "dual")
+
+
+def search_config(args: argparse.Namespace) -> InsertionCfg:
+    return replace(
+        replace(InsertionCfg(), **REAL2SIM_VALUES),
+        # 停滞惩罚只在板面受阻时触发，空中漂移可规避，从零训练会退化为远离板面游荡
+        stagnation_cost_per_second=0.0,
+        # 目标上叠加的正弦粘滑空中也一直存在，与真机不符
+        stick_slip_max_pp_m=0.0,
+        wall_friction_force=2.0,
+        clearance_curriculum=True, noise_curriculum=True, noise_curriculum_mode="success",
+        physics_cuda_graph=True, observation_cuda_graph=True,
+        shapes=SEARCH_SHAPES, shape_randomization=True, rim_probability=args.rim_probability,
+        episode_seconds=args.episode_seconds,
+        envs_per_shape=args.envs_per_shape, shape_env_counts=(), adaptive_sampling=True)
+
+
+def search_runner(args: argparse.Namespace) -> dict:
+    runner = runner_config(args.steps)
+    runner["save_interval"] = 1
+    # 部分可观测下 critic 也需记忆：只看当前特权状态的 MLP critic 训练均崩塌
+    for name in ("actor", "critic"):
+        runner[name].update(class_name=SKIP_RNN_MODEL, rnn_hidden_dim=args.rnn_hidden, rnn_num_layers=args.rnn_layers,
+                            hidden_dims=(args.rnn_hidden, args.rnn_hidden // 2))
+    distribution = runner["actor"]["distribution_cfg"]
+    runner["actor"]["distribution_cfg"] = {
+        "class_name": GSDE_DISTRIBUTION, "init_std": distribution["init_std"],
+        "std_range": distribution["std_range"], "resample_steps": args.gsde_resample_steps}
+    # 每卡环境数 × 序列长度 × 256 维 GRU 的更新显存较大，需更小的 minibatch
+    runner["algorithm"]["num_mini_batches"] = args.mini_batches
+    return runner
+
+
+def prepare(args: argparse.Namespace) -> None:
+    devices = [f"cuda:{i}" for i in range(args.gpus)]
+    cfg = search_config(args)
+    args.output.mkdir(parents=True, exist_ok=False)
+    atomic_json(args.output / "config.json", {
+        "environment": asdict(cfg), "runner": search_runner(args), "contract": contract(cfg),
+        "simulation_devices": devices,
+        "collection_backend": "distributed" if len(devices) > 1 else "serial",
+    })
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--output", type=Path, default=Path("runs/search/baseline"))
+    parser.add_argument("--gpus", type=int, default=2)
+    parser.add_argument("--envs-per-shape", type=int, default=4096)
+    parser.add_argument("--steps", type=int, default=128,
+                        help="rollout steps per environment; also the truncated BPTT horizon")
+    parser.add_argument("--mini-batches", type=int, default=16)
+    parser.add_argument("--rnn-hidden", type=int, default=256)
+    parser.add_argument("--rnn-layers", type=int, default=2)
+    parser.add_argument("--gsde-resample-steps", type=int, default=25,
+                        help="gSDE exploration matrix resample period in policy steps")
+    parser.add_argument("--rim-probability", type=float, default=0.5,
+                        help="per-episode probability of a raised rim around the opening")
+    parser.add_argument("--episode-seconds", type=float, default=18.0)
+    parser.add_argument("--prepare-only", action="store_true")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not (args.output / "config.json").exists():
+        prepare(args)
+    if not args.prepare_only:
+        supervise(argparse.Namespace(output=args.output, resume=True, device="cuda:0",
+                                     check_seconds=300., stall_seconds=900., stop_grace_seconds=180.))
+
+
+if __name__ == "__main__":
+    main()
