@@ -9,11 +9,13 @@ import math
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from rsl_rl.models import RNNModel
 from rsl_rl.utils import resolve_callable
 from tensordict import TensorDict
 
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv
+from insertion.search_map import ERASE_MAX, MAP_NLL, MapHead
 
 REASONS = {1: "success", 2: "wrench_limit", 3: "workspace", 4: "timeout", 5: "simulation_failure"}
 
@@ -29,8 +31,41 @@ def load_checkpoint(path: Path, device: str) -> tuple[dict, RNNModel]:
     dummy = TensorDict({"actor": torch.zeros(1, 13, device=device)}, [1])
     actor = model_class(dummy, {"actor": ["actor"]}, "actor", 6, **config).to(device)
     actor.load_state_dict(saved["actor_state_dict"], strict=True)
+    head_state = {key.removeprefix("map_head."): value for key, value in saved.get("critic_state_dict", {}).items()
+                  if key.startswith("map_head.")}
+    if head_state:
+        head = MapHead(actor.latent_dim).to(device)
+        head.load_state_dict(head_state, strict=True)
+        actor = MapPolicy(actor, head)
     actor.eval()
     return metadata, actor
+
+
+class MapPolicy(nn.Module):
+    """概率图策略回放：动作后由擦除头写入环境概率图的待定擦除，使用前须设置 search_map"""
+
+    def __init__(self, actor: RNNModel, head: MapHead) -> None:
+        super().__init__()
+        self.actor, self.head = actor, head
+        self.search_map = None
+        self.latent: torch.Tensor | None = None
+        actor.rnn.register_forward_hook(self.store_latent)
+
+    def store_latent(self, module, inputs, output) -> None:
+        del module, inputs
+        self.latent = output
+
+    @property
+    def distribution(self):
+        return self.actor.distribution
+
+    def forward(self, obs, **kwargs) -> torch.Tensor:
+        actions = self.actor(obs, **kwargs)
+        self.search_map.pending = ERASE_MAX * torch.sigmoid(self.head(self.latent.squeeze(0), obs[MAP_NLL]))
+        return actions
+
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        self.actor.reset(dones)
 
 
 def wilson(successes: int, trials: int) -> tuple[float, float]:
@@ -49,6 +84,8 @@ def evaluate_condition(actor: RNNModel, cfg: InsertionCfg, device: str,
         raise ValueError("trials_per_shape must be positive")
     actor.reset()
     env = InsertionEnv(cfg, device)
+    if isinstance(actor, MapPolicy):
+        actor.search_map = env.search_map
     shapes_by_index = [group.shape for group in env.groups for _ in range(group.n)]
     obs = env.get_observations()
     records = []

@@ -14,9 +14,10 @@ from rsl_rl.env import VecEnv
 from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
-from .config import ALL_SHAPES, InsertionCfg
+from .config import ALL_SHAPES, PPO_DISCOUNT, InsertionCfg
 from .curriculum import ADR_BOUNDARY_FRACTION, ADRCurriculum, SuccessNoiseCurriculum
 from .geometry import build_model, geometry, rough_surface_tiles
+from .search_map import SearchMap, prior_log_mass
 from .shapes.base import PARKED_OFFSET_M
 from .transforms import (action_target, actor_observation, canonical_quat,
                          quat_inv, quat_mul, quat_rotvec, rotate,
@@ -1333,6 +1334,12 @@ class PlantGroup:
         actor, critic = self.observation_outputs
         return actor.clone(), critic.clone()
 
+    def search_map_target(self) -> torch.Tensor:
+        """真实尖端对准孔口时观测尖端在目标点坐标系的 XY，含夹持与标定偏差"""
+        pos, q, _, _ = self.state()
+        observed = tip_pose(pos, q, self.nominal_offset + self.calibration) - tip_pose(pos, q, self.offset)
+        return (observed - self.bias)[:, :2]
+
     def record_position_observation(self, position_noise: torch.Tensor) -> None:
         if not self.cfg.position_observation_delay:
             return
@@ -1717,6 +1724,21 @@ class InsertionEnv(VecEnv):
         self.curriculum_rollout_steps = 256
         self.curriculum_shape_ids = torch.cat([
             torch.full((g.n,), cfg.shapes.index(g.shape), device=device) for g in self.groups])
+        self.search_map = SearchMap(self.num_envs, device) if cfg.search_map else None
+        self.reset_search_map(torch.ones(self.num_envs, dtype=torch.bool, device=device))
+
+    def reset_search_map(self, mask: torch.Tensor) -> None:
+        if self.search_map is None:
+            return
+        ids = mask.nonzero().squeeze(-1)
+        if not len(ids):
+            return
+        cfg = self.groups[0].cfg
+        # 均匀偏差±a 的方差为 a²/3，三项均随回合噪声尺度缩放
+        grasp = cfg.grasp_position_error**2 * (1. if cfg.grasp_error_distribution == "gaussian" else 1/3)
+        std = math.sqrt(grasp + (cfg.tip_calibration_error**2 + cfg.position_bias**2) / 3)
+        scale = torch.cat([g.episode_noise_scale.to(self.device) for g in self.groups])[ids]
+        self.search_map.reset(ids, prior_log_mass(std * scale))
 
     def curriculum_noise_scale(self, group: PlantGroup) -> float:
         scale = None if self.noise_curriculum is None else self.noise_curriculum.scale_for(group.shape)
@@ -1855,16 +1877,24 @@ class InsertionEnv(VecEnv):
         noise_scale = torch.cat([g.episode_noise_scale.to(self.device) for g in self.groups]).unsqueeze(-1)
         # phase 不进入任何网络，仅供 SmoothPPO 的阶段辅助头作监督标签
         phase = torch.cat([g.phase().to(self.device) for g in self.groups]).unsqueeze(-1)
-        return TensorDict({"actor": torch.cat([p[0].to(self.device) for p in pairs]),
-                           "critic": torch.cat([p[1].to(self.device) for p in pairs]),
-                           "free_air": free_air, "noise_scale": noise_scale, "phase": phase},
-                          [self.num_envs])
+        actor = torch.cat([p[0].to(self.device) for p in pairs])
+        critic = torch.cat([p[1].to(self.device) for p in pairs])
+        obs = {"free_air": free_air, "noise_scale": noise_scale, "phase": phase}
+        if self.search_map is not None:
+            truth = torch.cat([g.search_map_target().to(self.device) for g in self.groups])
+            obs.update(self.search_map.observe(-actor[:, :2], truth))
+            # 势函数整形的势由擦除头决定，critic 不看地图无法推断
+            critic = torch.cat((critic, self.search_map.removed.unsqueeze(-1)), -1)
+        return TensorDict({"actor": actor, "critic": critic, **obs}, [self.num_envs])
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
         if actions.shape != (self.num_envs, 6):
             raise ValueError(f"expected {(self.num_envs, 6)} action, got {actions.shape}")
         if not torch.isfinite(actions).all():
             raise FloatingPointError("non-finite policy action; no silent reset")
+        if self.search_map is not None:
+            removed_before = self.search_map.removed.clone()
+            self.search_map.apply()
         chunks = [a.to(g.device) for g, a in zip(
             self.groups, actions.split([g.n for g in self.groups]), strict=True)]
         results = [g.finalize(*p) for g, p in zip(self.groups, self.launch_groups(chunks), strict=True)]
@@ -1878,6 +1908,11 @@ class InsertionEnv(VecEnv):
                                 else min(1., self.policy_steps / g.cfg.curriculum_steps))
         rewards = torch.cat([r[0].to(self.device) for r in results])
         dones = torch.cat([r[1].to(self.device) for r in results])
+        coverage = None
+        if self.search_map is not None and self.groups[0].cfg.search_coverage_reward > 0:
+            after = torch.where(dones.bool(), 0., PPO_DISCOUNT * self.search_map.removed)
+            coverage = self.groups[0].cfg.search_coverage_reward * (after - removed_before)
+            rewards = rewards + coverage
         terminal = {key: torch.cat([r[2][key].to(self.device) for r in results])
                     for key in results[0][2]}
         if self.noise_curriculum is not None:
@@ -1917,6 +1952,9 @@ class InsertionEnv(VecEnv):
             logs[f"reward/{key}"] = torch.stack(
                 [g.last_reward_terms[key].mean().to(self.device)
                  for g in self.groups]).mean()
+        if coverage is not None:
+            logs["reward/search_coverage"] = coverage.mean()
+            logs["map/removed_mass"] = self.search_map.removed.mean()
         successes = {}
         for group, (_, done, info) in zip(self.groups, results, strict=True):
             if self.noise_curriculum is None and bool(done.any()):
@@ -1928,6 +1966,9 @@ class InsertionEnv(VecEnv):
         active = torch.stack([d.any().to(self.device) for d in dones_by_group]).tolist()
         self.concurrent_groups(lambda g, x: g.reset_masked(x[0]) if x[1] else None,
                                list(zip(dones_by_group, active)))
+        if self.search_map is not None:
+            logs.update(self.search_map.metrics)
+            self.reset_search_map(dones)
         for shape, counts in successes.items():
             totals = torch.stack(counts).sum(dim=0)
             if self.noise_curriculum is None:

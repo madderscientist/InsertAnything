@@ -1,7 +1,9 @@
 """实时训练快照与最新策略回放可视化，不包含任何真机控制通信"""
 
 import argparse
+import base64
 from dataclasses import replace
+import io
 import json
 import logging
 import math
@@ -22,6 +24,7 @@ import viser
 
 from insertion import ALL_SHAPES, InsertionCfg, build_model, geometry
 from insertion.env import PlantGroup
+from insertion.search_map import CELL_M, GRID
 from insertion.transforms import quat_rotvec, rotate, rotvec_quat, tip_pose
 
 
@@ -107,6 +110,9 @@ class PolicyReplay:
                     group.noise_scale = 0. if scale is None else scale
                     group.set_clearance(curriculum.clearance_for(group.shape))
                 group.reset(torch.arange(1, device=self.device))
+                if env.search_map is not None:
+                    env.reset_search_map(torch.ones(1, dtype=torch.bool, device=self.device))
+                    actor.search_map = env.search_map
                 obs = env.get_observations()
                 actor.reset()
                 frames = []
@@ -1303,6 +1309,38 @@ class EnvScene:
         self.root.remove()
 
 
+def search_map_html(env: Any, scale: int = 6) -> str:
+    """环境 0 的孔位后验概率图：按当前最大值归一的对数色标，白点=尖端，红点=真实孔位；X 向右、Y 向上"""
+    from PIL import Image
+
+    m = env.search_map
+    logits = (m.log_prior[0] + m.erased[0]).float()
+    # 每帧按当前后验整体重新着色，擦除后剩余格的概率上升会同步变亮
+    v = ((logits - logits.max()) / 8. + 1.).clamp(0., 1.).cpu().numpy()
+    rgb = np.stack((v, np.sqrt(v) * 0.85, 0.6 * (1. - v)), -1)
+    image = np.kron(np.flipud(rgb.transpose(1, 0, 2)), np.ones((scale, scale, 1)))
+    truth = env.groups[0].search_map_target()[0].to(m.log_prior.device)
+    points = [] if m.position is None else [(m.position[0].tolist(), (1., 1., 1.))]
+    points.append(((truth / CELL_M + GRID / 2).tolist(), (1., 0., 0.)))
+    # 按连续格坐标画 2×2 像素小点，不遮挡格子本身的概率颜色
+    size = GRID * scale
+    for (x, y), color in points:
+        row = min(max(round((GRID - y) * scale), 1), size - 1)
+        col = min(max(round(x * scale), 1), size - 1)
+        image[row - 1:row + 1, col - 1:col + 1] = color
+    image = (image * 255).astype(np.uint8)
+    buffer = io.BytesIO()
+    Image.fromarray(image).save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    # 固定定位到窗口左上角，不占右侧控制面板
+    return (f'<div style="position:fixed;top:12px;left:12px;z-index:1000;background:rgba(20,20,20,0.85);'
+            f'padding:6px;border-radius:6px;color:#eee;font-size:12px;line-height:1.4">'
+            f'孔位概率图（X→ Y↑，{CELL_M*1000:.0f} mm/格，{GRID}×{GRID}）<br>'
+            f'<img src="data:image/png;base64,{encoded}" style="display:block;image-rendering:pixelated"><br>'
+            f'亮=后验概率高（相对当前最大值，对数色标 8 nats） <span style="color:#fff">■</span>尖端 '
+            f'<span style="color:#f33">■</span>真实孔位</div>')
+
+
 def run_env_interactive(args: argparse.Namespace) -> None:
     """GPU 单环境逐步实时仿真：物理、观测与训练完全一致，回合参数可在 GUI 中覆盖"""
     from evaluate import load_checkpoint, REASONS
@@ -1347,6 +1385,7 @@ def run_env_interactive(args: argparse.Namespace) -> None:
         client.camera.up_direction = (0., 0., 1.)
 
     status_md = server.gui.add_markdown("正在构建 GPU 仿真环境...")
+    map_panel = server.gui.add_html("") if base.search_map else None
     # 课程默认值取检查点当前等级
     probe_env, _ = build_env(args.shape if args.shape in base.shapes else
                              ("dual" if "dual" in base.shapes else base.shapes[0]), False)
@@ -1542,11 +1581,17 @@ def run_env_interactive(args: argparse.Namespace) -> None:
             override_episode(g)
             g.finish_reset()
         actor.reset()
+        if env.search_map is not None:
+            env.reset_search_map(torch.ones(1, dtype=torch.bool, device=device))
+            actor.search_map = env.search_map
         frame = grab(g)
         scene.rebuild(frame)
         episode.clear()
         episode.update(info=episode_info(g), peak=0.)
-        return env, scene, env.get_observations()
+        obs = env.get_observations()
+        if map_panel is not None:
+            map_panel.content = search_map_html(env)
+        return env, scene, obs
 
     frames = 0
     next_step = time.monotonic()
@@ -1609,6 +1654,8 @@ def run_env_interactive(args: argparse.Namespace) -> None:
                 scene.update(last_frame)
                 if frames % 3 == 0 or request["mode"] == "paused":
                     render_status(last_frame)
+                    if map_panel is not None:
+                        map_panel.content = search_map_html(env)
     finally:
         server.stop()
 

@@ -42,7 +42,8 @@ def search_config(args: argparse.Namespace) -> InsertionCfg:
         physics_cuda_graph=True, observation_cuda_graph=True,
         shapes=SEARCH_SHAPES, shape_randomization=True, rim_probability=args.rim_probability,
         episode_seconds=args.episode_seconds,
-        envs_per_shape=args.envs_per_shape, shape_env_counts=(), adaptive_sampling=True)
+        envs_per_shape=args.envs_per_shape, shape_env_counts=(), adaptive_sampling=True,
+        search_map=args.search_map, search_coverage_reward=args.coverage_reward if args.search_map else 0.)
 
 
 def search_runner(args: argparse.Namespace) -> dict:
@@ -56,13 +57,15 @@ def search_runner(args: argparse.Namespace) -> dict:
             runner[name]["rnn_num_layers"] = args.rnn_layers
     if getattr(args, "critic_rnn_layers", None) is not None:
         runner["critic"]["rnn_num_layers"] = args.critic_rnn_layers
+    runner["actor"]["search_map"] = args.search_map
     distribution = runner["actor"]["distribution_cfg"]
     runner["actor"]["distribution_cfg"] = {
         "class_name": GSDE_DISTRIBUTION, "init_std": distribution["init_std"],
         "std_range": distribution["std_range"], "resample_steps": args.gsde_resample_steps}
     # 每卡环境数 × 序列长度 × 256 维 GRU 的更新显存较大，需更小的 minibatch
     runner["algorithm"].update(num_mini_batches=args.mini_batches,
-                               phase_coef=args.phase_coef, phase_learning_rate=args.phase_lr)
+                               phase_coef=args.phase_coef, phase_learning_rate=args.phase_lr,
+                               map_coef=args.map_coef if args.search_map else 0., map_learning_rate=args.map_lr)
     runner["algorithm"].update(actor_min_lr=getattr(args, "actor_min_lr", DEFAULT_ACTOR_MIN_LR),
                                critic_learning_rate=getattr(args, "critic_lr", "actor"))
     return runner
@@ -102,6 +105,14 @@ def main() -> None:
                         help="phase cross-entropy weight on the actor GRU (default: 0.1, use 0 to disable)")
     parser.add_argument("--phase-lr", type=float, default=1e-3,
                         help="fixed Adam learning rate of the phase head, independent of the KL schedule")
+    parser.add_argument("--search-map", action="store_true",
+                        help="add the prior-initialized, erase-only hole probability map to the observations")
+    parser.add_argument("--map-coef", type=float, default=0.5,
+                        help="one-step NLL weight for the map erase head")
+    parser.add_argument("--map-lr", type=float, default=1e-3,
+                        help="fixed Adam learning rate of the erase head, independent of the KL schedule")
+    parser.add_argument("--coverage-reward", type=float, default=5.0,
+                        help="with --search-map, potential-shaping weight on the prior mass removed by the learned erasure")
     parser.add_argument("--rim-probability", type=float, default=0.5,
                         help="per-episode probability of a raised rim around the opening")
     parser.add_argument("--episode-seconds", type=float, default=InsertionCfg.episode_seconds)

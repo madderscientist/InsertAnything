@@ -294,6 +294,7 @@ def rank_worker(rank: int, world_size: int, port: int, output: Path, attempt: in
             verify_physics(env)
             env = DistributedInsertionEnv(cfg, rank, world_size, output, metadata)
             runner.env = env
+            runner.alg.search_map = env.search_map
         resume_training(runner, cfg, attempt, rank, world_size)
         signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
         signal.signal(signal.SIGINT, lambda *_: stop_event.set())

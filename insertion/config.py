@@ -153,6 +153,10 @@ class InsertionCfg:
     step_moment_bias_max_nm: float = 0.6
     # 训练时以此概率从近期记录的接触难点位姿（贴板、孔口卡滞、半插入）开始回合
     hard_state_reset_probability: float = 0.25
+    # 空间概率记忆：按目标偏差初始化、只减不加的孔位概率图进入观测（insertion/search_map.py）
+    search_map: bool = False
+    # 势函数整形系数 c：Φ = c Σ P0 (1 - e^s)，奖励 γΦ' - Φ，终止时 Φ' = 0，整回合折扣和为零
+    search_coverage_reward: float = 0.0
     # 逐环境随机形状尺寸，并以一定概率在孔口加一圈高出周围平面的围框（孔口顶面始终为 z=0）
     shape_randomization: bool = False
     rim_probability: float = 0.5
@@ -314,6 +318,10 @@ class InsertionCfg:
             raise ValueError("lateral workspace radius must be positive and contain the full initial X/Y square")
         if not math.isfinite(self.plate_outer_radius_m) or self.plate_outer_radius_m < 0:
             raise ValueError("plate outer radius must be finite and nonnegative; zero selects legacy geometry")
+        if self.search_map and not 0 < self.position_bias <= 0.015:
+            raise ValueError("search map requires 0 < position_bias <= 15 mm inside its 48 mm grid")
+        if self.search_coverage_reward < 0 or (self.search_coverage_reward > 0 and not self.search_map):
+            raise ValueError("search coverage reward must be nonnegative and requires the search map")
         if not isinstance(self.shape_randomization, bool) or (self.shape_randomization and not (
                 0 <= self.rim_probability <= 1
                 and 0 < self.rim_height_min_m <= self.rim_height_max_m < self.hole_depth_m

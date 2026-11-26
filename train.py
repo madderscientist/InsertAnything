@@ -605,6 +605,7 @@ class ContinuousRunner(OnPolicyRunner):
         super().__init__(env, prepare_runner_config(config), str(output), str(env.device))
         configure_runner_logging(self)
         self.env = env
+        self.alg.search_map = env.search_map
         self.output, self.metadata = output, metadata
         self.env.curriculum_rollout_steps = config["num_steps_per_env"]
         self.stop_requested = False

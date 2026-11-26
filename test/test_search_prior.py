@@ -210,7 +210,8 @@ class SearchPriorTests(unittest.TestCase):
         torch.set_num_threads(1)
         cfg = InsertionCfg(envs_per_shape=4, shapes=("square",), episode_seconds=0.08, **SEARCH)
         config = search_runner(Namespace(steps=4, rnn_hidden=64, rnn_layers=2, mini_batches=4,
-                                         gsde_resample_steps=25, phase_coef=0.1, phase_lr=1e-3))
+                                         gsde_resample_steps=25, phase_coef=0.1, phase_lr=1e-3,
+                                         search_map=False, map_coef=0.5, map_lr=1e-3))
         self.assertEqual(config["actor"]["distribution_cfg"]["class_name"], GSDE_DISTRIBUTION)
         metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg)}
         with tempfile.TemporaryDirectory() as directory:

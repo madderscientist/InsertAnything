@@ -10,6 +10,9 @@ from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules.distribution import Distribution, GaussianDistribution
 from rsl_rl.utils import unpad_trajectories
 from torch.distributions import Normal
+from torch.utils.checkpoint import checkpoint
+
+from .search_map import MAP_BATCH, MAP_COARSE, MAP_FEATURES, MAP_FINE, MapEncoder
 
 SKIP_RNN_MODEL = "insertion.model:SkipRNNModel"
 GSDE_DISTRIBUTION = "insertion.model:GSDEDistribution"
@@ -84,12 +87,17 @@ def chrono_init(gru: nn.GRU, max_steps: float) -> None:
 
 
 class SkipRNNModel(RNNModel):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, search_map: bool = False, **kwargs) -> None:
+        # 概率图编码与 GRU 并联接入 MLP，维度须在父类构建 MLP 前确定
+        self.map_dim = MAP_FEATURES if search_map else 0
         super().__init__(*args, **kwargs)
         if not isinstance(self.rnn.rnn, nn.GRU):
             raise ValueError("SkipRNNModel supports GRU only")
         # 默认初始化更新门约 0.5，记忆约 2 步且梯度沿时间迅速衰减；不加 LayerNorm，慢单元回合初幅度很小，归一化会放大微小变化
         chrono_init(self.rnn.rnn, CHRONO_MAX_STEPS)
+        if self.map_dim:
+            self.map_encoder = MapEncoder()
+        self.map_cache: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def forward(self, obs, masks: torch.Tensor | None = None, hidden_state=None,
                 stochastic_output: bool = False) -> torch.Tensor:
@@ -116,16 +124,29 @@ class SkipRNNModel(RNNModel):
         memory = self.rnn(current, masks, hidden_state).squeeze(0)
         if masks is not None:
             current = unpad_trajectories(current, masks)
-        return torch.cat((memory, current), -1)
+        if not self.map_dim:
+            return torch.cat((memory, current), -1)
+        if masks is None:
+            return torch.cat((memory, current, self.map_encoder(obs[MAP_FINE], obs[MAP_COARSE])), -1)
+        maps = obs.get_non_tensor(MAP_BATCH)
+        # 平滑正则只扰动力旋量，同一批次的地图特征直接复用；反向时重算卷积不保存激活
+        if self.map_cache is None or self.map_cache[0] is not maps[MAP_FINE]:
+            self.map_cache = (maps[MAP_FINE], checkpoint(self.map_encoder, maps[MAP_FINE], maps[MAP_COARSE],
+                                                         use_reentrant=False))
+        return torch.cat((memory, current, self.map_cache[1]), -1)
 
     def _get_latent_dim(self) -> int:
-        return self.latent_dim + self.obs_dim
+        return self.latent_dim + self.obs_dim + self.map_dim
 
     def as_jit(self) -> nn.Module:
+        if self.map_dim:
+            raise NotImplementedError("search map policies are not exportable yet")
         return _JitSkipGRU(self)
 
     def as_onnx(self, verbose: bool = False) -> nn.Module:
         del verbose
+        if self.map_dim:
+            raise NotImplementedError("search map policies are not exportable yet")
         return _OnnxSkipGRU(self)
 
 
