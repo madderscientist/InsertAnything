@@ -6,7 +6,7 @@
 ## 1. 设计原则
 
 - **只罚不奖、终局一次性奖励**：每个非终止步的奖励严格为负，不存在悬停或往返刷分；成功时一次性给 `+20`。
-- **各项有界**：距离、姿态、负载和动作项都做了饱和，单步成本有理论上界。安全罚分必须大于这个上界的无穷步折扣和，策略因此无法靠触发安全终止来逃避成本（第 5 节）。
+- **各项有界**：距离、姿态、负载和动作项都做了饱和，单步成本有理论上界。安全罚分必须大于零动作悬停到终止的折扣成本，策略因此无法靠触发安全终止来逃避成本（第 5 节）。
 - **按阶段改变约束**：入孔前，倾角不罚、力有死区，鼓励用接触去找孔；入孔后，逐步加大倾角约束，撤掉轴向力成本和死区。
 - **空中要稳，接触可以晃**：动作变化成本在悬空时更重。
 
@@ -29,7 +29,7 @@ $$
 | `action_change_penalty` | $\lVert\bar a_t-\bar a_{t-1}\rVert$ | 悬空 `free_air_action_change_cost_per_second`（0.5）；接触 `action_change_cost_per_second`（0.1） | 动作平滑（3.4） |
 | `stagnation_penalty` | $s\in[0,1]$ | `stagnation_cost_per_second`（2.0，第二阶段 2.5） | 未达目标深度时推进太慢（3.5） |
 | `completion_bonus` | — | `completion_bonus`（20） | 成功终止（第 4 节） |
-| `safety_failure_penalty` | — | `safety_failure_penalty`（800） | 安全失败终止（第 4 节） |
+| `safety_failure_penalty` | — | `safety_failure_penalty`（250） | 安全失败终止（第 4 节） |
 | `timeout_penalty` | — | `timeout_penalty`（10，第二阶段 60） | 超时且未成功、未安全失败 |
 
 ## 3. 运行成本
@@ -101,7 +101,7 @@ $$
 | 结果 | 条件 | 一次性奖励 |
 |---|---|---|
 | 成功 | 尖端连续 `success_hold_steps`=5 步（100 ms）满足 $z_{\text{tip}}\le z_{\text{goal}}+0.2$ mm，且端面中心 XY 在孔口轮廓内（`success_opening_required`） | $+B$=20 |
-| 安全失败 | 逃出工作空间（横向超过 `workspace_xy_radius_m`、高度超过 `workspace_z_max_m`、低于孔底）、倾角大于 35°、单环境物理发散（NaN 或接触缓冲溢出） | $-P_X$=800 |
+| 安全失败 | 逃出工作空间（横向超过 `workspace_xy_radius_m`、高度超过 `workspace_z_max_m`、低于孔底）、倾角大于 35°、单环境物理发散（NaN 或接触缓冲溢出） | $-P_X$=250 |
 | 超时 | 达到 `episode_seconds`，且既未成功也未安全失败 | $-P_T$ |
 
 - **过载**：默认 `terminate_on_overload`=false。某一步内 1 ms 子步的未滤波峰值力超过 30 N 或力矩超过 2 N·m 时，回合不终止，只是成功保持计数清零，并由 3.3 的二次负载成本提供梯度。设为 true 时，过载直接按安全失败终止，viser 回放时默认这样处理。
@@ -112,10 +112,10 @@ $$
 `InsertionCfg` 在构造时校验：
 
 $$
-P_X>\max\!\left(\frac{C_{\text{step,max}}}{1-\gamma},\;C_{\text{step,max}}+P_T\right)
+P_X>\frac{C_{\text{hold}}}{1-\gamma}+P_T
 $$
 
-$C_{\text{step,max}}$ 是第 3 节各项上界之和（`completion_step_cost_bound`），动作变化项取悬空和接触两个系数中较大者。提高任何成本权重时，都要同时检查安全罚分是否还满足这一条件。
+$C_{\text{hold}}$ 是零动作悬停时仍不可避免的单步成本上界（时间、位置、姿态、停滞四项，`hold_cost_bound`）。卡住的策略随时可以悬停到终止，所以失败罚分只要超过这条退路的成本，主动出界就不会更划算。不再用含动作与负载上限的 $C_{\text{step,max}}$：它由动作变化成本上限主导，推出的 800 罚分远大于成功奖励，少数失败样本会主导回报方差。默认参数下右侧约 130。
 
 ## 6. 各阶段取值
 
@@ -127,7 +127,7 @@ $C_{\text{step,max}}$ 是第 3 节各项上界之和（`completion_step_cost_bou
 | `stagnation_cost_per_second` / 阈值 / 窗口 | 2.0 / 6 mm/s / 0.4 s | 2.5 / 2.5 mm/s / 0.7 s | 同第二阶段 |
 | `surface_z_free_m` | 0 | 0.006 | 0.006 |
 | `episode_seconds` / `timeout_penalty` | 8 s / 10 | 30 s / 60 | 30 s / 60 |
-| `safety_failure_penalty` | 800 | 600 | 800 |
+| `safety_failure_penalty` | 250 | 600 | 250 |
 
 第二阶段那一列取自产出 961 的那次训练。之后从第一阶段新训练进入第二阶段时，会沿用新的平滑默认值。
 

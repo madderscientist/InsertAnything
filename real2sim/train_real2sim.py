@@ -29,10 +29,8 @@ ACTION_STD_MAX = 0.4
 def real2sim_config(source_environment: dict) -> InsertionCfg:
     defaults = InsertionCfg()
     source = InsertionCfg.from_checkpoint(source_environment)
-    # 更高的动作变化成本抬高单步成本上界，安全罚分至少取新默认值以保持不可自杀逃避
-    return replace(source, **REAL2SIM_VALUES,
-                   safety_failure_penalty=max(source.safety_failure_penalty,
-                                              defaults.safety_failure_penalty))
+    # 旧检查点可能带 800 的安全罚分，统一改用当前默认值
+    return replace(source, **REAL2SIM_VALUES, safety_failure_penalty=defaults.safety_failure_penalty)
 
 
 def prepare(source: Path, output: Path, device: str, envs_per_shape: int | None = None,

@@ -736,6 +736,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
         env.curriculum_pending.clear()
         env.curriculum_cohort = None
         env.curriculum_cohort_seen = None
+        env.curriculum_cohort_armed = None
     for index, group in enumerate(env.groups):
         if env.noise_curriculum is not None:
             group.difficulty = env.noise_curriculum.difficulty

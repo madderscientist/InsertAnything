@@ -8,6 +8,10 @@ from rsl_rl.utils import unpad_trajectories
 WRENCH_SLICE = slice(7, 13)
 SMOOTH_PPO = "insertion.ppo:SmoothPPO"
 
+# TF32 下 rollout 逐步推理与更新时整段推理的误差经 GRU 累积，旧策略概率失真
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+
 
 class SmoothPPO(PPO):
     def __init__(self, *args, smooth_coef: float = 0.0, smooth_force_std: float = 0.5,
@@ -18,12 +22,27 @@ class SmoothPPO(PPO):
         self.smooth_coef = smooth_coef
         self.smooth_std = torch.tensor([smooth_force_std]*3 + [smooth_moment_std]*3, device=self.device)
 
+    def process_env_step(self, obs, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
+        # 采样期间冻结归一化，否则存储的旧策略与更新时重算的不一致；整批在 update 末尾合并
+        del obs
+        self.transition.rewards = rewards.clone()
+        self.transition.dones = dones
+        if "time_outs" in extras:
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1)
+        self.storage.add_transition(self.transition)
+        self.transition.clear()
+        self.actor.reset(dones)
+        self.critic.reset(dones)
+
     def smooth_loss(self, batch, clean_mean: torch.Tensor) -> torch.Tensor:
         # 仅在悬空步扰动力旋量观测，并只在悬空输出步惩罚动作均值变化；接触时对力的响应不受约束
         obs = batch.observations
         free = obs["free_air"]
         actor_obs = obs["actor"].clone()
-        actor_obs[..., WRENCH_SLICE] += torch.randn_like(actor_obs[..., WRENCH_SLICE]) * self.smooth_std * free
+        # 与环境振动和传感噪声同步启用，噪声关闭阶段悬空力旋量没有需要忽略的干扰
+        actor_obs[..., WRENCH_SLICE] += (torch.randn_like(actor_obs[..., WRENCH_SLICE]) * self.smooth_std
+                                         * free * obs["noise_scale"])
         perturbed = obs.clone(False)
         perturbed["actor"] = actor_obs
         mean = self.actor(perturbed, masks=batch.masks, hidden_state=batch.hidden_states[0])
@@ -95,6 +114,9 @@ class SmoothPPO(PPO):
             totals["surrogate"] += surrogate_loss.item()
             totals["entropy"] += entropy.mean().item()
             totals["smooth"] += smooth.item()
+        observations = self.storage.observations.flatten(0, 1)
+        self.actor.update_normalization(observations)
+        self.critic.update_normalization(observations)
         self.storage.clear()
         updates = self.num_learning_epochs * self.num_mini_batches
         return {key: value / updates for key, value in totals.items()}

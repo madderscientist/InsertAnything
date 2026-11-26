@@ -27,7 +27,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         curriculum = SuccessNoiseCurriculum(("square",))
         env = SimpleNamespace(
             noise_curriculum=curriculum, curriculum_pending=[], groups=[],
-            curriculum_cohort=None, curriculum_cohort_seen=None)
+            curriculum_cohort=None, curriculum_cohort_seen=None, curriculum_cohort_armed=None)
         batch = torch.zeros(1000, 4)
         batch[:, 3] = 1
         batch[:799, 1:3] = 1
@@ -47,10 +47,43 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(curriculum.level, 0)
         self.assertFalse(env.curriculum_cohort_seen.any())
         batch[:, 1:3] = 1
+        # 跨越队列起点的回合不计入，下一批才是队列开始后的完整回合
+        env.curriculum_pending.append(batch.clone())
+        InsertionEnv.advance_noise_curriculum(env)
+        self.assertEqual(curriculum.level, 0)
         env.curriculum_pending.append(batch.clone())
         InsertionEnv.advance_noise_curriculum(env)
         self.assertEqual(curriculum.level, 1)
         self.assertEqual(len(curriculum.windows["square"]), 0)
+
+    def test_curriculum_cohort_excludes_episodes_in_progress_at_start(self):
+        curriculum = SuccessNoiseCurriculum(("square",))
+        env = SimpleNamespace(
+            noise_curriculum=curriculum, curriculum_pending=[], groups=[],
+            curriculum_cohort=None, curriculum_cohort_seen=None, curriculum_cohort_armed=None)
+
+        def step(done, success):
+            batch = torch.zeros(1000, 4)
+            batch[:, 3] = 1
+            batch[done, 1] = 1
+            batch[done & success, 2] = 1
+            env.curriculum_pending.append(batch)
+            InsertionEnv.advance_noise_curriculum(env)
+
+        everyone = torch.ones(1000, dtype=torch.bool)
+        nobody = torch.zeros(1000, dtype=torch.bool)
+        fast = torch.arange(1000) < 700
+        step(everyone, nobody)
+        self.assertEqual(sum(curriculum.windows["square"]), 0)
+        # 新队列开始时已在进行的回合按时长偏向失败，不计入
+        step(fast, everyone)
+        step(~fast, nobody)
+        self.assertEqual(sum(curriculum.windows["square"]), 0)
+        self.assertFalse(env.curriculum_cohort_seen.any())
+        step(fast, everyone)
+        self.assertEqual(curriculum.level, 0)
+        step(~fast, everyone)
+        self.assertEqual(curriculum.level, 1)
 
     def test_depth_success_hold_reset_and_safety(self):
         cfg = InsertionCfg(success_opening_required=False)
@@ -368,7 +401,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         worst = self.reward(z=1000., xy=1000., tilt=180., yaw=180.,
                             force=1000., moment=1000., action=100., previous=-100.)
         self.assertGreaterEqual(worst, -cfg.completion_step_cost_bound)
-        self.assertLess(self.reward(failure=True), -cfg.completion_step_cost_bound / (1 - PPO_DISCOUNT))
+        self.assertLess(self.reward(failure=True), -cfg.hold_cost_bound)
 
     def test_squared_xy_and_linear_remaining_depth(self):
         cfg, legacy_cfg = InsertionCfg(), InsertionCfg.from_checkpoint({})
@@ -755,7 +788,7 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
             align_goal_z_to_observation=True,
             rotation_bias=math.radians(1.5),
             stagnation_cost_per_second=2.5,
-            safety_failure_penalty=800.0,
+            safety_failure_penalty=250.0,
             dynamics="train",
             training=False,
         )

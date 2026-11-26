@@ -184,7 +184,7 @@ class InsertionCfg:
     # 让 ~20 单位的大动作仍有代价梯度
     action_cost_cap: float = 12.0
     completion_bonus: float = 20.0
-    safety_failure_penalty: float = 800.0
+    safety_failure_penalty: float = 250.0
     timeout_penalty: float = 10.0
 
     def __post_init__(self) -> None:
@@ -370,11 +370,9 @@ class InsertionCfg:
             raise ValueError("completion cost weights and deadbands must be finite and nonnegative")
         if self.force_cost_free_n >= self.max_force or self.moment_cost_free_nm >= self.max_moment:
             raise ValueError("load cost deadbands must be below safety limits")
-        # 安全失败罚分必须严格大于最差折扣累计运行成本，防止智能体通过自杀提前终止逃避惩罚
-        if self.safety_failure_penalty <= max(
-                self.completion_step_cost_bound/(1-PPO_DISCOUNT),
-                self.completion_step_cost_bound+self.timeout_penalty):
-            raise ValueError("safety failure penalty must exceed the worst discounted running/deadline cost")
+        # 卡住时随时可零动作悬停至终止，失败罚分只需超过这条退路的成本即可杜绝自杀
+        if self.safety_failure_penalty <= self.hold_cost_bound:
+            raise ValueError("safety failure penalty must exceed the discounted cost of holding still until termination")
         if not math.isfinite(self.impedance_walk_fraction) or not 0 <= self.impedance_walk_fraction < 1:
             raise ValueError("impedance walk fraction must be finite and in [0, 1)")
         walk_positive = (self.impedance_walk_rate_per_second,
@@ -387,8 +385,16 @@ class InsertionCfg:
             raise ValueError("impedance walk interval must be a positive multiple of 0.02 s")
 
     @property
+    def hold_cost_bound(self) -> float:
+        # 零动作、无超限负载时仍不可避免的成本项，按无限期折扣并计入超时罚分
+        return self.physics_dt*self.decimation*(
+            self.time_cost_per_second + self.position_cost_per_second*self.position_cost_cap
+            + 2*self.orientation_cost_per_second + self.stagnation_cost_per_second
+        )/(1-PPO_DISCOUNT) + self.timeout_penalty
+
+    @property
     def completion_step_cost_bound(self) -> float:
-        # 单步运行成本的理论上界，用于校验安全失败罚分下界
+        # 单步运行成本的理论上界
         load_cap_sq = self.load_cost_cap ** 2
         return self.physics_dt*self.decimation*(
             self.time_cost_per_second + self.position_cost_per_second*self.position_cost_cap

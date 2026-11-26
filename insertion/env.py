@@ -1374,6 +1374,7 @@ class InsertionEnv(VecEnv):
         self.curriculum_pending: list[torch.Tensor] = []
         self.curriculum_cohort: torch.Tensor | None = None
         self.curriculum_cohort_seen: torch.Tensor | None = None
+        self.curriculum_cohort_armed: torch.Tensor | None = None
         self.curriculum_distributed = False
         self.curriculum_rollout_steps = 256
         self.curriculum_shape_ids = torch.cat([
@@ -1394,14 +1395,19 @@ class InsertionEnv(VecEnv):
             self.curriculum_cohort = torch.zeros_like(batches[0])
             self.curriculum_cohort_seen = torch.zeros(
                 len(batches[0]), dtype=torch.bool, device=outcomes.device)
+            # 首个队列由重置后的全新回合组成
+            self.curriculum_cohort_armed = torch.ones_like(self.curriculum_cohort_seen)
         cohort = self.curriculum_cohort
         seen = self.curriculum_cohort_seen
-        assert seen is not None
-        # Each environment contributes once; wait for slow failures as well as fast successes.
+        armed = self.curriculum_cohort_armed
+        assert seen is not None and armed is not None
+        # 每个环境只计入队列开始后才开始的首个回合，避免长失败回合被按时长加权采样
         for batch in batches:
-            selected = batch[:, 1].bool() & batch[:, 3].bool() & ~seen
+            done = batch[:, 1].bool()
+            selected = done & batch[:, 3].bool() & armed & ~seen
             cohort[selected] = batch[selected]
             seen |= selected
+            armed |= done
         complete = bool(seen.all())
         shapes = tuple(self.noise_curriculum.windows)
         recent = {}
@@ -1419,6 +1425,7 @@ class InsertionEnv(VecEnv):
         upgraded = self.noise_curriculum.update(recent) if complete else False
         if complete:
             seen.zero_()
+            armed.zero_()
         if upgraded:
             logging.info(
                 "Success curriculum level %d: clearance %.2f -> %.2f mm, "
@@ -1451,9 +1458,11 @@ class InsertionEnv(VecEnv):
         # free_air 不进入任何网络，仅供 SmoothPPO 选择悬空步
         free_air = torch.cat([(g.step_peak_contact <= CONTACT_THRESHOLD_N).float().to(self.device)
                               for g in self.groups]).unsqueeze(-1)
+        # noise_scale 不进入任何网络，供 SmoothPPO 按当前噪声课程缩放悬空扰动
+        noise_scale = torch.cat([g.episode_noise_scale.to(self.device) for g in self.groups]).unsqueeze(-1)
         return TensorDict({"actor": torch.cat([p[0].to(self.device) for p in pairs]),
                            "critic": torch.cat([p[1].to(self.device) for p in pairs]),
-                           "free_air": free_air},
+                           "free_air": free_air, "noise_scale": noise_scale},
                           [self.num_envs])
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
