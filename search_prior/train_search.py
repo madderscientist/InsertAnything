@@ -61,7 +61,8 @@ def search_runner(args: argparse.Namespace) -> dict:
         "class_name": GSDE_DISTRIBUTION, "init_std": distribution["init_std"],
         "std_range": distribution["std_range"], "resample_steps": args.gsde_resample_steps}
     # 每卡环境数 × 序列长度 × 256 维 GRU 的更新显存较大，需更小的 minibatch
-    runner["algorithm"]["num_mini_batches"] = args.mini_batches
+    runner["algorithm"].update(num_mini_batches=args.mini_batches,
+                               phase_coef=args.phase_coef, phase_learning_rate=args.phase_lr)
     runner["algorithm"].update(actor_min_lr=getattr(args, "actor_min_lr", DEFAULT_ACTOR_MIN_LR),
                                critic_learning_rate=getattr(args, "critic_lr", "actor"))
     return runner
@@ -95,6 +96,10 @@ def main() -> None:
                         help="follow the actor KL schedule (default), or specify a fixed critic learning rate")
     parser.add_argument("--gsde-resample-steps", type=int, default=25,
                         help="gSDE exploration matrix resample period in policy steps")
+    parser.add_argument("--phase-coef", type=float, default=0.0,
+                        help="cross-entropy weight of the linear phase head supervising the actor GRU output")
+    parser.add_argument("--phase-lr", type=float, default=1e-3,
+                        help="fixed Adam learning rate of the phase head, independent of the KL schedule")
     parser.add_argument("--rim-probability", type=float, default=0.5,
                         help="per-episode probability of a raised rim around the opening")
     parser.add_argument("--episode-seconds", type=float, default=18.0)

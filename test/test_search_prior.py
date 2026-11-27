@@ -155,7 +155,7 @@ class SearchPriorTests(unittest.TestCase):
         torch.set_num_threads(1)
         cfg = InsertionCfg(envs_per_shape=4, shapes=("square",), episode_seconds=0.08, **SEARCH)
         config = search_runner(Namespace(steps=4, rnn_hidden=64, rnn_layers=2, mini_batches=4,
-                                         gsde_resample_steps=25))
+                                         gsde_resample_steps=25, phase_coef=0.1, phase_lr=1e-3))
         self.assertEqual(config["actor"]["distribution_cfg"]["class_name"], GSDE_DISTRIBUTION)
         metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg)}
         with tempfile.TemporaryDirectory() as directory:
@@ -167,6 +167,10 @@ class SearchPriorTests(unittest.TestCase):
             runner.learn(1)
             self.assertFalse(torch.equal(before, runner.alg.critic.rnn.rnn.weight_hh_l0.detach()))
             saved = torch.load(output / "checkpoint.pt", weights_only=True, map_location="cpu")
+            self.assertEqual(saved["critic_state_dict"]["phase_head.weight"].shape, (4, 64))
+            labels = runner.env.get_observations()["phase"]
+            self.assertEqual(labels.dtype, torch.long)
+            self.assertTrue(bool(((labels >= 0) & (labels < 4)).all()))
             resumed = ContinuousRunner(InsertionEnv(cfg, "cuda:0"), config, output, metadata)
             resume_training(resumed, cfg, 1)
             torch.testing.assert_close(resumed.alg.critic.rnn.rnn.weight_hh_l0.cpu(),
@@ -177,7 +181,7 @@ class SearchPriorTests(unittest.TestCase):
                 i for group in optimizer["param_groups"] for i in group["params"]]}]}
             resumed.alg.load({**saved, "optimizer_state_dict": merged}, None, True)
             self.assertEqual([g["lr"] for g in resumed.alg.optimizer.param_groups],
-                             [1e-6, 1e-6])
+                             [1e-6, 1e-6, 1e-3])
             resumed.learn(1)
             _, actor = load_checkpoint(output / "checkpoint.pt", "cuda:0")
             self.assertIsInstance(actor, SkipRNNModel)

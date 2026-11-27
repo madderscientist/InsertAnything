@@ -11,6 +11,7 @@ from rsl_rl.utils import unpad_trajectories
 WRENCH_SLICE = slice(7, 13)
 SMOOTH_PPO = "insertion.ppo:SmoothPPO"
 DEFAULT_ACTOR_MIN_LR = 1e-5
+PHASES = 4
 
 # TF32 下 rollout 逐步推理与更新时整段推理的误差经 GRU 累积，旧策略概率失真
 torch.backends.cudnn.allow_tf32 = False
@@ -18,8 +19,8 @@ torch.backends.cuda.matmul.allow_tf32 = False
 
 
 class SmoothPPO(PPO):
-    def __init__(self, *args, smooth_coef: float = 0.0, smooth_force_std: float = 0.5,
-                 smooth_moment_std: float = 0.05,
+    def __init__(self, actor, critic, *args, smooth_coef: float = 0.0, smooth_force_std: float = 0.5,
+                 smooth_moment_std: float = 0.05, phase_coef: float = 0.0, phase_learning_rate: float = 1e-3,
                  actor_min_lr: float = DEFAULT_ACTOR_MIN_LR, critic_learning_rate: float | Literal["actor"] = "actor",
                  **kwargs) -> None:
         if not 0 < actor_min_lr <= 1e-2:
@@ -28,15 +29,24 @@ class SmoothPPO(PPO):
         if not follows_actor and (not isinstance(critic_learning_rate, (int, float))
                                   or not 0 < critic_learning_rate < math.inf):
             raise ValueError("critic_learning_rate must be positive and finite or 'actor'")
-        super().__init__(*args, **kwargs)
+        if phase_coef > 0:
+            # 线性读出 actor GRU 输出；挂在 critic 上：随 critic 保存与多卡同步，且不进入导出的 actor
+            critic.phase_head = nn.Linear(actor.rnn.rnn.hidden_size, PHASES)
+        super().__init__(actor, critic, *args, **kwargs)
         if self.rnd or self.symmetry:
             raise ValueError("SmoothPPO does not support RND or symmetry extensions")
         self.smooth_coef = smooth_coef
         self.actor_min_lr = actor_min_lr
         critic_lr = self.learning_rate if follows_actor else critic_learning_rate
         self.smooth_std = torch.tensor([smooth_force_std]*3 + [smooth_moment_std]*3, device=self.device)
+        self.phase_coef = phase_coef
+        self.memory: torch.Tensor | None = None
+        head = list(self.critic.phase_head.parameters()) if phase_coef > 0 else []
         groups = [{"params": list(self.actor.parameters())},
-                  {"params": list(self.critic.parameters()), "lr": critic_lr}]
+                  {"params": [p for p in self.critic.parameters() if all(p is not q for q in head)], "lr": critic_lr}]
+        if head:
+            groups.append({"params": head, "lr": phase_learning_rate})
+            self.actor.rnn.register_forward_hook(self.store_memory)
         self.optimizer = type(self.optimizer)(groups, lr=self.learning_rate)
         self.num_adaptive_groups = 2 if follows_actor else 1
         self.fixed_rates = [g["lr"] for g in self.optimizer.param_groups[self.num_adaptive_groups:]]
@@ -63,6 +73,16 @@ class SmoothPPO(PPO):
         for group, rate in zip(self.optimizer.param_groups[self.num_adaptive_groups:], self.fixed_rates, strict=True):
             group["lr"] = rate
         return loaded
+
+    def store_memory(self, module, inputs, output) -> None:
+        del module, inputs
+        self.memory = output
+
+    def phase_loss(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        labels = unpad_trajectories(batch.observations["phase"], batch.masks).flatten()
+        logits = self._raw_critic.phase_head(self.memory).flatten(0, -2)
+        accuracy = (logits.argmax(-1) == labels).float().mean()
+        return nn.functional.cross_entropy(logits, labels), accuracy
 
     def process_env_step(self, obs, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
         # 采样期间冻结归一化，否则存储的旧策略与更新时重算的不一致；整批在 update 末尾合并
@@ -92,7 +112,8 @@ class SmoothPPO(PPO):
         return ((mean - clean_mean).square().sum(-1, keepdim=True) * weight).sum() / weight.sum().clamp_min(1.)
 
     def update(self) -> dict[str, float]:
-        totals = {"value": 0., "surrogate": 0., "entropy": 0., "smooth": 0., "kl": 0.}
+        totals = {"value": 0., "surrogate": 0., "entropy": 0., "smooth": 0., "kl": 0.,
+                  "phase": 0., "phase_accuracy": 0.}
         generator = (self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
                      if self.actor.is_recurrent or self.critic.is_recurrent
                      else self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs))
@@ -139,6 +160,11 @@ class SmoothPPO(PPO):
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            # 须在平滑正则再次前向覆盖 memory 之前计算
+            phase = phase_accuracy = torch.zeros((), device=self.device)
+            if self.phase_coef > 0:
+                phase, phase_accuracy = self.phase_loss(batch)
+                loss = loss + self.phase_coef * phase
             smooth = torch.zeros((), device=self.device)
             if self.smooth_coef > 0:
                 smooth = self.smooth_loss(batch, clean_mean)
@@ -156,6 +182,8 @@ class SmoothPPO(PPO):
             totals["surrogate"] += surrogate_loss.item()
             totals["entropy"] += entropy.mean().item()
             totals["smooth"] += smooth.item()
+            totals["phase"] += phase.item()
+            totals["phase_accuracy"] += phase_accuracy.item()
         observations = self.storage.observations.flatten(0, 1)
         self.actor.update_normalization(observations)
         self.critic.update_normalization(observations)

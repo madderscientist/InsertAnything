@@ -1195,6 +1195,17 @@ class PlantGroup:
         base = plane - lowest if surface_height is None else surface_height + plane - lowest
         return base.clamp_min(self.cfg.initial_z_min)
 
+    def phase(self) -> torch.Tensor:
+        # 阶段监督标签（特权信息）：0 悬空，1 贴板但尖端不在开口投影内，2 尖端在开口投影内受阻，3 已入孔 0.5 mm 以上
+        pos, q, _, _ = self.state()
+        tip = tip_pose(pos, q, self.offset)
+        over = (self.geometry.definition.opening_contains(self.geo, self.shape_params, tip[:, None, :2])[:, 0]
+                if self.cfg.shape_randomization
+                else torch.linalg.vector_norm(tip[:, :2], dim=-1) < self.geometry.radius)
+        contact = self.step_peak_contact > CONTACT_THRESHOLD_N
+        inserted = over & (tip[:, 2] < -0.0005)
+        return torch.where(inserted, 3, torch.where(~contact, 0, torch.where(over, 2, 1)))
+
     def state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         pos = self.sim.data.qpos[:, :3]
         q = canonical_quat(self.sim.data.qpos[:, 3:7])
@@ -1762,9 +1773,11 @@ class InsertionEnv(VecEnv):
                               for g in self.groups]).unsqueeze(-1)
         # noise_scale 不进入任何网络，供 SmoothPPO 按当前噪声课程缩放悬空扰动
         noise_scale = torch.cat([g.episode_noise_scale.to(self.device) for g in self.groups]).unsqueeze(-1)
+        # phase 不进入任何网络，仅供 SmoothPPO 的阶段辅助头作监督标签
+        phase = torch.cat([g.phase().to(self.device) for g in self.groups]).unsqueeze(-1)
         return TensorDict({"actor": torch.cat([p[0].to(self.device) for p in pairs]),
                            "critic": torch.cat([p[1].to(self.device) for p in pairs]),
-                           "free_air": free_air, "noise_scale": noise_scale},
+                           "free_air": free_air, "noise_scale": noise_scale, "phase": phase},
                           [self.num_envs])
 
     def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
