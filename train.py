@@ -182,7 +182,7 @@ def contract(cfg: InsertionCfg) -> dict:
             "reset": "replicate initial noisy position error; no history across episodes",
             "clock": "policy-step length only; reads and graph capture do not advance history",
             "quaternion_and_wrench": "current",
-            "critic": "clean and current; 57 dimensions",
+            "critic": "clean and current",
         },
         "position_error": (
             "historical target minus estimated tip, in fixed hole axes; see position_observation_delay"
