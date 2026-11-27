@@ -12,7 +12,7 @@ import mujoco
 import torch
 
 from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
-                       SuccessNoiseCurriculum, TRAIN_SHAPES, bounded_stiffness_step,
+                       ADRCurriculum, SuccessNoiseCurriculum, TRAIN_SHAPES, bounded_stiffness_step,
                        completion_cost_terms, geometry, quat_rotvec, tip_pose)
 from insertion.config import REAL2SIM_VALUES
 from insertion.curriculum import adaptive_environment_counts
@@ -29,7 +29,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         env = SimpleNamespace(
             noise_curriculum=curriculum, curriculum_pending=[], groups=[],
             curriculum_cohort=None, curriculum_cohort_seen=None, curriculum_cohort_armed=None)
-        batch = torch.zeros(1000, 4)
+        batch = torch.zeros(1000, 5)
         batch[:, 3] = 1
         # 起始回合不计入，先让全部环境结束一次
         batch[:, 1] = 1
@@ -68,7 +68,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             curriculum_cohort=None, curriculum_cohort_seen=None, curriculum_cohort_armed=None)
 
         def step(done, success):
-            batch = torch.zeros(1000, 4)
+            batch = torch.zeros(1000, 5)
             batch[:, 3] = 1
             batch[done, 1] = 1
             batch[done & success, 2] = 1
@@ -505,6 +505,39 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(reversed_.tolist(), [True, False, False])
         self.assertEqual(valid.tolist(), [True, True, False])
 
+    def test_adr_adjusts_noise_and_clearance_independently(self):
+        curriculum = ADRCurriculum(("square", "triangle"), 0.002, 0.0001)
+        full = {"square": [True] * 10, "triangle": [True] * 10}
+        none: tuple[list[bool], list[bool]] = ([], [])
+        self.assertEqual((curriculum.clearance_for("square"), curriculum.difficulty), (0.002, 0.))
+        self.assertFalse(curriculum.update(full, {"square": ([True] * 199, []), "triangle": none}))
+        self.assertTrue(curriculum.update(full, {"square": ([True], []), "triangle": none}))
+        self.assertEqual(curriculum.phi, {"square": [0.05, 0.], "triangle": [0., 0.]})
+        self.assertEqual(curriculum.difficulty, 0.)
+        # 间隙维单独计数；缓冲带内不调节，已在下限时不再回退
+        self.assertFalse(curriculum.update(full, {"square": ([], [True] * 130 + [False] * 70), "triangle": none}))
+        self.assertFalse(curriculum.update(full, {"square": ([], [False] * 200), "triangle": none}))
+        for _ in range(20):
+            curriculum.update(full, {"square": ([True] * 200, [True] * 200),
+                                     "triangle": ([True] * 200, [True] * 200)})
+        self.assertEqual(curriculum.phi, {"square": [1., 1.], "triangle": [1., 1.]})
+        self.assertEqual(curriculum.difficulty, 1.)
+        self.assertAlmostEqual(curriculum.clearance_for("triangle"), 0.0001)
+        self.assertTrue(curriculum.update(full, {"square": ([], [False] * 200), "triangle": none}))
+        self.assertEqual(curriculum.phi["square"], [1., 0.95])
+        self.assertAlmostEqual(curriculum.clearance_for("square"), 0.002 * 0.05 ** 0.95)
+        restored = ADRCurriculum(("square", "triangle"), 0.002, 0.0001)
+        restored.load_state_dict(curriculum.state_dict())
+        self.assertEqual(restored.state_dict(), curriculum.state_dict())
+        cfg = InsertionCfg(noise_curriculum=True, noise_curriculum_mode="adr",
+                           shape_randomization=True, shapes=("triangle",))
+        self.assertEqual(cfg.noise_scale(0), 0.)
+        with self.assertRaises(ValueError):
+            InsertionCfg(noise_curriculum_mode="adr")
+        with self.assertRaises(ValueError):
+            InsertionCfg(noise_curriculum=True, noise_curriculum_mode="adr",
+                         shape_randomization=True, shapes=("square",))
+
     def test_clearance_difficulty_and_noise_curriculum(self):
         levels = (0.002, 0.001, 0.0005, 0.00025, 0.00015, 0.0001)
         curriculum = SuccessNoiseCurriculum(("square", "triangle"), clearances=levels, noise_levels=10)
@@ -686,10 +719,10 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(group.action_graph)
         self.assertIsNotNone(group.outcome_graph)
         # 起始回合不计入，先让全部环境结束一次
-        env.record_curriculum_outcomes(torch.tensor([[0, 1, 0, 1]] * 4, device=self.device))
+        env.record_curriculum_outcomes(torch.tensor([[0, 1, 0, 1, 0]] * 4, device=self.device))
         env.advance_noise_curriculum()
         env.noise_curriculum.windows["square"].extend([True] * 996)
-        env.record_curriculum_outcomes(torch.tensor([[0, 1, 1, 1]] * 4, device=self.device))
+        env.record_curriculum_outcomes(torch.tensor([[0, 1, 1, 1, 0]] * 4, device=self.device))
         logs = env.advance_noise_curriculum()
         self.assertEqual(group.clearance, 0.001)
         self.assertEqual(group.sim.wp_data.naconmax, group.n * 64)

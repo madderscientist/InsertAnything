@@ -38,7 +38,7 @@ def search_config(args: argparse.Namespace) -> InsertionCfg:
         free_air_action_change_squared=True,
         # ζ=0.25 超调 44%，满难度下悬空惯性力 p90 近 5 N；0.5 超调 16%
         damping_ratio_min=0.5,
-        clearance_curriculum=True, noise_curriculum=True, noise_curriculum_mode="success",
+        clearance_curriculum=True, noise_curriculum=True, noise_curriculum_mode="adr",
         physics_cuda_graph=True, observation_cuda_graph=True,
         shapes=SEARCH_SHAPES, shape_randomization=True, rim_probability=args.rim_probability,
         episode_seconds=args.episode_seconds,

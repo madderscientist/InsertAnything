@@ -123,7 +123,8 @@ def add_prism(parent: ET.Element, assets: ET.Element, name: str, polygon: np.nda
 class InsertionShape(ABC):
     """一对配合的插头和孔板；镜像轴为孔坐标系中穿过原点的 XY 方向向量。
 
-    几何查询均按环境接收形状参数 params (n, SHAPE_PARAM_DIM)；默认实现对应固定名义几何。
+    几何查询均按环境接收参数 params (n, SHAPE_PARAM_DIM+1)：前 SHAPE_PARAM_DIM 列为形状参数，
+    末列为本回合直径间隙；默认实现对应固定名义几何。
     """
 
     name: str
@@ -189,7 +190,7 @@ class InsertionShape(ABC):
         """Return the hole polygon, peg polygon, and circle approximation error."""
 
     def add_plate_colliders(self, hole: ET.Element, assets: ET.Element, g: Geometry) -> None:
-        add_walls(hole, assets, g, g.hole_polygon, "wall_")
+        add_walls(hole, g, g.hole_polygon, "wall_")
 
     def add_peg_colliders(self, body: ET.Element, assets: ET.Element, g: Geometry,
                           tip_z: float) -> None:
@@ -212,8 +213,8 @@ class InsertionShape(ABC):
         return float(torch.linalg.vector_norm(peg_polygon, dim=-1).amax())
 
 
-def add_walls(hole: ET.Element, assets: ET.Element, g: Geometry, p: np.ndarray, prefix: str) -> None:
-    # 拆成独立凸棱柱，避免整体凸包将中心孔封死
+def add_walls(hole: ET.Element, g: Geometry, p: np.ndarray, prefix: str) -> None:
+    # 每条边一块盒体，取该边孔壁梯形在边坐标系下的包围盒；相邻盒体在角上重叠，沿法向外移后孔口仍封闭
     out = p * 2
     if g.plate_outer_radius_m:
         edges = np.roll(p, -1, axis=0)-p
@@ -222,8 +223,10 @@ def add_walls(hole: ET.Element, assets: ET.Element, g: Geometry, p: np.ndarray, 
         out = p*(g.plate_outer_radius_m/inradius)
     for i in range(len(p)):
         j = (i + 1) % len(p)
-        add_prism(hole, assets, f"{prefix}{i}", np.array([p[i], out[i], out[j], p[j]]),
-                  -g.depth, 0, "0.5 0.5 0.6 1")
+        yaw = math.atan2(*(p[j]-p[i])[::-1])
+        c, s = math.cos(yaw), math.sin(yaw)
+        local = np.array([p[i], out[i], out[j], p[j]]) @ np.array([[c, -s], [s, c]])
+        add_box(hole, f"{prefix}{i}", local.min(0), local.max(0), -g.depth, 0, "0.5 0.5 0.6 1", yaw)
 
 
 class RegularPolygonShape(InsertionShape):
@@ -237,7 +240,8 @@ POLYGON_SCALES = (0.6, 0.8, 1.0)
 
 
 class ScaledPolygonShape(RegularPolygonShape):
-    """正多边形网格棱柱无法逐环境缩放：随机化时预置尺寸档，每个环境只启用一档
+    """插头网格棱柱无法逐环境缩放：随机化时插头预置尺寸档，每个环境只启用一档；
+    孔壁盒体按尺寸档与间隙逐环境沿法向平移
 
     params = (外接圆缩放 s, 档位 k, 0)
     """
@@ -252,12 +256,6 @@ class ScaledPolygonShape(RegularPolygonShape):
             scale = torch.where(k == i, s, scale)
         return torch.cat((scale, k, torch.zeros_like(k)), -1)
 
-    def add_plate_colliders(self, hole: ET.Element, assets: ET.Element, g: Geometry) -> None:
-        if not g.randomized:
-            return add_walls(hole, assets, g, g.hole_polygon, "wall_")
-        for k, s in enumerate(POLYGON_SCALES):
-            add_walls(hole, assets, g, regular_polygon(g.radius*s, self.rotation_order), f"wall_{k}_")
-
     def add_peg_colliders(self, body: ET.Element, assets: ET.Element, g: Geometry,
                           tip_z: float) -> None:
         if not g.randomized:
@@ -270,10 +268,26 @@ class ScaledPolygonShape(RegularPolygonShape):
         active = params[:, 1].long()
         for k in range(len(POLYGON_SCALES)):
             parked = (active != k).float()[:, None] * PARKED_OFFSET_M
-            for prefix, sign in ((f"wall_{k}_", -1.0), (f"peg_{k}", 1.0)):
-                for gid in plant.geom_ids_with_prefix(prefix):
-                    offset = torch.cat((torch.zeros_like(parked), torch.zeros_like(parked), sign*parked), -1)
-                    plant.geom_base_pos[ids, gid] = plant.default_geom_pos[gid] + offset
+            for gid in plant.geom_ids_with_prefix(f"peg_{k}"):
+                offset = torch.cat((torch.zeros_like(parked), torch.zeros_like(parked), parked), -1)
+                plant.geom_base_pos[ids, gid] = plant.default_geom_pos[gid] + offset
+        # 外缘内切圆半径固定，盒体只改内壁位置与厚度
+        g, half_angle = plant.geometry, math.pi/self.rotation_order
+        inner = self._apothem(g, params)
+        outer = g.plate_outer_radius_m or 2*g.radius*math.cos(half_angle)
+        normal = self._normals(params)
+        half = torch.stack((inner*0 + outer*math.tan(half_angle), (outer-inner)/2), -1)
+        for i in range(self.rotation_order):
+            plant.set_box(ids, f"wall_{i}", ((inner+outer)/2)[:, None]*normal[i], half)
+
+    def _apothem(self, g: Geometry, params: torch.Tensor) -> torch.Tensor:
+        # 插头按建模间隙固定，回合间隙多出的部分由孔壁外移补足
+        return g.radius*params[:, 0]*math.cos(math.pi/self.rotation_order) + (params[:, 3]-g.clearance)/2
+
+    def _normals(self, params: torch.Tensor) -> torch.Tensor:
+        half_angle = math.pi/self.rotation_order
+        angle = torch.arange(self.rotation_order, device=params.device)*(2*half_angle) + math.pi/2 + half_angle
+        return torch.stack((angle.cos(), angle.sin()), -1)
 
     def _polygon(self, radius: torch.Tensor) -> torch.Tensor:
         sides = self.rotation_order
@@ -291,10 +305,10 @@ class ScaledPolygonShape(RegularPolygonShape):
                          points_xy: torch.Tensor) -> torch.Tensor:
         if not geo.g.randomized:
             return super().opening_contains(geo, params, points_xy)
-        return points_in_polygons(points_xy, self._polygon(geo.g.radius*params[:, 0]))
+        return points_in_polygons(points_xy, self._polygon(self.opening_radius(geo, params)))
 
     def opening_radius(self, geo: PreparedGeometry, params: torch.Tensor) -> torch.Tensor:
-        return geo.g.radius*params[:, 0]
+        return self._apothem(geo.g, params)/math.cos(math.pi/self.rotation_order)
 
     def rim_yaws(self, g: Geometry) -> tuple[float, ...]:
         sides = self.rotation_order
@@ -304,13 +318,10 @@ class ScaledPolygonShape(RegularPolygonShape):
                   width: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # 每条边向外一块盒体，沿边两端各延长 w·tan(π/n) 使相邻盒体在外角恰好合拢
         sides, half_angle = self.rotation_order, math.pi/self.rotation_order
-        radius = geo.g.radius*params[:, 0]
-        normal_angle = torch.arange(sides, device=radius.device)*(2*half_angle) + math.pi/2 + half_angle
-        normal = torch.stack((normal_angle.cos(), normal_angle.sin()), -1)
-        distance = radius*math.cos(half_angle) + width/2
-        along = radius*math.sin(half_angle) + width*math.tan(half_angle)
+        inner = self._apothem(geo.g, params)
+        along = (inner + width)*math.tan(half_angle)
         half = torch.stack((along, width/2), -1)[:, None].expand(-1, sides, -1)
-        return distance[:, None, None]*normal, half
+        return (inner + width/2)[:, None, None]*self._normals(params), half
 
 
 class BoxShape(InsertionShape):
@@ -341,7 +352,7 @@ class BoxShape(InsertionShape):
         """围框盒体 (下界 (n, 2), 上界 (n, 2)) 列表"""
 
     def _nominal(self, g: Geometry) -> torch.Tensor:
-        return torch.tensor([self.nominal_params(g)], dtype=torch.float64)
+        return torch.tensor([(*self.nominal_params(g), g.clearance)], dtype=torch.float64)
 
     def add_plate_colliders(self, hole: ET.Element, assets: ET.Element, g: Geometry) -> None:
         for name, (low, high) in self.plate_bounds(g, self._nominal(g)).items():

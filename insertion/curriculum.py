@@ -64,7 +64,21 @@ class SuccessNoiseCurriculum:
             return 0.0
         return (self.level - self.clearance_stages) / self.noise_levels
 
-    def update(self, outcomes: dict[str, list[bool]]) -> bool:
+    def scale_for(self, shape: str) -> float | None:
+        # None：本课程不管理噪声，沿用配置的步数噪声课程
+        del shape
+        return self.scale if self.noise_levels > 0 else None
+
+    def clearance_for(self, shape: str) -> float:
+        del shape
+        return self.clearance
+
+    def load_levels(self, state: dict) -> None:
+        self.level = state["level"]
+
+    def update(self, outcomes: dict[str, list[bool]],
+               boundary: dict[str, list[bool]] | None = None) -> bool:
+        del boundary
         if set(outcomes) != set(self.windows):
             raise ValueError("curriculum outcomes must include every configured shape")
         for shape, values in outcomes.items():
@@ -91,6 +105,91 @@ class SuccessNoiseCurriculum:
             if len(values) > self.window_size or any(type(value) is not bool for value in values):
                 raise ValueError("invalid curriculum outcome window")
         self.level = state["level"]
+        for shape, values in state["windows"].items():
+            self.windows[shape].clear()
+            self.windows[shape].extend(values)
+
+
+ADR_BOUNDARY_FRACTION = 0.2
+
+
+class ADRCurriculum:
+    """两维自动域随机化：每形状噪声上界 φ[0] 与间隙进度 φ[1] 各按自己的边界回合成功率双向调节。
+
+    边界回合把一维钉在当前边界（噪声取 φ[0]，间隙取最紧值 c(φ[1])），另一维照常采样；
+    c(φ) 在最松与目标间隙之间对数插值；初始位姿、阻尼等其余随机化难度取 min φ[0]"""
+    window_size = 1000
+    expand_above = 0.8
+    shrink_below = 0.5
+    step = 0.05
+    # 每次调节 φ 前需累计的边界回合数
+    boundary_episodes = 200
+
+    def __init__(self, shapes: tuple[str, ...], loosest: float, tightest: float):
+        if not (math.isfinite(loosest) and 0 < tightest <= loosest):
+            raise ValueError("ADR clearance range must satisfy 0 < tightest <= loosest")
+        self.loosest, self.tightest = float(loosest), float(tightest)
+        self.phi = {shape: [0.0, 0.0] for shape in shapes}
+        self.boundary = {shape: [[0, 0], [0, 0]] for shape in shapes}
+        self.windows = {shape: deque(maxlen=self.window_size) for shape in shapes}
+
+    @property
+    def difficulty(self) -> float:
+        return min(phi[0] for phi in self.phi.values())
+
+    @property
+    def scale(self) -> float:
+        return self.difficulty
+
+    def scale_for(self, shape: str) -> float:
+        return self.phi[shape][0]
+
+    def clearance_for(self, shape: str) -> float:
+        return self.loosest * (self.tightest/self.loosest) ** self.phi[shape][1]
+
+    def load_levels(self, state: dict) -> None:
+        self.phi.update({shape: list(phi) for shape, phi in state["phi"].items() if shape in self.phi})
+
+    def update(self, outcomes: dict[str, list[bool]],
+               boundary: dict[str, tuple[list[bool], list[bool]]] | None = None) -> bool:
+        boundary = boundary or {}
+        if set(outcomes) != set(self.windows) or not set(boundary) <= set(self.windows):
+            raise ValueError("curriculum outcomes must include every configured shape")
+        changed = False
+        for shape, per_dimension in boundary.items():
+            for d, values in enumerate(per_dimension):
+                stats = self.boundary[shape][d]
+                stats[0] += sum(values)
+                stats[1] += len(values)
+                if stats[1] < self.boundary_episodes:
+                    continue
+                rate, old = stats[0] / stats[1], self.phi[shape][d]
+                if rate > self.expand_above:
+                    self.phi[shape][d] = min(1.0, round(old + self.step, 6))
+                elif rate < self.shrink_below:
+                    self.phi[shape][d] = max(0.0, round(old - self.step, 6))
+                self.boundary[shape][d] = [0, 0]
+                changed |= self.phi[shape][d] != old
+        for shape, values in outcomes.items():
+            self.windows[shape].extend(values)
+        return changed
+
+    def state_dict(self) -> dict:
+        return {"phi": {shape: list(phi) for shape, phi in self.phi.items()},
+                "boundary": {shape: [list(s) for s in stats] for shape, stats in self.boundary.items()},
+                "windows": {shape: list(window) for shape, window in self.windows.items()}}
+
+    def load_state_dict(self, state: dict) -> None:
+        if (set(state.get("phi", ())) != set(self.phi)
+                or any(len(phi) != 2 or not all(0 <= p <= 1 for p in phi) for phi in state["phi"].values())
+                or set(state.get("boundary", ())) != set(self.boundary)
+                or set(state.get("windows", ())) != set(self.windows)):
+            raise ValueError("invalid ADR curriculum checkpoint")
+        for values in state["windows"].values():
+            if len(values) > self.window_size or any(type(value) is not bool for value in values):
+                raise ValueError("invalid curriculum outcome window")
+        self.load_levels(state)
+        self.boundary = {shape: [[int(s), int(n)] for s, n in stats] for shape, stats in state["boundary"].items()}
         for shape, values in state["windows"].items():
             self.windows[shape].clear()
             self.windows[shape].extend(values)

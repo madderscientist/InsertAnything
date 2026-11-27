@@ -42,7 +42,7 @@ class DualBladeShape(BoxShape):
         return factor
 
     def _slots(self, g: Geometry, params: torch.Tensor):
-        c = g.clearance / 2
+        c = params[:, 3] / 2
         return params[:, 0]/2 + c, params[:, 1]/2 + c, params[:, 2]
 
     def plate_bounds(self, g: Geometry, params: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:

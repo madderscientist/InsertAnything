@@ -236,7 +236,7 @@ class InsertionCfg:
                 or sum(self.shape_env_counts) != self.envs_per_shape * len(self.shapes)):
             raise ValueError("shape_env_counts must be positive integers preserving the total environment count")
         if self.adaptive_sampling and (not self.training or not (
-                self.clearance_curriculum or self.noise_curriculum_mode == "success")):
+                self.clearance_curriculum or self.noise_curriculum_mode in ("success", "adr"))):
             raise ValueError("adaptive sampling requires training with a success-based curriculum")
         if not math.isclose(self.physics_dt * self.decimation, 0.02, abs_tol=1e-10):
             raise ValueError("policy period must be 0.02 s (50 Hz)")
@@ -340,10 +340,13 @@ class InsertionCfg:
                 or not isinstance(self.noise_full_steps, int)
                 or not 0 <= self.noise_zero_steps < self.noise_full_steps):
             raise ValueError("noise curriculum requires integer steps with 0 <= zero < full")
-        if self.noise_curriculum_mode not in ("steps", "success"):
-            raise ValueError("noise curriculum mode must be steps or success")
-        if self.noise_curriculum_mode == "success" and not self.noise_curriculum:
-            raise ValueError("success noise curriculum requires noise_curriculum=True")
+        if self.noise_curriculum_mode not in ("steps", "success", "adr"):
+            raise ValueError("noise curriculum mode must be steps, success or adr")
+        if self.noise_curriculum_mode in ("success", "adr") and not self.noise_curriculum:
+            raise ValueError("success and ADR noise curricula require noise_curriculum=True")
+        if self.noise_curriculum_mode == "adr" and (
+                not self.shape_randomization or {"square", "circle"} & set(self.shapes)):
+            raise ValueError("ADR per-episode clearance requires shape randomization without square or circle")
         if self.grasp_error_distribution not in ("gaussian", "uniform"):
             raise ValueError("grasp error distribution must be gaussian or uniform")
         if not math.isfinite(self.target_depth_min_m) or self.target_depth_min_m <= 0:
@@ -457,7 +460,7 @@ class InsertionCfg:
     def noise_scale(self, policy_steps: int) -> float:
         if not self.training or not self.noise_curriculum:
             return 1.0
-        if self.noise_curriculum_mode == "success":
+        if self.noise_curriculum_mode in ("success", "adr"):
             return 0.0
         if policy_steps < self.noise_zero_steps:
             return 0.0

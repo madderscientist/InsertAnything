@@ -43,7 +43,7 @@ class LShape(BoxShape):
         }
 
     def peg_bounds(self, g: Geometry, params: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        r, c = g.radius*params[:, 0], g.clearance/2
+        r, c = g.radius*params[:, 0], params[:, 3]/2
         return {
             "peg_bottom": (_xy(-r+c, -r+c), _xy(r-c, -r*0-c)),
             "peg_left": (_xy(-r+c, -r*0-c), _xy(-r*0-c, r-c)),
@@ -55,7 +55,7 @@ class LShape(BoxShape):
         return polygon_from_xy((-r, -r), (r, -r), (r, z), (z, z), (z, r), (-r, r))
 
     def peg_outline(self, g: Geometry, params: torch.Tensor) -> torch.Tensor:
-        r, c = g.radius*params[:, 0], g.clearance/2
+        r, c = g.radius*params[:, 0], params[:, 3]/2
         z = r*0 - c
         return polygon_from_xy((-r+c, -r+c), (r-c, -r+c), (r-c, z), (z, z), (z, r-c), (-r+c, r-c))
 

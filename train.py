@@ -704,10 +704,11 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
     env.total_transitions = saved["infos"]["progress"].get(
         "transitions", env.policy_steps*source_cfg["envs_per_shape"]*len(source_cfg["shapes"]))
     if env.noise_curriculum is not None:
-        if (source_cfg.get("noise_curriculum_mode", "steps") == "success"
-                or source_cfg.get("clearance_curriculum", False)):
+        source_mode = source_cfg.get("noise_curriculum_mode", "steps")
+        if source_mode in ("success", "adr") or source_cfg.get("clearance_curriculum", False):
             if ("noise_curriculum_state" in saved["infos"]
-                    and source_cfg.get("clearance_curriculum", False) == cfg.clearance_curriculum):
+                    and source_cfg.get("clearance_curriculum", False) == cfg.clearance_curriculum
+                    and (source_mode == "adr") == (cfg.noise_curriculum_mode == "adr")):
                 env.noise_curriculum.load_state_dict(saved["infos"]["noise_curriculum_state"])
                 previous_cfg = InsertionCfg.from_checkpoint(source_cfg)
                 changed_fields = (
@@ -747,11 +748,9 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
     for index, group in enumerate(env.groups):
         if env.noise_curriculum is not None:
             group.difficulty = env.noise_curriculum.difficulty
-            group.noise_scale = (env.noise_curriculum.scale
-                                 if env.noise_curriculum.noise_levels > 0
-                                 else cfg.noise_scale(env.policy_steps))
+            group.noise_scale = env.curriculum_noise_scale(group)
             if hasattr(group, "set_clearance"):
-                group.set_clearance(env.noise_curriculum.clearance)
+                group.set_clearance(env.noise_curriculum.clearance_for(group.shape))
         else:
             group.difficulty = min(1., env.policy_steps/cfg.curriculum_steps)
             group.noise_scale = cfg.noise_scale(env.policy_steps)
@@ -815,7 +814,7 @@ def adapt_training_layout(output: Path, iteration: int) -> bool:
         return False
     saved = load_recovery_checkpoint(output, "cpu")
     curriculum = saved["infos"]["noise_curriculum_state"]
-    level = curriculum["level"]
+    level = curriculum.get("level")
     windows = curriculum["windows"]
     if state.get("level") != level or any(len(windows[s]) < 1000 for s in cfg.shapes):
         metadata["adaptive_sampling_state"] = {

@@ -84,12 +84,19 @@ class SearchPriorTests(unittest.TestCase):
         self.assertTrue(bool((g.rim_height > 0).all()))
 
     def test_masked_graph_reset_keeps_running_envs_and_matches_eager(self):
-        cfg = replace(InsertionCfg(shapes=("dual",), envs_per_shape=32, shape_randomization=True,
+        for shape in ("dual", "pentagon"):
+            with self.subTest(shape=shape):
+                self.check_masked_graph_reset(shape)
+
+    def check_masked_graph_reset(self, shape: str) -> None:
+        cfg = replace(InsertionCfg(shapes=(shape,), envs_per_shape=32, shape_randomization=True,
                                    rim_probability=0.5, hard_state_reset_probability=0.5, training=True,
+                                   noise_curriculum=True, noise_curriculum_mode="adr", clearance_curriculum=True,
                                    physics_cuda_graph=True, observation_cuda_graph=True, seed=4), **SEARCH)
         env = InsertionEnv(cfg, "cuda:0")
         g = env.groups[0]
         g.difficulty = 0.7
+        g.set_clearance(0.0005)
         g.hard_valid[:16] = True
 
         def state():
@@ -134,7 +141,7 @@ class SearchPriorTests(unittest.TestCase):
                            hard_state_reset_probability=1.0, seed=5)
         g = InsertionEnv(cfg, "cuda:0").groups[0]
         g.difficulty = 1.
-        params = torch.tensor([0.005, 0.002, 0.], device=g.device)
+        params = torch.tensor([0.005, 0.002, 0., 0.0004], device=g.device)
         g.hard_params[:] = params
         g.hard_rim[:] = torch.tensor([0.0015, 0.003], device=g.device)
         g.hard_pos[:] = torch.tensor([0.01, 0., 0.003], device=g.device)
@@ -146,10 +153,48 @@ class SearchPriorTests(unittest.TestCase):
         torch.testing.assert_close(g.rim_height, torch.full((g.n,), 0.0015, device=g.device))
         peg = g.geom_index["peg"]
         torch.testing.assert_close(g.sim.model.geom_size[:, peg, :2],
-                                   (params[:2] - g.geometry.clearance/2).expand(g.n, -1))
+                                   (params[:2] - params[3]/2).expand(g.n, -1))
         wall = g.geom_index["wall_left"]
         self.assertTrue(bool(torch.allclose(g.sim.model.geom_pos[:, wall, 2],
                                             torch.full((g.n,), -g.geometry.depth/2 - 0.0015, device=g.device))))
+
+    def test_adr_clearance_offsets_polygon_walls_without_gaps(self):
+        cfg = InsertionCfg(shapes=("pentagon", "rectangle"), envs_per_shape=256, shape_randomization=True,
+                           training=True, noise_curriculum=True, noise_curriculum_mode="adr",
+                           clearance_curriculum=True, seed=6)
+        env = InsertionEnv(cfg, "cuda:0")
+        for g in env.groups:
+            g.set_clearance(0.0005)
+            g.reset(torch.arange(g.n, device=g.device))
+            c = g.shape_params[:, 3]
+            self.assertEqual(g.clearance, cfg.clearance)
+            self.assertTrue(bool(((c >= 0.0005) & (c <= 0.002 + 1e-9)).all()))
+            probe = g.episode_boundary == 2
+            self.assertTrue(bool(probe.any()) and bool((c[probe] == 0.0005).all()))
+        g, sides = env.groups[0], 5
+        half_angle = math.pi/sides
+        peg_apothem = g.geometry.radius*g.shape_params[:, 0]*math.cos(half_angle) - cfg.clearance/2
+        angles = torch.arange(sides, device=g.device)*2*half_angle + math.pi/2
+        vertices = torch.stack((angles.cos(), angles.sin()), -1)
+        walls = []
+        for i in range(sides):
+            gid = g.geom_index[f"wall_{i}"]
+            center, half = g.sim.model.geom_pos[:, gid, :2], g.sim.model.geom_size[:, gid, :2]
+            w, _, _, z = g.model.geom_quat[gid]
+            walls.append((center, half, 2*math.atan2(z, w)))
+            # 孔壁内表面到插头对应侧面的距离为半个回合间隙
+            torch.testing.assert_close(torch.linalg.vector_norm(center, dim=-1) - half[:, 1] - peg_apothem,
+                                       g.shape_params[:, 3]/2)
+        # 孔口顶点外侧 0.05 mm 落在孔壁内，内侧 0.05 mm 不在任何孔壁内
+        for sign, expected in ((1., True), (-1., False)):
+            points = (g.opening_radius[:, None, None] + sign*5e-5)*vertices
+            covered = torch.zeros(g.n, sides, dtype=torch.bool, device=g.device)
+            for center, half, yaw in walls:
+                d = points - center[:, None]
+                local = torch.stack((d[..., 0]*math.cos(yaw) + d[..., 1]*math.sin(yaw),
+                                     -d[..., 0]*math.sin(yaw) + d[..., 1]*math.cos(yaw)), -1)
+                covered |= (local.abs() <= half[:, None]).all(-1)
+            self.assertTrue(bool((covered == expected).all()), sign)
 
     def test_recurrent_actor_critic_trains_resumes_and_exports(self):
         torch.set_num_threads(1)

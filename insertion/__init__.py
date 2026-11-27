@@ -2,7 +2,7 @@
 
 from .config import (ALL_SHAPES, CLEARANCE_CURRICULUM_LEVELS, HOLE_DEPTH_M,
                      InsertionCfg, PPO_DISCOUNT, TRAIN_SHAPES, runner_config)
-from .curriculum import SuccessNoiseCurriculum
+from .curriculum import ADRCurriculum, SuccessNoiseCurriculum
 from .env import InsertionEnv, PlantGroup, bounded_stiffness_step, completion_cost_terms
 from .geometry import (Geometry, RoughTile, build_model, geometry, inset_polygon,
                        model_xml, rough_surface_tiles, symmetry_count)
@@ -12,6 +12,7 @@ from .transforms import (action_target, actor_observation, canonical_quat,
                          tip_pose, transform_wrench)
 
 __all__ = [
+    "ADRCurriculum",
     "ALL_SHAPES",
     "CLEARANCE_CURRICULUM_LEVELS",
     "Geometry",

@@ -50,14 +50,14 @@ class RectangleShape(BoxShape):
         }
 
     def peg_bounds(self, g: Geometry, params: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        a, b, c = params[:, 0], params[:, 1], g.clearance/2
+        a, b, c = params[:, 0], params[:, 1], params[:, 3]/2
         return {"peg": (_xy(-a+c, -b+c), _xy(a-c, b-c))}
 
     def hole_outline(self, g: Geometry, params: torch.Tensor) -> torch.Tensor:
         return rectangle_corners(params[:, 0], params[:, 1])
 
     def peg_outline(self, g: Geometry, params: torch.Tensor) -> torch.Tensor:
-        c = g.clearance/2
+        c = params[:, 3]/2
         return rectangle_corners(params[:, 0] - c, params[:, 1] - c)
 
     def opening_radius(self, geo, params: torch.Tensor) -> torch.Tensor:

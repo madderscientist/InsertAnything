@@ -15,7 +15,7 @@ from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
 from .config import ALL_SHAPES, InsertionCfg
-from .curriculum import SuccessNoiseCurriculum
+from .curriculum import ADR_BOUNDARY_FRACTION, ADRCurriculum, SuccessNoiseCurriculum
 from .geometry import build_model, geometry, rough_surface_tiles
 from .shapes.base import PARKED_OFFSET_M
 from .transforms import (action_target, actor_observation, canonical_quat,
@@ -214,11 +214,15 @@ class PlantGroup:
     def __init__(self, shape: str, cfg: InsertionCfg, device: str):
         self.cfg, self.device, self.n = cfg, device, cfg.envs_per_shape
         self.last_reward_terms: dict[str, torch.Tensor] = {}
-        self.clearance = cfg.active_clearance_levels[0]
+        self.adr = cfg.training and cfg.noise_curriculum and cfg.noise_curriculum_mode == "adr"
+        # ADR 按目标间隙建模一次，回合间隙在 [clearance_floor, clearance_max] 内逐环境变化
+        self.clearance_max = cfg.active_clearance_levels[0]
+        self.clearance = cfg.clearance if self.adr else self.clearance_max
+        self.clearance_floor = self.clearance_max
         self.shape = shape
         self._build_simulation()
         self._init_shape()
-        self.shape_params = torch.tensor(self.geometry.definition.nominal_params(self.geometry),
+        self.shape_params = torch.tensor((*self.geometry.definition.nominal_params(self.geometry), self.clearance),
                                          device=device).expand(self.n, -1).clone()
         self.rim_height = torch.zeros(self.n, device=device)
         self.rim_width = torch.zeros(self.n, device=device)
@@ -229,7 +233,8 @@ class PlantGroup:
         self.constants: dict[tuple[float, ...], torch.Tensor] = {}
         self.noise_scale = cfg.noise_scale(0)
         self.episode_noise_scale = torch.full((self.n,), self.noise_scale, device=device)
-        self.episode_clearance = torch.full((self.n,), self.clearance, device=device)
+        # ADR 边界回合钉住的维度：0 普通回合，1 噪声，2 间隙
+        self.episode_boundary = torch.zeros(self.n, dtype=torch.long, device=device)
         self.nominal_offset = torch.tensor([0, 0, -0.05 * cfg.scale],
                                            device=device).expand(self.n, 3)
         self.offset = self.nominal_offset.clone()
@@ -405,7 +410,7 @@ class PlantGroup:
 
     def randomize_shape(self, ids: torch.Tensor) -> None:
         cfg, n = self.cfg, len(ids)
-        self.shape_params[ids] = self.geometry.definition.sample_params(self.geometry, n, self.uniform).float()
+        self.shape_params[ids, :3] = self.geometry.definition.sample_params(self.geometry, n, self.uniform).float()
         present = self.uniform(n, 1, 0., 1.)[:, 0] < cfg.rim_probability * self.difficulty
         height = self.curriculum_uniform(
             n, 1, cfg.rim_height_min_m, cfg.rim_height_max_m, cfg.rim_height_min_m)[:, 0] * cfg.scale
@@ -709,7 +714,8 @@ class PlantGroup:
         dt = cfg.physics_dt * cfg.decimation
         omega = 2 * math.pi * self.uniform(n, 6, cfg.vibration_min_hz, cfg.vibration_max_hz)
         zeta = self.uniform(n, 6, 0.1, 0.3)
-        amplitude = self.uniform(n, 1, cfg.vibration_force_min_n, cfg.vibration_force_max_n) * self.noise_scale
+        amplitude = (self.uniform(n, 1, cfg.vibration_force_min_n, cfg.vibration_force_max_n)
+                     * self.episode_noise_scale[ids, None])
         if self.cfg.dynamics == "real":
             omega.fill_(2 * math.pi * 6.0)
             zeta.fill_(0.2)
@@ -756,10 +762,13 @@ class PlantGroup:
                 self.n, 1, cfg.step_force_bias_min_n, cfg.step_force_bias_max_n),
             self.unit_vector(self.n)*self.uniform(
                 self.n, 1, cfg.step_moment_bias_min_nm, cfg.step_moment_bias_max_nm)), -1)
-        self.wrench_bias.add_(bias * hit.unsqueeze(-1) * self.noise_scale)
+        self.wrench_bias.add_(bias * hit.unsqueeze(-1) * self.episode_noise_scale[:, None])
         self.step_bias_active |= hit
 
     def set_clearance(self, clearance: float) -> None:
+        if self.adr:
+            self.clearance_floor = clearance
+            return
         if math.isclose(clearance, self.clearance, rel_tol=0., abs_tol=1e-12):
             return
         qpos = self.sim.data.qpos[:].clone()
@@ -823,7 +832,7 @@ class PlantGroup:
         if not cfg.physics_cuda_graph:
             self.masked_reset()
             return
-        signature = (self.difficulty, self.noise_scale, self.clearance)
+        signature = (self.difficulty, self.noise_scale, self.clearance, self.clearance_floor)
         if self.masked_reset_graph is not None and signature == self.masked_reset_signature:
             self.masked_reset_graph.replay()
             return
@@ -894,8 +903,19 @@ class PlantGroup:
     def reset_state(self, ids: torch.Tensor, mask: torch.Tensor | None = None) -> None:
         """采样并写入 ids 的新回合状态；物理常量与正向运动学由 finish_reset 统一重算"""
         n, cfg = len(ids), self.cfg
-        self.episode_noise_scale.index_fill_(0, ids, self.noise_scale)
-        self.episode_clearance.index_fill_(0, ids, self.clearance)
+        if self.adr:
+            u = self.uniform(n, 4, 0., 1.)
+            probe = u[:, 0] < ADR_BOUNDARY_FRACTION
+            clearance_probe = probe & (u[:, 1] < 0.5)
+            noise_probe = probe & ~clearance_probe
+            self.episode_boundary[ids] = noise_probe.long() + 2*clearance_probe.long()
+            self.episode_noise_scale[ids] = torch.where(noise_probe, 1., u[:, 2]) * self.noise_scale
+            low, high = math.log(self.clearance_floor), math.log(self.clearance_max)
+            self.shape_params[ids, 3] = torch.where(
+                clearance_probe, self.clearance_floor, (low + (high-low)*u[:, 3]).exp())
+        else:
+            self.episode_noise_scale.index_fill_(0, ids, self.noise_scale)
+            self.shape_params[:, 3].index_fill_(0, ids, self.clearance)
         sim = self.sim
         if mask is None:
             sim._reset_mask.fill_(False)
@@ -1058,7 +1078,8 @@ class PlantGroup:
             grasp = torch.cat((
                 self.uniform(n, 2, -cfg.grasp_position_error, cfg.grasp_position_error),
                 self.uniform(n, 1, -z_grasp_err, z_grasp_err)), dim=-1)
-        grasp = grasp*self.noise_scale
+        scale = self.episode_noise_scale[ids, None]
+        grasp = grasp*scale
         self.offset[ids] = self.nominal_offset[ids] + grasp
         if cfg.shape_randomization:
             self.randomize_shape(ids)
@@ -1066,19 +1087,19 @@ class PlantGroup:
         if cfg.rough_surface:
             self._randomize_rough_surface(ids)
         self.calibration[ids] = self.uniform(n, 3, -cfg.tip_calibration_error,
-                                            cfg.tip_calibration_error)*self.noise_scale
-        self.bias[ids] = self.uniform(n, 3, -cfg.position_bias, cfg.position_bias)*self.noise_scale
+                                            cfg.tip_calibration_error)*scale
+        self.bias[ids] = self.uniform(n, 3, -cfg.position_bias, cfg.position_bias)*scale
         if cfg.align_goal_z_to_observation:
             # 将名义目标深度同步平移纵向估计偏差 (h + Z)，使竖直到达实际深度 h 时 obs_z 恰好归零
             self.bias[ids, 2] = self.calibration[ids, 2] - grasp[:, 2]
         self.sensor_error[ids] = rotvec_quat(self.uniform(
-            n, 3, -cfg.sensor_rotation_error, cfg.sensor_rotation_error)*self.noise_scale)
+            n, 3, -cfg.sensor_rotation_error, cfg.sensor_rotation_error)*scale)
         self.rotation_bias_q[ids] = rotvec_quat(self.uniform(
-            n, 3, -cfg.rotation_bias, cfg.rotation_bias)*self.noise_scale)
+            n, 3, -cfg.rotation_bias, cfg.rotation_bias)*scale)
         if cfg.force_bias or cfg.moment_bias:
             self.wrench_bias[ids] = torch.cat((
                 self.sample_wrench_bias(n, cfg.force_bias),
-                self.sample_wrench_bias(n, cfg.moment_bias)), -1) * self.noise_scale
+                self.sample_wrench_bias(n, cfg.moment_bias)), -1) * scale
         else:
             self.wrench_bias.index_fill_(0, ids, 0)
         self.delay[ids] = torch.randint(0, 3, (n,), generator=self.generator, device=self.device)
@@ -1154,7 +1175,7 @@ class PlantGroup:
         n = len(ids)
         self.position_delay_frames[ids] = torch.randint(
             0, 2, (n,), generator=self.generator, device=self.device)
-        position_noise = self.normal(n, 3, self.cfg.position_noise)*self.noise_scale
+        position_noise = self.normal(n, 3, self.cfg.position_noise)*self.episode_noise_scale[ids, None]
         error = self.goal[ids] + self.bias[ids] - observed_tip - position_noise
         self.position_history[ids] = error[:, None, :].expand(-1, 2, -1)
         self.position_history_length[ids] = self.length[ids]
@@ -1283,9 +1304,9 @@ class PlantGroup:
         noise_scale = torch.tensor([self.cfg.force_noise]*3 + [self.cfg.moment_noise]*3,
                                    device=self.device)
         noise = torch.randn(self.n, 6, generator=self.generator,
-                            device=self.device) * noise_scale*self.noise_scale
-        position_noise = self.normal(self.n, 3, self.cfg.position_noise)*self.noise_scale
-        rotation_noise = self.normal(self.n, 3, self.cfg.rotation_noise)*self.noise_scale
+                            device=self.device) * noise_scale*self.episode_noise_scale[:, None]
+        position_noise = self.normal(self.n, 3, self.cfg.position_noise)*self.episode_noise_scale[:, None]
+        rotation_noise = self.normal(self.n, 3, self.cfg.rotation_noise)*self.episode_noise_scale[:, None]
         self.record_position_observation(position_noise)
         if not self.cfg.observation_cuda_graph:
             return self.observations_from_noise(noise, position_noise, rotation_noise)
@@ -1338,6 +1359,9 @@ class PlantGroup:
                             self.offset-self.nominal_offset, shape_id), -1)
         if self.cfg.shape_randomization:
             critic = torch.cat((critic, self.shape_params*1000, self.rim_height[:, None]*1000), -1)
+        if self.cfg.noise_curriculum_mode == "adr":
+            # 同批混合不同噪声水平，力旋量干扰强度不可从其他特权量推断
+            critic = torch.cat((critic, self.episode_noise_scale[:, None]), -1)
         return obs, critic
 
     def alignment(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1659,12 +1683,15 @@ class InsertionEnv(VecEnv):
         self.policy_steps = 0
         self.total_transitions = 0
         use_success_curriculum = cfg.training and (
-            cfg.noise_curriculum_mode == "success" or cfg.clearance_curriculum)
+            cfg.noise_curriculum_mode in ("success", "adr") or cfg.clearance_curriculum)
         noise_levels = (10 if cfg.noise_curriculum and cfg.noise_curriculum_mode == "success"
                         else 0)
-        self.noise_curriculum = (
-            SuccessNoiseCurriculum(cfg.shapes, cfg.active_clearance_levels, noise_levels)
-            if use_success_curriculum else None)
+        self.noise_curriculum: SuccessNoiseCurriculum | ADRCurriculum | None = None
+        if use_success_curriculum and cfg.noise_curriculum and cfg.noise_curriculum_mode == "adr":
+            levels = cfg.active_clearance_levels
+            self.noise_curriculum = ADRCurriculum(cfg.shapes, levels[0], levels[-1])
+        elif use_success_curriculum:
+            self.noise_curriculum = SuccessNoiseCurriculum(cfg.shapes, cfg.active_clearance_levels, noise_levels)
         self.curriculum_pending: list[torch.Tensor] = []
         self.curriculum_cohort: torch.Tensor | None = None
         self.curriculum_cohort_seen: torch.Tensor | None = None
@@ -1673,6 +1700,10 @@ class InsertionEnv(VecEnv):
         self.curriculum_rollout_steps = 256
         self.curriculum_shape_ids = torch.cat([
             torch.full((g.n,), cfg.shapes.index(g.shape), device=device) for g in self.groups])
+
+    def curriculum_noise_scale(self, group: PlantGroup) -> float:
+        scale = None if self.noise_curriculum is None else self.noise_curriculum.scale_for(group.shape)
+        return group.cfg.noise_scale(self.policy_steps) if scale is None else scale
 
     def record_curriculum_outcomes(self, outcomes: torch.Tensor) -> None:
         if self.noise_curriculum is not None:
@@ -1705,6 +1736,7 @@ class InsertionEnv(VecEnv):
         complete = bool(seen.all())
         shapes = tuple(self.noise_curriculum.windows)
         recent = {}
+        boundary = {}
         logs = {}
         for index, shape in enumerate(shapes):
             ended = (outcomes[:, 0] == index) & outcomes[:, 1].bool()
@@ -1712,15 +1744,23 @@ class InsertionEnv(VecEnv):
             logs[f"success/{shape}"] = (completed.float().mean() if completed.numel()
                                         else outcomes.new_tensor(0., dtype=torch.float32))
             eligible = (cohort[:, 0] == index) & seen
-            recent[shape] = cohort[eligible, 2].bool().cpu().tolist() if complete else []
-        previous_scale = self.noise_curriculum.scale
-        previous_clearance = self.noise_curriculum.clearance
-        previous_difficulty = self.noise_curriculum.difficulty
-        upgraded = self.noise_curriculum.update(recent) if complete else False
+            probe = cohort[:, 4].long()
+            recent[shape] = cohort[eligible & (probe == 0), 2].bool().cpu().tolist() if complete else []
+            boundary[shape] = tuple(cohort[eligible & (probe == d), 2].bool().cpu().tolist() if complete else []
+                                    for d in (1, 2))
+        curriculum = self.noise_curriculum
+        previous_scale = curriculum.scale
+        previous_clearance = max(curriculum.clearance_for(s) for s in shapes)
+        previous_difficulty = curriculum.difficulty
+        upgraded = curriculum.update(recent, boundary) if complete else False
         if complete:
             seen.zero_()
             armed.zero_()
-        if upgraded:
+        adr = isinstance(curriculum, ADRCurriculum)
+        if upgraded and adr:
+            logging.info("ADR: difficulty %.2f -> %.2f, phi (noise, clearance) %s",
+                         previous_difficulty, curriculum.difficulty, curriculum.phi)
+        elif upgraded:
             logging.info(
                 "Success curriculum level %d: clearance %.2f -> %.2f mm, "
                 "difficulty %.2f -> %.2f, noise %.1f -> %.1f; "
@@ -1730,17 +1770,21 @@ class InsertionEnv(VecEnv):
                 self.noise_curriculum.difficulty, previous_scale, self.noise_curriculum.scale,
             )
         for group in self.groups:
-            if self.noise_curriculum.noise_levels > 0:
-                group.noise_scale = self.noise_curriculum.scale
+            group.noise_scale = self.curriculum_noise_scale(group)
             group.difficulty = self.noise_curriculum.difficulty
             if hasattr(group, "set_clearance"):
-                group.set_clearance(self.noise_curriculum.clearance)
+                group.set_clearance(self.noise_curriculum.clearance_for(group.shape))
         logs["curriculum/clearance_mm"] = outcomes.new_tensor(
-            self.noise_curriculum.clearance * 1000, dtype=torch.float32)
+            max(curriculum.clearance_for(s) for s in shapes) * 1000, dtype=torch.float32)
         logs["curriculum/difficulty"] = outcomes.new_tensor(
             self.noise_curriculum.difficulty, dtype=torch.float32)
         logs["curriculum/noise_scale"] = outcomes.new_tensor(
             self.noise_curriculum.scale, dtype=torch.float32)
+        if adr:
+            for shape, (noise_phi, _) in curriculum.phi.items():
+                logs[f"curriculum/noise_phi/{shape}"] = outcomes.new_tensor(noise_phi, dtype=torch.float32)
+                logs[f"curriculum/clearance_mm/{shape}"] = outcomes.new_tensor(
+                    curriculum.clearance_for(shape) * 1000, dtype=torch.float32)
         for shape, window in self.noise_curriculum.windows.items():
             logs[f"curriculum/episodes/{shape}"] = outcomes.new_tensor(len(window))
             logs[f"curriculum/success/{shape}"] = outcomes.new_tensor(
@@ -1791,9 +1835,7 @@ class InsertionEnv(VecEnv):
         self.policy_steps += 1
         self.total_transitions += self.num_envs
         for g in self.groups:
-            g.noise_scale = (self.noise_curriculum.scale
-                             if self.noise_curriculum is not None and self.noise_curriculum.noise_levels > 0
-                             else g.cfg.noise_scale(self.policy_steps))
+            g.noise_scale = self.curriculum_noise_scale(g)
             if g.cfg.training:
                 g.difficulty = (self.noise_curriculum.difficulty
                                 if self.noise_curriculum is not None
@@ -1804,18 +1846,28 @@ class InsertionEnv(VecEnv):
                     for key in results[0][2]}
         if self.noise_curriculum is not None:
             episode_scales = torch.cat([g.episode_noise_scale.to(self.device) for g in self.groups])
-            episode_clearances = torch.cat([g.episode_clearance.to(self.device) for g in self.groups])
-            scale_target = (torch.as_tensor(self.noise_curriculum.scale, device=self.device)
-                            if self.noise_curriculum.noise_levels > 0 else episode_scales)
-            terminal["curriculum_eligible"] = (
-                torch.isclose(episode_scales, scale_target)
-                & torch.isclose(episode_clearances,
-                                torch.as_tensor(self.noise_curriculum.clearance, device=self.device),
-                                rtol=0., atol=1e-12))
+            episode_clearances = torch.cat([g.shape_params[:, 3].to(self.device) for g in self.groups])
+            probes = torch.cat([g.episode_boundary.to(self.device) for g in self.groups])
+            scale_target = torch.cat([
+                torch.full((g.n,), s, device=self.device)
+                if (s := self.noise_curriculum.scale_for(g.shape)) is not None
+                else g.episode_noise_scale.to(self.device) for g in self.groups])
+            clearance_target = torch.cat([
+                torch.full((g.n,), self.noise_curriculum.clearance_for(g.shape), device=self.device)
+                for g in self.groups])
+            scale_ok = torch.isclose(episode_scales, scale_target)
+            clearance_ok = torch.isclose(episode_clearances, clearance_target, rtol=0., atol=1e-9)
+            if isinstance(self.noise_curriculum, ADRCurriculum):
+                # 普通回合两维本就随机；边界回合须钉在当前边界（课程中途变化或困难状态回放的不计）
+                eligible = (probes == 0) | ((probes == 1) & scale_ok) | ((probes == 2) & clearance_ok)
+            else:
+                eligible = scale_ok & clearance_ok
+            terminal["curriculum_boundary"] = probes
+            terminal["curriculum_eligible"] = eligible
             if not self.curriculum_distributed:
                 self.record_curriculum_outcomes(torch.stack((
                     self.curriculum_shape_ids, dones, terminal["reason"] == 1,
-                    terminal["curriculum_eligible"]), dim=1))
+                    terminal["curriculum_eligible"], probes), dim=1))
         logs = {}
         logs["episode/simulation_failures"] = terminal["simulation_failure"].float().sum()
         hard = terminal["hard_start"] & dones

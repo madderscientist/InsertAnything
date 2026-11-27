@@ -115,12 +115,13 @@ def global_logging_step(env: InsertionEnv, rewards: torch.Tensor, dones: torch.T
     fields = [rewards, dones.float()]
     if env.noise_curriculum is not None:
         fields.extend(((extras["terminal"]["reason"] == 1).float(),
-                       extras["terminal"]["curriculum_eligible"].float()))
+                       extras["terminal"]["curriculum_eligible"].float(),
+                       extras["terminal"]["curriculum_boundary"].float()))
     outcomes = gather_batch(torch.stack(fields, dim=1))
     if env.noise_curriculum is not None:
         shape_ids = env.curriculum_shape_ids.repeat(dist.get_world_size())
         env.record_curriculum_outcomes(torch.stack(
-            (shape_ids, outcomes[:, 1], outcomes[:, 2], outcomes[:, 3]), dim=1))
+            (shape_ids, outcomes[:, 1], outcomes[:, 2], outcomes[:, 3], outcomes[:, 4]), dim=1))
     keys = [key for key in extras["log"] if not key.startswith("success/")]
     counts = []
     offset = 0
@@ -222,7 +223,9 @@ class DistributedRunner(ContinuousRunner):
     def verify_shared_state(self) -> None:
         if self.env.noise_curriculum is not None:
             state = self.env.noise_curriculum.state_dict()
-            values = [state["level"]]
+            values = [state.get("level", 0)]
+            for phi in state.get("phi", {}).values():
+                values.extend(phi)
             for window in state["windows"].values():
                 values.extend((len(window), *window))
             actual = torch.tensor(values, device=self.device)

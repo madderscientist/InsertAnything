@@ -101,10 +101,11 @@ class PolicyReplay:
                 group = env.groups[0]
                 if self.training_level and env.noise_curriculum is not None:
                     curriculum = env.noise_curriculum
-                    curriculum.level = metadata["noise_curriculum_state"]["level"]
+                    curriculum.load_levels(metadata["noise_curriculum_state"])
                     group.difficulty = curriculum.difficulty
-                    group.noise_scale = curriculum.scale if curriculum.noise_levels > 0 else 0.
-                    group.set_clearance(curriculum.clearance)
+                    scale = curriculum.scale_for(group.shape)
+                    group.noise_scale = 0. if scale is None else scale
+                    group.set_clearance(curriculum.clearance_for(group.shape))
                 group.reset(torch.arange(1, device=self.device))
                 obs = env.get_observations()
                 actor.reset()
@@ -1320,7 +1321,7 @@ def run_env_interactive(args: argparse.Namespace) -> None:
 
     ckpt_iter, metadata, actor = load_policy()
     base = InsertionCfg.from_checkpoint(metadata["environment"])
-    level = metadata.get("noise_curriculum_state", {}).get("level")
+    curriculum_state = metadata.get("noise_curriculum_state")
     probe = replay_config(metadata["environment"], base.shapes[0], training_level=True)
     env_cache: dict[str, Any] = {"env": None, "key": None, "scene": None}
 
@@ -1332,8 +1333,8 @@ def run_env_interactive(args: argparse.Namespace) -> None:
             cfg = replace(replay_config(metadata["environment"], shape, training_level=True),
                           terminate_on_overload=terminate, enable_timeout=False)
             env = InsertionEnv(cfg, device)
-            if env.noise_curriculum is not None and level is not None:
-                env.noise_curriculum.level = level
+            if env.noise_curriculum is not None and curriculum_state is not None:
+                env.noise_curriculum.load_levels(curriculum_state)
             env_cache.update(env=env, key=key, scene=EnvScene(server, env.groups[0]))
         return env_cache["env"], env_cache["scene"]
 
@@ -1350,10 +1351,11 @@ def run_env_interactive(args: argparse.Namespace) -> None:
     probe_env, _ = build_env(args.shape if args.shape in base.shapes else
                              ("dual" if "dual" in base.shapes else base.shapes[0]), False)
     curriculum = probe_env.noise_curriculum
-    default_clearance = (curriculum.clearance if curriculum is not None else base.clearance)*1000
+    default_clearance = (curriculum.clearance_for(probe_env.groups[0].shape) if curriculum is not None
+                         else base.clearance)*1000
     default_difficulty = curriculum.difficulty if curriculum is not None else 1.
-    default_noise = (curriculum.scale if curriculum is not None and curriculum.noise_levels > 0
-                     else probe_env.groups[0].noise_scale)
+    curriculum_noise = None if curriculum is None else curriculum.scale_for(probe_env.groups[0].shape)
+    default_noise = probe_env.groups[0].noise_scale if curriculum_noise is None else curriculum_noise
     mm = lambda value: round(value*1000/base.scale, 2)
 
     with server.gui.add_folder("0. 运行控制", expand_by_default=True):
@@ -1503,7 +1505,7 @@ def run_env_interactive(args: argparse.Namespace) -> None:
         return (f"形状参数 `{', '.join(f'{p:.2f}' for p in params)}` mm | "
                 f"凸台 `h={float(g.rim_height[0])*1000:.2f} w={float(g.rim_width[0])*1000:.2f}` mm  \n"
                 f"目标偏差 `[{bias[0]:+.2f}, {bias[1]:+.2f}]` mm | "
-                f"间隙 `{g.clearance*1000:.2f}` mm | 难度 `{g.difficulty:.2f}`  \n"
+                f"间隙 `{float(g.shape_params[0, 3])*1000:.2f}` mm | 难度 `{g.difficulty:.2f}`  \n"
                 f"K `[{k[0]:.0f}, {k[1]:.0f}, {k[2]:.0f}] N/m` | 低通 `{'关' if off else '开'}` | "
                 f"孔壁摩擦 `{float(g.wall_friction[0]):.2f} N` | "
                 f"静摩擦 `{float(g.stiction[0, 2]):.2f} N` | "
