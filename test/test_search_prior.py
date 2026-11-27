@@ -209,8 +209,11 @@ class SearchPriorTests(unittest.TestCase):
     def test_recurrent_actor_critic_trains_resumes_and_exports(self):
         torch.set_num_threads(1)
         cfg = InsertionCfg(envs_per_shape=4, shapes=("square",), episode_seconds=0.08, **SEARCH)
-        config = search_runner(Namespace(steps=4, rnn_hidden=64, rnn_layers=2, mini_batches=4,
+        config = search_runner(Namespace(steps=4, rnn_hidden=64, rnn_layers=None, mini_batches=4,
                                          gsde_resample_steps=25, phase_coef=0.1, phase_lr=1e-3))
+        self.assertEqual(config["actor"]["rnn_num_layers"], 2)
+        self.assertEqual(config["critic"]["rnn_num_layers"], 2)
+        self.assertEqual(config["algorithm"]["actor_min_lr"], 1e-6)
         self.assertEqual(config["actor"]["distribution_cfg"]["class_name"], GSDE_DISTRIBUTION)
         metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg)}
         with tempfile.TemporaryDirectory() as directory:

@@ -16,10 +16,10 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from insertion import InsertionCfg
 from insertion.config import REAL2SIM_VALUES, runner_config
 from insertion.model import GSDE_DISTRIBUTION, SKIP_RNN_MODEL
-from insertion.ppo import DEFAULT_ACTOR_MIN_LR
 from train import atomic_json, contract, supervise, validate_ppo_batch_layout
 
 SEARCH_SHAPES = ("triangle", "pentagon", "hexagon", "l", "rectangle", "dual")
+SEARCH_ACTOR_MIN_LR = 1e-6
 
 
 def parse_critic_lr(value: str) -> float | str:
@@ -48,12 +48,11 @@ def search_config(args: argparse.Namespace) -> InsertionCfg:
 def search_runner(args: argparse.Namespace) -> dict:
     runner = runner_config(args.steps)
     runner["save_interval"] = 1
+    layers = 2 if args.rnn_layers is None else args.rnn_layers
     # 部分可观测下 critic 也需记忆：只看当前特权状态的 MLP critic 训练均崩塌
     for name in ("actor", "critic"):
-        runner[name].update(class_name=SKIP_RNN_MODEL, rnn_hidden_dim=args.rnn_hidden,
+        runner[name].update(class_name=SKIP_RNN_MODEL, rnn_hidden_dim=args.rnn_hidden, rnn_num_layers=layers,
                             hidden_dims=(args.rnn_hidden, args.rnn_hidden // 2))
-        if args.rnn_layers is not None:
-            runner[name]["rnn_num_layers"] = args.rnn_layers
     if getattr(args, "critic_rnn_layers", None) is not None:
         runner["critic"]["rnn_num_layers"] = args.critic_rnn_layers
     distribution = runner["actor"]["distribution_cfg"]
@@ -63,7 +62,7 @@ def search_runner(args: argparse.Namespace) -> dict:
     # 每卡环境数 × 序列长度 × 256 维 GRU 的更新显存较大，需更小的 minibatch
     runner["algorithm"].update(num_mini_batches=args.mini_batches,
                                phase_coef=args.phase_coef, phase_learning_rate=args.phase_lr)
-    runner["algorithm"].update(actor_min_lr=getattr(args, "actor_min_lr", DEFAULT_ACTOR_MIN_LR),
+    runner["algorithm"].update(actor_min_lr=getattr(args, "actor_min_lr", SEARCH_ACTOR_MIN_LR),
                                critic_learning_rate=getattr(args, "critic_lr", "actor"))
     return runner
 
@@ -90,9 +89,9 @@ def main() -> None:
                         help="rollout steps per environment; also the truncated BPTT horizon")
     parser.add_argument("--mini-batches", type=int, default=16)
     parser.add_argument("--rnn-hidden", type=int, default=256)
-    parser.add_argument("--rnn-layers", type=int, help="override both GRU depths (defaults: actor 1, critic 2)")
+    parser.add_argument("--rnn-layers", type=int, help="override both GRU depths (default: 2)")
     parser.add_argument("--critic-rnn-layers", type=int, help="override the critic GRU depth independently")
-    parser.add_argument("--actor-min-lr", type=float, default=DEFAULT_ACTOR_MIN_LR,
+    parser.add_argument("--actor-min-lr", type=float, default=SEARCH_ACTOR_MIN_LR,
                         help="lower bound for the actor KL learning-rate schedule")
     parser.add_argument("--critic-lr", type=parse_critic_lr, default="actor", metavar="RATE|actor",
                         help="follow the actor KL schedule (default), or specify a fixed critic learning rate")
