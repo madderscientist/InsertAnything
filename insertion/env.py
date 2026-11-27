@@ -144,7 +144,14 @@ def position_distance(cfg: InsertionCfg, xy: torch.Tensor, z_disp: torch.Tensor,
         norm = r_max*r_max / (length + eps)
         outer_xy = half_cap * x2 / ((torch.sqrt(x2 + eps*eps) + eps) * norm)
         xy_distance = (1.0 - w)*xy_distance + w*outer_xy
-    return xy_distance + half_cap*torch.tanh(remaining/half_cap)
+    z_distance = half_cap*torch.tanh(remaining/half_cap)
+    w = cfg.z_outer_cost_weight
+    if w > 0:
+        # 板面到工作空间顶部线性增长，消除离板后 tanh 饱和的零梯度（否则悬停高空与贴板同价）
+        ceiling = cfg.workspace_z_max_m*cfg.scale
+        outer_z = half_cap*(z_disp - target_depth).clamp(0.0, ceiling)/ceiling
+        z_distance = (1.0 - w)*z_distance + w*outer_z
+    return xy_distance + z_distance
 
 
 def orientation_cost(cfg: InsertionCfg, z_disp: torch.Tensor, target_depth: torch.Tensor,

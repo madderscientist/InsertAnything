@@ -250,6 +250,7 @@ def contract(cfg: InsertionCfg) -> dict:
         "success_safety_priority": True,
         "xy_cost_radius_fraction": cfg.xy_cost_radius_fraction,
         "xy_outer_cost_weight": cfg.xy_outer_cost_weight,
+        "z_outer_cost_weight": cfg.z_outer_cost_weight,
         "inserted_load_cost": {
             "enabled": cfg.inserted_load_cost,
             "activation": f"true physical tip center z < {-cfg.inserted_load_depth_m:g} m; not lowest point",
@@ -720,7 +721,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "target_depth_min_m", "target_depth_max_fraction",
                     "stagnation_cost_per_second", "stagnation_window_seconds",
                     "stagnation_speed_threshold_mps", "surface_z_free_m",
-                    "xy_cost_radius_fraction", "xy_outer_cost_weight",
+                    "xy_cost_radius_fraction", "xy_outer_cost_weight", "z_outer_cost_weight",
                     "load_cost_cap", "terminate_on_overload",
                     "enable_timeout", "rough_surface", "rough_max_amplitude_m",
                     "rough_wavelength_min_m", "rough_wavelength_max_m",

@@ -43,11 +43,12 @@ D_{xy}=c_{1/2}\Big[(1-w_{\text{out}})\tanh\!\big(u_{xy}^2/c_{1/2}\big)+w_{\text{
 $$
 
 $$
-D_z=c_{1/2}\tanh\!\big(u_z/c_{1/2}\big),\qquad u_z=\frac{\max(z_{\min}+d,\,0)}{d}
+D_z=c_{1/2}\Big[(1-w_z)\tanh\!\big(u_z/c_{1/2}\big)+w_z\,\frac{\mathrm{clip}(z_{\min},0,Z)}{Z}\Big],\qquad u_z=\frac{\max(z_{\min}+d,\,0)}{d}
 $$
 
 - **近场项** $\tanh(u_{xy}^2)$：在孔轴处导数为零，允许在孔口附近用接触盲搜。参考尺度为 $k_{xy}R$，其中 $k_{xy}$ 即 `xy_cost_radius_fraction`=0.25。
 - **远场项** $\phi_{\text{out}}$：在 `workspace_xy_radius_m` 以内是平滑的径向斜率，弥补近场项饱和后的零梯度，权重为 `xy_outer_cost_weight`=0.2。两项按凸组合相加，所以 $D_{xy}\le c_{1/2}$ 始终成立。
+- **高度远场项**：$\tanh(u_z)$ 在板面以上约一个目标深度处已饱和，悬停高空与贴板几乎同价，策略会退化为飞离板面；故从板面到工作空间顶部 $Z$=`workspace_z_max_m` 叠加线性项，权重 `z_outer_cost_weight`=0.2，同样是凸组合，$D_z\le c_{1/2}$。
 - **深度用最低点**：深度项按最低点计算，策略可以斜着先把一个角插进去来降低成本。XY 成本、观测和成功判定仍以端面中心为准。
 - **第二阶段越障免罚带**：`surface_z_free_m`>0 时，最低点在板面以上、这个高度以内的抬升不增加 $D_z$，策略可以抬起来越过台阶。
 
