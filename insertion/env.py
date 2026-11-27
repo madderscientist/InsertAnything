@@ -199,14 +199,15 @@ def stagnation_level(cfg: InsertionCfg, tip: torch.Tensor, tip_ema: torch.Tensor
 
 def action_costs(cfg: InsertionCfg, actions: torch.Tensor, previous_actions: torch.Tensor,
                  in_contact: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-    """返回 ‖ā‖ 与 w_Δa·‖ā−ā_prev‖；ā 为 tanh 软饱和动作，悬空时 w_Δa 更大。"""
+    """返回 ‖ā‖ 与 w_Δa·‖ā−ā_prev‖（悬空可选平方）；ā 为 tanh 软饱和动作，悬空时 w_Δa 更大。"""
     applied = cfg.action_cost_cap * torch.tanh(actions / cfg.action_cost_cap)
     previous = cfg.action_cost_cap * torch.tanh(previous_actions / cfg.action_cost_cap)
-    weight = torch.full_like(applied[:, 0], cfg.action_change_cost_per_second)
+    change = torch.linalg.vector_norm(applied-previous, dim=-1)
+    cost = cfg.action_change_cost_per_second*change
     if in_contact is not None and cfg.free_air_action_change_cost_per_second is not None:
-        weight = torch.where(in_contact, weight, cfg.free_air_action_change_cost_per_second)
-    return (torch.linalg.vector_norm(applied, dim=-1),
-            weight*torch.linalg.vector_norm(applied-previous, dim=-1))
+        air = change.square() if cfg.free_air_action_change_squared else change
+        cost = torch.where(in_contact, cost, cfg.free_air_action_change_cost_per_second*air)
+    return torch.linalg.vector_norm(applied, dim=-1), cost
 
 
 class PlantGroup:

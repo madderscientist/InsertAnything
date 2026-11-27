@@ -29,6 +29,10 @@ def search_config(args: argparse.Namespace) -> InsertionCfg:
         # 目标上叠加的正弦粘滑空中也一直存在，与真机不符
         stick_slip_max_pp_m=0.0,
         wall_friction_force=2.0,
+        # 线性变化成本压不住悬空大幅跳变，低阻尼下激起持续振荡
+        free_air_action_change_squared=True,
+        # ζ=0.25 超调 44%，满难度下悬空惯性力 p90 近 5 N；0.5 超调 16%
+        damping_ratio_min=0.5,
         clearance_curriculum=True, noise_curriculum=True, noise_curriculum_mode="success",
         physics_cuda_graph=True, observation_cuda_graph=True,
         shapes=SEARCH_SHAPES, shape_randomization=True, rim_probability=args.rim_probability,

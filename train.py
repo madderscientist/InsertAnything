@@ -326,6 +326,7 @@ def contract(cfg: InsertionCfg) -> dict:
                         "zero GRU state; lifted above new rough terrain unless inside the hole opening"),
         },
         "free_air_action_change_cost_per_second": cfg.free_air_action_change_cost_per_second,
+        "free_air_action_change_squared": cfg.free_air_action_change_squared,
         "action_change_contact": "privileged true constraint force > 0.05 N within the 20 ms step",
         "motion_vibration_wrench": {
             "force_std_n": [cfg.vibration_force_min_n, cfg.vibration_force_max_n],

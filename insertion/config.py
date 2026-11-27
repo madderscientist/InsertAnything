@@ -189,6 +189,7 @@ class InsertionCfg:
     action_change_cost_per_second: float = 0.1
     # 悬空时更强的动作变化成本；接触时允许晃动以搜索孔口
     free_air_action_change_cost_per_second: float | None = 0.5
+    free_air_action_change_squared: bool = False
     # 让 ~20 单位的大动作仍有代价梯度
     action_cost_cap: float = 12.0
     completion_bonus: float = 20.0
@@ -425,7 +426,11 @@ class InsertionCfg:
 
     @property
     def max_action_change_cost_per_second(self) -> float:
-        return max(self.action_change_cost_per_second, self.free_air_action_change_cost_per_second or 0.)
+        # 平方时按最大跳变幅度折算成线性斜率上界
+        air = self.free_air_action_change_cost_per_second or 0.
+        if self.free_air_action_change_squared:
+            air *= 2*self.action_cost_cap*math.sqrt(6)
+        return max(self.action_change_cost_per_second, air)
 
     @property
     def critic_shape_count(self) -> int:

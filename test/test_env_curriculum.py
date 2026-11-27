@@ -17,7 +17,7 @@ from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
 from insertion.config import REAL2SIM_VALUES
 from insertion.curriculum import adaptive_environment_counts
 from insertion.transforms import quat_inv, rotate, rotvec_quat
-from insertion.env import PlantGroup, lowpass_velocity, play_hysteresis_step
+from insertion.env import PlantGroup, action_costs, lowpass_velocity, play_hysteresis_step
 from insertion.shapes.base import PreparedGeometry
 from real2sim.evaluate_real2sim import sign_flips, velocity_reversals
 from real2sim.train_real2sim import real2sim_config
@@ -407,6 +407,18 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
                             force=1000., moment=1000., action=100., previous=-100.)
         self.assertGreaterEqual(worst, -cfg.completion_step_cost_bound)
         self.assertLess(self.reward(failure=True), -cfg.hold_cost_bound)
+
+    def test_free_air_action_change_squared(self):
+        cfg = replace(InsertionCfg(), free_air_action_change_squared=True)
+        actions = torch.tensor([[0.5, 0, 0, 0, 0, 0], [3., 0, 0, 0, 0, 0]] * 2)
+        contact = torch.tensor([False, False, True, True])
+        _, cost = action_costs(cfg, actions, torch.zeros_like(actions), contact)
+        change = cfg.action_cost_cap * torch.tanh(actions[:, 0] / cfg.action_cost_cap)
+        torch.testing.assert_close(cost, torch.cat((
+            cfg.free_air_action_change_cost_per_second * change[:2].square(),
+            cfg.action_change_cost_per_second * change[2:])))
+        self.assertGreater(cfg.max_action_change_cost_per_second,
+                           InsertionCfg().max_action_change_cost_per_second)
 
     def test_squared_xy_and_linear_remaining_depth(self):
         cfg, legacy_cfg = InsertionCfg(), InsertionCfg.from_checkpoint({})
