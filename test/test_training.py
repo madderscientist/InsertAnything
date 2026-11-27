@@ -91,11 +91,11 @@ class PolicyAndViewerTests(unittest.TestCase):
             self.assertLess(report["action_max_absolute_error"], 1e-5)
             manifest = json.loads((output / "contract.json").read_text())
             self.assertEqual(manifest["source"]["iteration"], 42)
-            self.assertEqual(manifest["onnx"]["inputs"], {"obs": [1, 13], "h_in": [2, 1, 128]})
+            self.assertEqual(manifest["onnx"]["inputs"], {"obs": [1, 13], "h_in": [1, 1, 128]})
             self.assertFalse(manifest["onnx"]["safety_checks_in_model"])
             with np.load(output / "test_vectors.npz") as vectors:
                 self.assertEqual(vectors["obs"].shape, (100, 1, 13))
-                self.assertEqual(vectors["h_out"].shape, (100, 2, 1, 128))
+                self.assertEqual(vectors["h_out"].shape, (100, 1, 1, 128))
                 self.assertEqual(np.flatnonzero(vectors["reset"]).tolist(), [0, 37, 74])
             self.assertTrue((output / "DEPLOYMENT_ONNX.md").is_file())
 

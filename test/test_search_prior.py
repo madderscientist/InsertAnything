@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 import torch
 from torch.distributions import Normal
@@ -17,6 +18,7 @@ from export_policy import export, export_onnx
 from insertion import InsertionCfg, InsertionEnv
 from insertion.env import warp_stream
 from insertion.model import CHRONO_MAX_STEPS, GSDE_DISTRIBUTION, SkipRNNModel
+from insertion.ppo import SmoothPPO
 from insertion.transforms import rotate, tip_pose
 from search_prior.train_search import SEARCH_SHAPES, search_runner
 from train import ContinuousRunner, atomic_json, contract, resume_training
@@ -169,13 +171,13 @@ class SearchPriorTests(unittest.TestCase):
             resume_training(resumed, cfg, 1)
             torch.testing.assert_close(resumed.alg.critic.rnn.rnn.weight_hh_l0.cpu(),
                                        saved["critic_state_dict"]["rnn.rnn.weight_hh_l0"])
-            # 旧检查点 actor/critic 共用一组：按当前分组切分，critic 恢复固定学习率
+            # 旧检查点 actor/critic 共用一组：按当前分组切分，critic 恢复与 actor 相同的学习率
             optimizer = saved["optimizer_state_dict"]
             merged = {**optimizer, "param_groups": [{**optimizer["param_groups"][0], "lr": 1e-6, "params": [
                 i for group in optimizer["param_groups"] for i in group["params"]]}]}
             resumed.alg.load({**saved, "optimizer_state_dict": merged}, None, True)
             self.assertEqual([g["lr"] for g in resumed.alg.optimizer.param_groups],
-                             [1e-6, config["algorithm"]["learning_rate"]])
+                             [1e-6, 1e-6])
             resumed.learn(1)
             _, actor = load_checkpoint(output / "checkpoint.pt", "cuda:0")
             self.assertIsInstance(actor, SkipRNNModel)
@@ -191,6 +193,35 @@ class SearchPriorTests(unittest.TestCase):
             # 导出函数内部逐步校验 TorchScript/ONNX 与原模型的序列数值等价
             export(output / "checkpoint.pt", output / "jit", samples=100)
             export_onnx(output / "checkpoint.pt", output / "onnx", samples=100)
+
+    def test_critic_rate_on_resume_and_kl_update(self):
+        torch.manual_seed(7)
+        obs = TensorDict({"actor": torch.randn(4, 13), "critic": torch.randn(4, 15)}, [4])
+        groups = {"actor": ["actor"], "critic": ["critic"]}
+        model = dict(hidden_dims=(8,), rnn_type="gru", rnn_hidden_dim=8)
+        for schedule in ("actor", 3e-5):
+            with self.subTest(schedule=schedule):
+                actor = SkipRNNModel(obs, groups, "actor", 6, **model, rnn_num_layers=1,
+                                     distribution_cfg={"class_name": GSDE_DISTRIBUTION})
+                critic = SkipRNNModel(obs, groups, "critic", 1, **model, rnn_num_layers=2)
+                storage = RolloutStorage("rl", 4, 4, obs, [6])
+                alg = SmoothPPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=1,
+                                learning_rate=1e-4, critic_learning_rate=schedule)
+                saved = alg.save()
+                saved["optimizer_state_dict"]["param_groups"][0]["lr"] = 6e-5
+                alg.load(saved, None, True)
+                critic_rate = 6e-5 if schedule == "actor" else schedule
+                self.assertEqual([g["lr"] for g in alg.optimizer.param_groups], [6e-5, critic_rate])
+                with torch.inference_mode():
+                    for _ in range(4):
+                        alg.act(obs)
+                        alg.process_env_step(obs, torch.randn(4), torch.zeros(4, dtype=torch.long), {})
+                    alg.compute_returns(obs)
+                    storage.distribution_params[0].add_(1.0)  # Force KL above the decrease threshold.
+                alg.update()
+                actor_rate, critic_rate = [g["lr"] for g in alg.optimizer.param_groups]
+                self.assertAlmostEqual(actor_rate, 4e-5)
+                self.assertEqual(critic_rate, actor_rate if schedule == "actor" else schedule)
 
     def test_gsde_noise_is_state_dependent_consistent_and_matches_likelihood(self):
         torch.manual_seed(0)

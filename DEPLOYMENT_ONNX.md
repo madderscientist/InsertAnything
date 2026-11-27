@@ -17,9 +17,9 @@ python -m pip install numpy onnxruntime
 | Tensor | Shape | Meaning |
 |---|---|---|
 | `obs` | `[1,13]` | Unnormalized observation |
-| `h_in` | `[2,1,128]` | Previous GRU state |
+| `h_in` | `[layers,1,hidden_size]` | Previous GRU state |
 | `actions` | `[1,6]` | Unbounded deterministic mean |
-| `h_out` | `[2,1,128]` | Next GRU state |
+| `h_out` | `[layers,1,hidden_size]` | Next GRU state |
 
 All tensors are finite, contiguous `float32`, with fixed batch size one. Do not normalize observations again or sample exploration noise. Exporting with `--onnx --prune-std` removes the unused standard-deviation head without changing mean actions.
 
@@ -95,7 +95,8 @@ import numpy as np
 import onnxruntime as ort
 
 session = ort.InferenceSession("actor.onnx", providers=["CPUExecutionProvider"])
-h = np.zeros((2, 1, 128), dtype=np.float32)
+hidden_shape = next(tensor.shape for tensor in session.get_inputs() if tensor.name == "h_in")
+h = np.zeros(hidden_shape, dtype=np.float32)
 
 def reset_policy():
     h.fill(0)

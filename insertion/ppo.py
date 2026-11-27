@@ -1,5 +1,8 @@
 """循环 PPO + 空中力旋量观测平滑正则：抑制策略对悬空时自身惯性/振动力波动的反应"""
 
+import math
+from typing import Literal
+
 import torch
 import torch.nn as nn
 from rsl_rl.algorithms import PPO
@@ -7,6 +10,7 @@ from rsl_rl.utils import unpad_trajectories
 
 WRENCH_SLICE = slice(7, 13)
 SMOOTH_PPO = "insertion.ppo:SmoothPPO"
+DEFAULT_ACTOR_MIN_LR = 1e-5
 
 # TF32 下 rollout 逐步推理与更新时整段推理的误差经 GRU 累积，旧策略概率失真
 torch.backends.cudnn.allow_tf32 = False
@@ -15,17 +19,31 @@ torch.backends.cuda.matmul.allow_tf32 = False
 
 class SmoothPPO(PPO):
     def __init__(self, *args, smooth_coef: float = 0.0, smooth_force_std: float = 0.5,
-                 smooth_moment_std: float = 0.05, **kwargs) -> None:
+                 smooth_moment_std: float = 0.05,
+                 actor_min_lr: float = DEFAULT_ACTOR_MIN_LR, critic_learning_rate: float | Literal["actor"] = "actor",
+                 **kwargs) -> None:
+        if not 0 < actor_min_lr <= 1e-2:
+            raise ValueError("actor_min_lr must be in (0, 1e-2]")
+        follows_actor = critic_learning_rate == "actor"
+        if not follows_actor and (not isinstance(critic_learning_rate, (int, float))
+                                  or not 0 < critic_learning_rate < math.inf):
+            raise ValueError("critic_learning_rate must be positive and finite or 'actor'")
         super().__init__(*args, **kwargs)
         if self.rnd or self.symmetry:
             raise ValueError("SmoothPPO does not support RND or symmetry extensions")
         self.smooth_coef = smooth_coef
+        self.actor_min_lr = actor_min_lr
+        critic_lr = self.learning_rate if follows_actor else critic_learning_rate
         self.smooth_std = torch.tensor([smooth_force_std]*3 + [smooth_moment_std]*3, device=self.device)
-        # KL 自适应学习率只调 actor；critic 不改变动作分布，随 KL 压低会拖慢价值学习
-        self.optimizer = type(self.optimizer)(
-            [{"params": list(self.actor.parameters())}, {"params": list(self.critic.parameters())}],
-            lr=self.learning_rate)
-        self.fixed_rates = [self.learning_rate]
+        groups = [{"params": list(self.actor.parameters())},
+                  {"params": list(self.critic.parameters()), "lr": critic_lr}]
+        self.optimizer = type(self.optimizer)(groups, lr=self.learning_rate)
+        self.num_adaptive_groups = 2 if follows_actor else 1
+        self.fixed_rates = [g["lr"] for g in self.optimizer.param_groups[self.num_adaptive_groups:]]
+
+    def apply_adaptive_rate(self) -> None:
+        for group in self.optimizer.param_groups[:self.num_adaptive_groups]:
+            group["lr"] = self.learning_rate
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         saved = loaded_dict.get("optimizer_state_dict")
@@ -41,7 +59,8 @@ class SmoothPPO(PPO):
                 start += len(group["params"])
             loaded_dict = {**loaded_dict, "optimizer_state_dict": {**saved, "param_groups": regrouped}}
         loaded = super().load(loaded_dict, load_cfg, strict)
-        for group, rate in zip(self.optimizer.param_groups[1:], self.fixed_rates, strict=True):
+        self.apply_adaptive_rate()
+        for group, rate in zip(self.optimizer.param_groups[self.num_adaptive_groups:], self.fixed_rates, strict=True):
             group["lr"] = rate
         return loaded
 
@@ -99,14 +118,14 @@ class SmoothPPO(PPO):
                     totals["kl"] += kl_mean.item()
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            self.learning_rate = max(self.actor_min_lr, self.learning_rate / 1.5)
                         elif 0.0 < kl_mean < self.desired_kl / 2.0:
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
                     if self.is_multi_gpu:
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
-                    self.optimizer.param_groups[0]["lr"] = self.learning_rate
+                    self.apply_adaptive_rate()
 
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))
             advantages = torch.squeeze(batch.advantages)
