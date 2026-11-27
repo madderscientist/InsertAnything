@@ -96,8 +96,8 @@ def main() -> None:
                         help="follow the actor KL schedule (default), or specify a fixed critic learning rate")
     parser.add_argument("--gsde-resample-steps", type=int, default=25,
                         help="gSDE exploration matrix resample period in policy steps")
-    parser.add_argument("--phase-coef", type=float, default=0.0,
-                        help="cross-entropy weight of the linear phase head supervising the actor GRU output")
+    parser.add_argument("--phase-coef", type=float, default=0.1,
+                        help="phase cross-entropy weight on the actor GRU (default: 0.1, use 0 to disable)")
     parser.add_argument("--phase-lr", type=float, default=1e-3,
                         help="fixed Adam learning rate of the phase head, independent of the KL schedule")
     parser.add_argument("--rim-probability", type=float, default=0.5,

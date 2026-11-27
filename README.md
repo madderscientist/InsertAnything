@@ -204,6 +204,7 @@ X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
 - **搜索训练网络**：actor 和 critic 均使用 [insertion/model.py](./insertion/model.py) 的 `SkipRNNModel`：actor 使用一层 `GRU(256)`，critic 使用两层。归一化观测经过 GRU，输出与当前观测拼接 → `ELU MLP(256, 128)`。GRU 用 chrono 初始化（更新门偏置 $\log U(1, 499)$，初始记忆时间常数铺满 2–500 步），输出不加 LayerNorm；默认初始化的更新门约 0.5，记忆只有约 2 步。critic 也需记忆：只看当前特权状态的 MLP critic 在部分可观测任务中有偏，两次训练均崩塌。
 
   搜索训练每个 minibatch 按策略 KL 同步调整 actor 和 critic 的学习率，默认下限为 `1e-5`。训练配置中的 `critic_learning_rate="actor"` 表示联动，`--critic-lr 1e-4` 可切换为固定学习率。续训使用检查点配套的网络层数。
+  新建搜索训练默认使用阶段监督。线性分类头从 actor 的 GRU 输出预测悬空、贴板、孔口受阻和已入孔四个阶段。交叉熵权重为 `0.1`，分类头学习率固定为 `1e-3`。`--phase-coef 0` 可关闭，已有实验按保存的配置续训。
 
   ```mermaid
   flowchart LR
