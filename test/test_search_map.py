@@ -24,6 +24,22 @@ SEARCH = dict(position_bias=0.005, initial_xy=0.005, workspace_xy_radius_m=0.025
 
 
 class SearchMapTests(unittest.TestCase):
+    def test_episode_prior_sigma_is_log_uniform_and_independent_of_noise(self):
+        cfg = InsertionCfg(search_map=True, search_map_sigma_min_m=0.0005, search_map_sigma_max_m=0.003)
+        group = Namespace(cfg=cfg, episode_noise_scale=torch.zeros(2000))
+        env = Namespace(search_map=SearchMap(2000, "cpu"), groups=[group], device="cpu",
+                        map_generator=torch.Generator().manual_seed(0))
+        InsertionEnv.reset_search_map(env, torch.ones(2000, dtype=torch.bool))
+        p = env.search_map.log_prior.exp()
+        axis = (torch.arange(GRID) - GRID / 2 + 0.5) * CELL_M
+        std = (p.sum(2) * axis.square()).sum(1).sqrt()
+        self.assertGreater(float(std.min()), 0.0004)
+        self.assertLess(float(std.max()), 0.0031)
+        log_std = std.log()
+        self.assertAlmostEqual(float(log_std.mean()), (math.log(0.0005) + math.log(0.003)) / 2, delta=0.1)
+        with self.assertRaises(ValueError):
+            InsertionCfg(search_map_sigma_min_m=0.0005, search_map_sigma_max_m=0.003)
+
     def test_prior_is_normalized_gaussian_with_given_std(self):
         std = torch.tensor([0.001, 0.003, 0.005])
         p = prior_log_mass(std).exp()

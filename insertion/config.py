@@ -157,6 +157,9 @@ class InsertionCfg:
     search_map: bool = False
     # 势函数整形系数 c：Φ = c Σ P0 (1 - e^s)，奖励 γΦ' - Φ，终止时 Φ' = 0，整回合折扣和为零
     search_coverage_reward: float = 0.0
+    # >0 时每回合先验宽度在 [min, max] 对数均匀采样、与噪声尺度脱钩；0 按误差分布×噪声尺度
+    search_map_sigma_min_m: float = 0.0
+    search_map_sigma_max_m: float = 0.0
     # 逐环境随机形状尺寸，并以一定概率在孔口加一圈高出周围平面的围框（孔口顶面始终为 z=0）
     shape_randomization: bool = False
     rim_probability: float = 0.5
@@ -320,6 +323,9 @@ class InsertionCfg:
             raise ValueError("plate outer radius must be finite and nonnegative; zero selects legacy geometry")
         if self.search_map and not 0 < self.position_bias <= 0.015:
             raise ValueError("search map requires 0 < position_bias <= 15 mm inside its 48 mm grid")
+        if self.search_map_sigma_max_m and not (
+                self.search_map and 0 < self.search_map_sigma_min_m <= self.search_map_sigma_max_m <= 0.015):
+            raise ValueError("search map sigma range requires the search map and 0 < min <= max <= 15 mm")
         if self.search_coverage_reward < 0 or (self.search_coverage_reward > 0 and not self.search_map):
             raise ValueError("search coverage reward must be nonnegative and requires the search map")
         if not isinstance(self.shape_randomization, bool) or (self.shape_randomization and not (

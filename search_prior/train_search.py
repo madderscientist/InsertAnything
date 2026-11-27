@@ -43,7 +43,10 @@ def search_config(args: argparse.Namespace) -> InsertionCfg:
         shapes=SEARCH_SHAPES, shape_randomization=True, rim_probability=args.rim_probability,
         episode_seconds=args.episode_seconds,
         envs_per_shape=args.envs_per_shape, shape_env_counts=(), adaptive_sampling=True,
-        search_map=args.search_map, search_coverage_reward=args.coverage_reward if args.search_map else 0.)
+        search_map=args.search_map, search_coverage_reward=args.coverage_reward if args.search_map else 0.,
+        # 上限约为噪声满量程名义先验的 2 倍，噪声课程放开前就见过各种先验宽度
+        search_map_sigma_min_m=0.0005 if args.search_map else 0.,
+        search_map_sigma_max_m=0.003 if args.search_map else 0.)
 
 
 def search_runner(args: argparse.Namespace) -> dict:

@@ -1725,6 +1725,7 @@ class InsertionEnv(VecEnv):
         self.curriculum_shape_ids = torch.cat([
             torch.full((g.n,), cfg.shapes.index(g.shape), device=device) for g in self.groups])
         self.search_map = SearchMap(self.num_envs, device) if cfg.search_map else None
+        self.map_generator = torch.Generator(device=device).manual_seed(cfg.seed + 7919)
         self.reset_search_map(torch.ones(self.num_envs, dtype=torch.bool, device=device))
 
     def reset_search_map(self, mask: torch.Tensor) -> None:
@@ -1734,6 +1735,11 @@ class InsertionEnv(VecEnv):
         if not len(ids):
             return
         cfg = self.groups[0].cfg
+        if cfg.search_map_sigma_max_m > 0:
+            low, high = math.log(cfg.search_map_sigma_min_m), math.log(cfg.search_map_sigma_max_m)
+            u = torch.rand(len(ids), generator=self.map_generator, device=self.device)
+            self.search_map.reset(ids, prior_log_mass(torch.exp(low + (high - low) * u)))
+            return
         # 均匀偏差±a 的方差为 a²/3，三项均随回合噪声尺度缩放
         grasp = cfg.grasp_position_error**2 * (1. if cfg.grasp_error_distribution == "gaussian" else 1/3)
         std = math.sqrt(grasp + (cfg.tip_calibration_error**2 + cfg.position_bias**2) / 3)
