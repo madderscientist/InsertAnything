@@ -1,7 +1,8 @@
-"""GRU 记忆 + 当前观测跳连的循环模型：GRU 输出与归一化当前观测拼接再进 MLP"""
+"""GRU/minGRU 记忆 + 当前观测跳连的循环模型：记忆输出与归一化当前观测拼接再进 MLP"""
 
 import copy
 import math
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -83,13 +84,66 @@ def chrono_init(gru: nn.GRU, max_steps: float) -> None:
             b_ih[h:2*h] = torch.empty(h).uniform_(1, max_steps - 1).log()
 
 
+class MinGRU(nn.Module):
+    """多层 minGRU：z = σ(W_z x)，h̃ = tanh(W_h x)，h = (1-z) h + z h̃，接口同 nn.GRU（时间优先）
+
+    门与候选只看本层输入，状态 Jacobian 为 diag(1-z)，范数 < 1，参数微小变化不会经门反馈沿序列放大
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, max_steps: float) -> None:
+        super().__init__()
+        self.input_size, self.hidden_size, self.num_layers = input_size, hidden_size, num_layers
+        self.layers = nn.ModuleList(nn.Linear(input_size if k == 0 else hidden_size, 2 * hidden_size)
+                                    for k in range(num_layers))
+        with torch.no_grad():
+            for layer in self.layers:
+                nn.init.xavier_uniform_(layer.weight[:hidden_size])
+                nn.init.xavier_uniform_(layer.weight[hidden_size:])
+                layer.bias.zero_()
+                # 同 chrono 初始化：保留比例 1-z = u/(1+u)，u ~ U(1, T-1)
+                layer.bias[:hidden_size] = -torch.empty(hidden_size).uniform_(1, max_steps - 1).log()
+
+    def forward(self, x: torch.Tensor, h0: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if h0 is None:
+            h0 = x.new_zeros(self.num_layers, x.shape[1], self.hidden_size)
+        last: List[torch.Tensor] = []
+        for k, layer in enumerate(self.layers):
+            y = layer(x)
+            gate = y[..., :self.hidden_size]
+            retain = torch.sigmoid(-gate)
+            write = torch.sigmoid(gate) * torch.tanh(y[..., self.hidden_size:])
+            if x.is_cuda and x.shape[0] > 1 and not torch.jit.is_scripting():
+                x = self.scan(retain, write, h0[k])
+            else:
+                h = h0[k]
+                out: List[torch.Tensor] = []
+                for t in range(x.shape[0]):
+                    h = torch.addcmul(write[t], retain[t], h)
+                    out.append(h)
+                x = torch.stack(out)
+            last.append(x[-1])
+        return x, torch.stack(last)
+
+    @torch.jit.unused
+    def scan(self, retain: torch.Tensor, write: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
+        # 逐步 Python 循环的上百次小核启动使每轮学习慢一倍；融合核与 rollout 逐步递推逐位一致
+        from insertion.linear_scan import LinearScan
+        return LinearScan.apply(retain, write, h0)
+
+
 class SkipRNNModel(RNNModel):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, recurrence: str = "gru", **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if not isinstance(self.rnn.rnn, nn.GRU):
             raise ValueError("SkipRNNModel supports GRU only")
-        # 默认初始化更新门约 0.5，记忆约 2 步且梯度沿时间迅速衰减；不加 LayerNorm，慢单元回合初幅度很小，归一化会放大微小变化
-        chrono_init(self.rnn.rnn, CHRONO_MAX_STEPS)
+        if recurrence == "mingru":
+            gru = self.rnn.rnn
+            self.rnn.rnn = MinGRU(gru.input_size, gru.hidden_size, gru.num_layers, CHRONO_MAX_STEPS)
+        elif recurrence == "gru":
+            # 默认初始化更新门约 0.5，记忆约 2 步且梯度沿时间迅速衰减；不加 LayerNorm，慢单元回合初幅度很小，归一化会放大微小变化
+            chrono_init(self.rnn.rnn, CHRONO_MAX_STEPS)
+        else:
+            raise ValueError("recurrence must be 'gru' or 'mingru'")
 
     def forward(self, obs, masks: torch.Tensor | None = None, hidden_state=None,
                 stochastic_output: bool = False) -> torch.Tensor:

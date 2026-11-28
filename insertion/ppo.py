@@ -27,6 +27,8 @@ class SmoothPPO(PPO):
             raise ValueError("actor_min_lr must be in (0, 1e-2]")
         if recurrent_norm_max is not None and not 0 < recurrent_norm_max < math.inf:
             raise ValueError("recurrent_norm_max must be positive and finite")
+        if recurrent_norm_max is not None and not isinstance(actor.rnn.rnn, nn.GRU):
+            raise ValueError("recurrent_norm_max requires a GRU actor")
         follows_actor = critic_learning_rate == "actor"
         if not follows_actor and (not isinstance(critic_learning_rate, (int, float))
                                   or not 0 < critic_learning_rate < math.inf):

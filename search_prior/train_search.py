@@ -56,6 +56,8 @@ def search_runner(args: argparse.Namespace) -> dict:
                             hidden_dims=(args.rnn_hidden, args.rnn_hidden // 2))
     if getattr(args, "critic_rnn_layers", None) is not None:
         runner["critic"]["rnn_num_layers"] = args.critic_rnn_layers
+    recurrence = getattr(args, "actor_recurrence", "gru")
+    runner["actor"]["recurrence"] = recurrence
     distribution = runner["actor"]["distribution_cfg"]
     runner["actor"]["distribution_cfg"] = {
         "class_name": GSDE_DISTRIBUTION, "init_std": distribution["init_std"],
@@ -65,7 +67,9 @@ def search_runner(args: argparse.Namespace) -> dict:
                                phase_coef=args.phase_coef, phase_learning_rate=args.phase_lr)
     runner["algorithm"].update(actor_min_lr=getattr(args, "actor_min_lr", SEARCH_ACTOR_MIN_LR),
                                critic_learning_rate=getattr(args, "critic_lr", "actor"),
-                               recurrent_norm_max=getattr(args, "recurrent_norm_max", SEARCH_RECURRENT_NORM_MAX))
+                               # minGRU 状态无递归权重，无需谱范数约束
+                               recurrent_norm_max=None if recurrence == "mingru" else
+                               getattr(args, "recurrent_norm_max", SEARCH_RECURRENT_NORM_MAX))
     return runner
 
 
@@ -93,6 +97,8 @@ def main() -> None:
     parser.add_argument("--rnn-hidden", type=int, default=256)
     parser.add_argument("--rnn-layers", type=int, help="override both GRU depths (default: 2)")
     parser.add_argument("--critic-rnn-layers", type=int, help="override the critic GRU depth independently")
+    parser.add_argument("--actor-recurrence", choices=("gru", "mingru"), default="gru",
+                        help="actor recurrent unit; the critic always uses a GRU")
     parser.add_argument("--actor-min-lr", type=float, default=SEARCH_ACTOR_MIN_LR,
                         help="lower bound for the actor KL learning-rate schedule")
     parser.add_argument("--critic-lr", type=parse_critic_lr, default="actor", metavar="RATE|actor",
