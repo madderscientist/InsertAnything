@@ -148,8 +148,8 @@ class SmoothPPO(PPO):
                         self.learning_rate = lr_tensor.item()
                     self.apply_adaptive_rate()
 
-            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))
-            advantages = torch.squeeze(batch.advantages)
+            ratio = torch.exp(actions_log_prob - batch.old_actions_log_prob.squeeze(-1))
+            advantages = batch.advantages.squeeze(-1)
             surrogate_loss = torch.max(
                 -advantages * ratio,
                 -advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)).mean()

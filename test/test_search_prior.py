@@ -253,6 +253,24 @@ class SearchPriorTests(unittest.TestCase):
             export(output / "checkpoint.pt", output / "jit", samples=100)
             export_onnx(output / "checkpoint.pt", output / "onnx", samples=100)
 
+    def test_ppo_single_environment_minibatch_pairs_likelihoods_by_step(self):
+        torch.manual_seed(8)
+        obs = TensorDict({"actor": torch.randn(1, 13), "critic": torch.randn(1, 15)}, [1])
+        groups = {"actor": ["actor"], "critic": ["critic"]}
+        model = dict(hidden_dims=(8,), rnn_type="gru", rnn_hidden_dim=8, rnn_num_layers=1)
+        actor = SkipRNNModel(obs, groups, "actor", 6, **model,
+                             distribution_cfg={"class_name": GSDE_DISTRIBUTION, "resample_steps": 1})
+        critic = SkipRNNModel(obs, groups, "critic", 1, **model)
+        storage = RolloutStorage("rl", 1, 4, obs, [6])
+        alg = SmoothPPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=1)
+        with torch.inference_mode():
+            for _ in range(4):
+                alg.act(obs)
+                alg.process_env_step(obs, torch.zeros(1), torch.zeros(1, dtype=torch.long), {})
+            alg.compute_returns(obs)
+            storage.advantages.fill_(1)
+        self.assertAlmostEqual(alg.update()["surrogate"], -1.0, places=5)
+
     def test_critic_rate_on_resume_and_kl_update(self):
         torch.manual_seed(7)
         obs = TensorDict({"actor": torch.randn(4, 13), "critic": torch.randn(4, 15)}, [4])
