@@ -1518,7 +1518,7 @@ def run_env_interactive(args: argparse.Namespace) -> None:
         results = " | ".join(f"{s} {v[0]}/{v[1]}" for s, v in tally.items()) or "无"
         labels = {"running": "运行中", "paused": "已暂停", "finished": f"回合结束：**{episode.get('reason', '')}**"}
         status_md.content = (
-            f"**{labels[state['mode']]}** | 迭代 `{ckpt_iter}` | 课程等级 `{level}` | "
+            f"**{labels[state['mode']]}** | 迭代 `{ckpt_iter}` | 检查点难度 `{default_difficulty:.2f}` | "
             f"终止口径 `{'超限终止' if env_cache['key'][1] else '训练（超限不终止）'}`  \n"
             f"{episode.get('info', '')}  \n"
             f"步数 `{frame['length']}` (`{frame['length']*0.02:.2f} s`) | 保持 `{frame['hold']}`  \n"
