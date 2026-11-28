@@ -61,6 +61,21 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         self.assertEqual(curriculum.level, 1)
         self.assertEqual(len(curriculum.windows["square"]), 0)
 
+    def test_adr_cohort_logs_boundary_success_per_dimension(self):
+        env = SimpleNamespace(
+            noise_curriculum=ADRCurriculum(("square",), 0.002, 0.0001), curriculum_pending=[], groups=[],
+            curriculum_cohort=None, curriculum_cohort_seen=None, curriculum_cohort_armed=None)
+        batch = torch.zeros(1000, 5)
+        batch[:, 1] = batch[:, 3] = 1
+        batch[:100, 4], batch[100:200, 4] = 1, 2
+        env.curriculum_pending.append(batch.clone())
+        self.assertNotIn("curriculum/boundary_success/noise/square", InsertionEnv.advance_noise_curriculum(env))
+        batch[:70, 2] = batch[100:150, 2] = 1
+        env.curriculum_pending.append(batch)
+        logs = InsertionEnv.advance_noise_curriculum(env)
+        self.assertAlmostEqual(float(logs["curriculum/boundary_success/noise/square"]), 0.7)
+        self.assertAlmostEqual(float(logs["curriculum/boundary_success/clearance/square"]), 0.5)
+
     def test_curriculum_cohort_excludes_episodes_in_progress_at_start(self):
         curriculum = SuccessNoiseCurriculum(("square",))
         env = SimpleNamespace(

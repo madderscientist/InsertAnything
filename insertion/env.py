@@ -1770,6 +1770,11 @@ class InsertionEnv(VecEnv):
         if complete:
             seen.zero_()
             armed.zero_()
+            for shape in shapes:
+                for name, values in zip(("noise", "clearance"), boundary[shape]):
+                    if values:
+                        logs[f"curriculum/boundary_success/{name}/{shape}"] = outcomes.new_tensor(
+                            sum(values)/len(values), dtype=torch.float32)
         adr = isinstance(curriculum, ADRCurriculum)
         if upgraded and adr:
             logging.info("ADR: difficulty %.2f -> %.2f, phi (noise, clearance) %s",

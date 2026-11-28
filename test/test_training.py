@@ -19,6 +19,7 @@ from rsl_rl.models import RNNModel
 from export_policy import OfflinePolicy, export_onnx
 from evaluate import load_checkpoint
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv, SuccessNoiseCurriculum, runner_config
+from insertion.curriculum import adaptive_environment_counts
 from insertion.distributed import run_distributed, validate_layout
 from train import (ContinuousRunner, GroupedLogger, LiveInsertionEnv, TrainingStopped,
                    adapt_training_layout, archive_checkpoint, atomic_json, contract,
@@ -344,16 +345,27 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                 state = json.loads((output / "config.json").read_text())["adaptive_sampling_state"]
                 for actual, expected in zip(state["failures"], (0.34, 0.24, 0.24, 0.24, 0.24)):
                     self.assertAlmostEqual(actual, expected)
+                # 不足 10% 的调整只记录失败率，不重启
+                current = tuple(json.loads((output / "config.json").read_text())["environment"]["shape_env_counts"])
+                curriculum["windows"] = {
+                    s: [True] * n + [False] * (1000-n)
+                    for s, n in zip(cfg.shapes, (500, 760, 760, 760, 760), strict=True)}
+                torch.save(saved, output / "checkpoint.pt")
+                self.assertFalse(adapt_training_layout(output, 100))
+                updated = json.loads((output / "config.json").read_text())
+                self.assertEqual(tuple(updated["environment"]["shape_env_counts"]), current)
+                self.assertNotEqual(adaptive_environment_counts(current, updated[
+                    "adaptive_sampling_state"]["failures"], 2), current)
                 curriculum["level"] = 5
                 for values in curriculum["windows"].values():
                     values.clear()
                 torch.save(saved, output / "checkpoint.pt")
-                self.assertFalse(adapt_training_layout(output, 100))
-                state = json.loads((output / "config.json").read_text())["adaptive_sampling_state"]
-                self.assertEqual(state, {"level": 5, "iteration": 100})
                 self.assertFalse(adapt_training_layout(output, 130))
                 state = json.loads((output / "config.json").read_text())["adaptive_sampling_state"]
-                self.assertEqual(state["iteration"], 130)
+                self.assertEqual(state, {"level": 5, "iteration": 130})
+                self.assertFalse(adapt_training_layout(output, 160))
+                state = json.loads((output / "config.json").read_text())["adaptive_sampling_state"]
+                self.assertEqual(state["iteration"], 160)
                 self.assertEqual(kill.call_count, 2)
 
     def test_changed_sensor_bias_retains_level_but_invalidates_old_windows(self):

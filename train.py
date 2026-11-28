@@ -827,7 +827,8 @@ def adapt_training_layout(output: Path, iteration: int) -> bool:
     counts = adaptive_environment_counts(cfg.environment_counts, smoothed, unit)
     state = {"level": level, "iteration": iteration, "failures": smoothed}
     metadata["adaptive_sampling_state"] = state
-    if counts == cfg.environment_counts:
+    # 重启会丢弃未完成的 ADR 回合队列，小幅调整不值得
+    if all(abs(n - old) < 0.1 * old for n, old in zip(counts, cfg.environment_counts, strict=True)):
         atomic_json(output / "config.json", metadata)
         return False
     updated = replace(cfg, shape_env_counts=counts)
