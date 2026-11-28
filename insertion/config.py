@@ -195,7 +195,8 @@ class InsertionCfg:
     completion_bonus: float = 20.0
     safety_failure_penalty: float = 250.0
     timeout_penalty: float = 10.0
-    # 入孔深度势函数整形 Φ = w·入孔深度/目标深度，奖励加 γΦ' − Φ，终止时 Φ' = 0
+    # 入孔深度整形 Φ = w·入孔深度/目标深度，奖励加 γΦ' − Φ；终止态保留 Φ'，即超时按终止深度给部分分
+    # （终止 Φ'=0 的纯势函数整形会被 critic 吸收，优势与不整形时相同）
     insertion_depth_reward: float = 0.0
 
     def __post_init__(self) -> None:
