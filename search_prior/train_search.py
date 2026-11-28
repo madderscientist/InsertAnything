@@ -41,7 +41,7 @@ def search_config(args: argparse.Namespace) -> InsertionCfg:
         clearance_curriculum=True, noise_curriculum=True, noise_curriculum_mode="adr",
         physics_cuda_graph=True, observation_cuda_graph=True,
         shapes=SEARCH_SHAPES, shape_randomization=True, rim_probability=args.rim_probability,
-        episode_seconds=args.episode_seconds,
+        episode_seconds=args.episode_seconds, insertion_depth_reward=args.insertion_depth_reward,
         envs_per_shape=args.envs_per_shape, shape_env_counts=(), adaptive_sampling=True,
         spatial_memory=getattr(args, "spatial_memory", False),
         search_map=args.search_map, search_coverage_reward=args.coverage_reward if args.search_map else 0.,
@@ -127,6 +127,8 @@ def main() -> None:
     parser.add_argument("--rim-probability", type=float, default=0.5,
                         help="per-episode probability of a raised rim around the opening")
     parser.add_argument("--episode-seconds", type=float, default=InsertionCfg.episode_seconds)
+    parser.add_argument("--insertion-depth-reward", type=float, default=0.0,
+                        help="weight of the potential-based insertion-depth shaping (0 disables)")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

@@ -203,6 +203,8 @@ class InsertionCfg:
     completion_bonus: float = 20.0
     safety_failure_penalty: float = 250.0
     timeout_penalty: float = 10.0
+    # 入孔深度势函数整形 Φ = w·入孔深度/目标深度，奖励加 γΦ' − Φ，终止时 Φ' = 0
+    insertion_depth_reward: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.terminate_on_overload, bool):
@@ -405,7 +407,8 @@ class InsertionCfg:
                             self.stagnation_cost_per_second, self.surface_z_free_m,
                             self.action_cost_per_second,
                             self.action_change_cost_per_second, self.timeout_penalty,
-                            self.force_cost_free_n, self.moment_cost_free_nm)
+                            self.force_cost_free_n, self.moment_cost_free_nm,
+                            self.insertion_depth_reward)
         if any(not math.isfinite(x) or x < 0 for x in cost_nonnegative):
             raise ValueError("completion cost weights and deadbands must be finite and nonnegative")
         if self.force_cost_free_n >= self.max_force or self.moment_cost_free_nm >= self.max_moment:
