@@ -20,6 +20,7 @@ from insertion.ppo import DEFAULT_ACTOR_MIN_LR
 from train import atomic_json, contract, supervise, validate_ppo_batch_layout
 
 SEARCH_SHAPES = ("triangle", "pentagon", "hexagon", "l", "rectangle", "dual")
+SEARCH_RECURRENT_NORM_MAX = 2.0
 
 
 def parse_critic_lr(value: str) -> float | str:
@@ -70,7 +71,8 @@ def search_runner(args: argparse.Namespace) -> dict:
                                phase_coef=args.phase_coef, phase_learning_rate=args.phase_lr,
                                map_coef=args.map_coef if args.search_map else 0., map_learning_rate=args.map_lr)
     runner["algorithm"].update(actor_min_lr=getattr(args, "actor_min_lr", DEFAULT_ACTOR_MIN_LR),
-                               critic_learning_rate=getattr(args, "critic_lr", "actor"))
+                               critic_learning_rate=getattr(args, "critic_lr", "actor"),
+                               recurrent_norm_max=getattr(args, "recurrent_norm_max", SEARCH_RECURRENT_NORM_MAX))
     return runner
 
 
@@ -102,6 +104,8 @@ def main() -> None:
                         help="lower bound for the actor KL learning-rate schedule")
     parser.add_argument("--critic-lr", type=parse_critic_lr, default="actor", metavar="RATE|actor",
                         help="follow the actor KL schedule (default), or specify a fixed critic learning rate")
+    parser.add_argument("--recurrent-norm-max", type=float, default=SEARCH_RECURRENT_NORM_MAX,
+                        help="spectral-norm cap of each actor GRU recurrent gate block, applied after every step")
     parser.add_argument("--gsde-resample-steps", type=int, default=25,
                         help="gSDE exploration matrix resample period in policy steps")
     parser.add_argument("--phase-coef", type=float, default=0.1,

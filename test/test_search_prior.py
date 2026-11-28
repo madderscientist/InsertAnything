@@ -212,6 +212,7 @@ class SearchPriorTests(unittest.TestCase):
         config = search_runner(Namespace(steps=4, rnn_hidden=64, rnn_layers=2, mini_batches=4,
                                          gsde_resample_steps=25, phase_coef=0.1, phase_lr=1e-3,
                                          search_map=False, map_coef=0.5, map_lr=1e-3))
+        self.assertEqual(config["algorithm"]["recurrent_norm_max"], 2.)
         self.assertEqual(config["actor"]["distribution_cfg"]["class_name"], GSDE_DISTRIBUTION)
         metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg)}
         with tempfile.TemporaryDirectory() as directory:
@@ -300,6 +301,32 @@ class SearchPriorTests(unittest.TestCase):
                 actor_rate, critic_rate = [g["lr"] for g in alg.optimizer.param_groups]
                 self.assertAlmostEqual(actor_rate, 4e-5)
                 self.assertEqual(critic_rate, actor_rate if schedule == "actor" else schedule)
+
+    def test_recurrent_gate_blocks_are_spectrally_bounded_after_update(self):
+        torch.manual_seed(3)
+        obs = TensorDict({"actor": torch.randn(4, 13), "critic": torch.randn(4, 15)}, [4])
+        groups = {"actor": ["actor"], "critic": ["critic"]}
+        model = dict(hidden_dims=(8,), rnn_type="gru", rnn_hidden_dim=8, rnn_num_layers=2)
+        actor = SkipRNNModel(obs, groups, "actor", 6, **model, distribution_cfg={"class_name": GSDE_DISTRIBUTION})
+        critic = SkipRNNModel(obs, groups, "critic", 1, **model)
+        gru = actor.rnn.rnn
+        with torch.no_grad():
+            for k in range(2):
+                getattr(gru, f"weight_hh_l{k}").mul_(5.)
+        before = [torch.linalg.svdvals(getattr(gru, f"weight_hh_l{k}").detach().view(3, 8, 8)) for k in range(2)]
+        storage = RolloutStorage("rl", 4, 4, obs, [6])
+        alg = SmoothPPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=1,
+                        learning_rate=1e-6, recurrent_norm_max=2.)
+        with torch.inference_mode():
+            for _ in range(4):
+                alg.act(obs)
+                alg.process_env_step(obs, torch.randn(4), torch.zeros(4, dtype=torch.long), {})
+            alg.compute_returns(obs)
+        alg.update()
+        for k in range(2):
+            after = torch.linalg.svdvals(getattr(gru, f"weight_hh_l{k}").detach().view(3, 8, 8))
+            # 只截断超限的奇异值，其余方向不缩小
+            torch.testing.assert_close(after, before[k].clamp(max=2.), atol=1e-4, rtol=0.)
 
     def test_gsde_noise_is_state_dependent_consistent_and_matches_likelihood(self):
         torch.manual_seed(0)
