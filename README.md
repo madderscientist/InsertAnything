@@ -228,6 +228,10 @@ X/Y 位置和三个旋转分量随 `difficulty` 缩放，Z 高度不缩放。
       cg --> cc --> cm["ELU MLP 256, 128"] --> v(["价值 V"])
     end
   ```
+- **actor GRU 递归权重谱范数上限**（`--recurrent-norm-max`，默认 `2.0`）：每次优化器步后，把 actor 各层 `weight_hh` 的重置门、更新门、候选三块各自做 SVD，奇异值截断到上限，其余方向不变；多卡由 rank 0 广播。旧配置缺字段时不约束。
+  - **现象**（2026-11-27 两维 ADR 训练）：本地从 iter ~12 起 actor 学习率一直贴在下限 `1e-6`，KL 仍为 0.012–0.025（目标 0.008，超过 0.016 即降率），dual 噪声 φ 在 0.1 停约 2 h。远程 map 版本学习率在 `1e-5` 时 KL 为 0.5–2.6，在固定 φ 下 30 轮平均成功率 2 h 内从 0.83 降到 0.74，回合变长、超时增多；学习率下限改为 `1e-6` 后 KL 仍约 0.5，继续下滑到 0.68。
+  - **分析**（停训后在同一批 rollout 上重放更新）：更新前 KL 为 5e-11，rollout 与更新一致；去掉相位/概率图辅助损失或截断其梯度，KL 基本不变。新 Adam 单步（每个参数 ±1e-6）后 KL 0.08，其中仅改第 1 层 `weight_hh_l0` 就占 0.07，其余参数组均不超过 1e-4。KL 沿序列时间增长（首 1/8 段 3e-4，末 1/8 段 0.2）、重尾（中位数 3e-4，最大 17），回合越长越大。该矩阵更新门块谱范数为 14（正交初始化为 1），对应的门反馈项 $\lvert h-\tilde h\rvert\,\sigma'\,\lVert W_{hz}\rVert$ 最坏约 7：门控呈开关行为，参数微小变化即翻转之后整段记忆。
+  - **结论**：晋级慢和远程退化的根因是 actor 递归权重增长后策略对参数过度敏感，与学习率下限和辅助损失无关。KL 自适应只能把全部参数的学习率压到下限，PPO 的有效步长接近噪声；回合更长时，即便在下限，每轮也有大幅漂移。约束谱范数后门反馈项上界约为 1，长记忆仍由更新门偏置（$z\approx1$）保持。
 - **搜索训练的探索噪声（gSDE）**：[search_prior/train_search.py](./search_prior/train_search.py) 改用 [insertion/model.py](./insertion/model.py) 中的 `GSDEDistribution`（generalized State-Dependent Exploration）。逐步独立的高斯噪声在 50 Hz 下会相互抵消，累计位移只按 $\sqrt{N}$ 增长且被动作变化惩罚压制；gSDE 使探索在一段时间内方向连贯。
   - 记 MLP 最后一个隐层特征为 $z(s)$（截断梯度并单位化，$\lVert z\rVert=1$），可学习参数为 $d\times 6$ 的 $\log\sigma$。每个环境保存探索矩阵 $\varepsilon\sim\mathcal N(0,1)^{d\times 6}$，动作为
     $$a = \mu(s) + z(s)^\top(\varepsilon\odot\sigma)$$
