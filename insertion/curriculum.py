@@ -110,7 +110,7 @@ class SuccessNoiseCurriculum:
             self.windows[shape].extend(values)
 
 
-ADR_BOUNDARY_FRACTION = 0.2
+ADR_BOUNDARY_FRACTION = 0.5
 
 
 class ADRCurriculum:

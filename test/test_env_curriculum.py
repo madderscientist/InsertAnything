@@ -75,6 +75,8 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         logs = InsertionEnv.advance_noise_curriculum(env)
         self.assertAlmostEqual(float(logs["curriculum/boundary_success/noise/square"]), 0.7)
         self.assertAlmostEqual(float(logs["curriculum/boundary_success/clearance/square"]), 0.5)
+        # 成功率窗口含边界回合
+        self.assertAlmostEqual(float(logs["curriculum/success/square"]), 0.12)
 
     def test_curriculum_cohort_excludes_episodes_in_progress_at_start(self):
         curriculum = SuccessNoiseCurriculum(("square",))

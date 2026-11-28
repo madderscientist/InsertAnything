@@ -1759,7 +1759,7 @@ class InsertionEnv(VecEnv):
                                         else outcomes.new_tensor(0., dtype=torch.float32))
             eligible = (cohort[:, 0] == index) & seen
             probe = cohort[:, 4].long()
-            recent[shape] = cohort[eligible & (probe == 0), 2].bool().cpu().tolist() if complete else []
+            recent[shape] = cohort[eligible, 2].bool().cpu().tolist() if complete else []
             boundary[shape] = tuple(cohort[eligible & (probe == d), 2].bool().cpu().tolist() if complete else []
                                     for d in (1, 2))
         curriculum = self.noise_curriculum
