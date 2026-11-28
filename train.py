@@ -691,10 +691,6 @@ def resume_training(runner: ContinuousRunner, cfg: InsertionCfg, attempt: int,
         restore_environment_progress(runner.env, cfg, saved, attempt, rank, world_size)
         logging.info("Resumed iteration %d, policy steps %d; episodes and GRU state reset.",
                      runner.current_learning_iteration, runner.env.policy_steps)
-    # 错开回合计时，避免全部环境同步超时使逐轮统计成波浪起伏
-    for group in runner.env.groups:
-        group.length.random_(0, runner.env.max_episode_length, generator=group.generator)
-        group.position_history_length.copy_(group.length)
 
 
 def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: dict,

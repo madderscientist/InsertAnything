@@ -178,6 +178,32 @@ class PolicyAndViewerTests(unittest.TestCase):
 
 class RuntimeAndDistributedTests(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_start_and_resume_give_new_episodes_the_full_timeout(self):
+        torch.set_num_threads(1)
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=8, dynamics="nominal",
+                           initial_z_min=0.015, initial_z_max=0.02, episode_seconds=0.12)
+        config = runner_config(4)
+        metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg)}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for attempt in range(2):
+                env = InsertionEnv(cfg, "cuda:0")
+                runner = ContinuousRunner(env, config, output, metadata)
+                resume_training(runner, cfg, attempt)
+                group = env.groups[0]
+                self.assertFalse(bool(group.length.any()))
+                self.assertTrue(torch.equal(group.position_history_length, group.length))
+                actions = torch.zeros(env.num_envs, env.num_actions, device=env.device)
+                for step in range(1, env.max_episode_length + 1):
+                    _, _, done, extras = env.step(actions)
+                    terminal = extras["terminal"]
+                    self.assertTrue(bool((terminal["length"] == step).all()))
+                    self.assertTrue(bool((done.bool() == (step == env.max_episode_length)).all()))
+                    self.assertTrue(torch.equal(done.bool(), terminal["time_outs"]))
+                if attempt == 0:
+                    runner.save(str(output / "checkpoint.pt"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_captured_termination_statistics_match_eager_without_double_counting(self):
         environments = []
         for capture in (False, True):

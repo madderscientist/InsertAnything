@@ -1734,8 +1734,8 @@ class InsertionEnv(VecEnv):
             self.curriculum_cohort = torch.zeros_like(batches[0])
             self.curriculum_cohort_seen = torch.zeros(
                 len(batches[0]), dtype=torch.bool, device=outcomes.device)
-            # 起始回合计时被错开、时长不完整，不计入首个队列
-            self.curriculum_cohort_armed = torch.zeros_like(self.curriculum_cohort_seen)
+            # 启动和恢复时物理环境都刚重置，首个队列从这些完整回合开始。
+            self.curriculum_cohort_armed = torch.ones_like(self.curriculum_cohort_seen)
         cohort = self.curriculum_cohort
         seen = self.curriculum_cohort_seen
         armed = self.curriculum_cohort_armed

@@ -31,10 +31,6 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
             curriculum_cohort=None, curriculum_cohort_seen=None, curriculum_cohort_armed=None)
         batch = torch.zeros(1000, 5)
         batch[:, 3] = 1
-        # 起始回合不计入，先让全部环境结束一次
-        batch[:, 1] = 1
-        env.curriculum_pending.append(batch.clone())
-        batch[:, 1] = 0
         batch[:799, 1:3] = 1
         env.curriculum_pending.append(batch.clone())
         InsertionEnv.advance_noise_curriculum(env)
@@ -68,8 +64,6 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         batch = torch.zeros(1000, 5)
         batch[:, 1] = batch[:, 3] = 1
         batch[:100, 4], batch[100:200, 4] = 1, 2
-        env.curriculum_pending.append(batch.clone())
-        self.assertNotIn("curriculum/boundary_success/noise/square", InsertionEnv.advance_noise_curriculum(env))
         batch[:70, 2] = batch[100:150, 2] = 1
         env.curriculum_pending.append(batch)
         logs = InsertionEnv.advance_noise_curriculum(env)
@@ -78,7 +72,7 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         # 成功率窗口含边界回合
         self.assertAlmostEqual(float(logs["curriculum/success/square"]), 0.12)
 
-    def test_curriculum_cohort_excludes_episodes_in_progress_at_start(self):
+    def test_curriculum_counts_first_episodes_and_excludes_later_in_progress_episodes(self):
         curriculum = SuccessNoiseCurriculum(("square",))
         env = SimpleNamespace(
             noise_curriculum=curriculum, curriculum_pending=[], groups=[],
@@ -95,11 +89,14 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         everyone = torch.ones(1000, dtype=torch.bool)
         nobody = torch.zeros(1000, dtype=torch.bool)
         fast = torch.arange(1000) < 700
-        # 起始回合计时被错开，不计入
         step(fast, nobody)
         step(~fast, everyone)
-        self.assertEqual(len(curriculum.windows["square"]), 0)
+        self.assertEqual(len(curriculum.windows["square"]), 1000)
+        self.assertEqual(sum(curriculum.windows["square"]), 300)
         self.assertFalse(env.curriculum_cohort_seen.any())
+        # 下一队列开始时正在进行的回合要先结束一次。
+        step(everyone, everyone)
+        self.assertEqual(curriculum.level, 0)
         step(fast, everyone)
         self.assertEqual(curriculum.level, 0)
         step(~fast, everyone)
@@ -748,9 +745,6 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(group.reset_constants_graph)
         self.assertIsNotNone(group.action_graph)
         self.assertIsNotNone(group.outcome_graph)
-        # 起始回合不计入，先让全部环境结束一次
-        env.record_curriculum_outcomes(torch.tensor([[0, 1, 0, 1, 0]] * 4, device=self.device))
-        env.advance_noise_curriculum()
         env.noise_curriculum.windows["square"].extend([True] * 996)
         env.record_curriculum_outcomes(torch.tensor([[0, 1, 1, 1, 0]] * 4, device=self.device))
         logs = env.advance_noise_curriculum()
