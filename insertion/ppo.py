@@ -25,17 +25,15 @@ class SmoothPPO(PPO):
                  smooth_moment_std: float = 0.05, phase_coef: float = 0.0, phase_learning_rate: float = 1e-3,
                  map_coef: float = 0.0, map_learning_rate: float = 1e-3,
                  actor_min_lr: float = DEFAULT_ACTOR_MIN_LR, critic_learning_rate: float | Literal["actor"] = "actor",
-                 recurrent_norm_max: float | None = None, **kwargs) -> None:
+                 **kwargs) -> None:
         if not 0 < actor_min_lr <= 1e-2:
             raise ValueError("actor_min_lr must be in (0, 1e-2]")
-        if recurrent_norm_max is not None and not 0 < recurrent_norm_max < math.inf:
-            raise ValueError("recurrent_norm_max must be positive and finite")
         follows_actor = critic_learning_rate == "actor"
         if not follows_actor and (not isinstance(critic_learning_rate, (int, float))
                                   or not 0 < critic_learning_rate < math.inf):
             raise ValueError("critic_learning_rate must be positive and finite or 'actor'")
         if phase_coef > 0:
-            # 线性读出 actor GRU 输出；挂在 critic 上：随 critic 保存与多卡同步，且不进入导出的 actor
+            # 线性读出 actor 记忆输出；挂在 critic 上：随 critic 保存与多卡同步，且不进入导出的 actor
             critic.phase_head = nn.Linear(actor.rnn.rnn.hidden_size, PHASES)
         if map_coef > 0:
             critic.map_head = MapHead(actor.latent_dim)
@@ -44,7 +42,6 @@ class SmoothPPO(PPO):
             raise ValueError("SmoothPPO does not support RND or symmetry extensions")
         self.smooth_coef = smooth_coef
         self.actor_min_lr = actor_min_lr
-        self.recurrent_norm_max = recurrent_norm_max
         critic_lr = self.learning_rate if follows_actor else critic_learning_rate
         self.smooth_std = torch.tensor([smooth_force_std]*3 + [smooth_moment_std]*3, device=self.device)
         self.phase_coef = phase_coef
@@ -88,19 +85,6 @@ class SmoothPPO(PPO):
         for group, rate in zip(self.optimizer.param_groups[self.num_adaptive_groups:], self.fixed_rates, strict=True):
             group["lr"] = rate
         return loaded
-
-    def bound_recurrent_norms(self) -> None:
-        # 门块谱范数大时门控成开关，参数微小变化即翻转后续整段记忆，KL 自适应只能把学习率压到下限
-        gru = self.actor.rnn.rnn
-        with torch.no_grad():
-            for k in range(gru.num_layers):
-                weight = getattr(gru, f"weight_hh_l{k}")
-                blocks = weight.view(3, gru.hidden_size, gru.hidden_size)
-                if bool(torch.linalg.matrix_norm(blocks, 2).max() > self.recurrent_norm_max):
-                    u, s, vh = torch.linalg.svd(blocks)
-                    blocks.copy_(u @ torch.diag_embed(s.clamp(max=self.recurrent_norm_max)) @ vh)
-                if self.is_multi_gpu:
-                    torch.distributed.broadcast(weight, src=0)
 
     def store_memory(self, module, inputs, output) -> None:
         del module, inputs
@@ -229,8 +213,6 @@ class SmoothPPO(PPO):
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
-            if self.recurrent_norm_max is not None:
-                self.bound_recurrent_norms()
 
             totals["value"] += value_loss.item()
             totals["surrogate"] += surrogate_loss.item()

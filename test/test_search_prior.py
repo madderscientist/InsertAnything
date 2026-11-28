@@ -17,7 +17,7 @@ from evaluate import load_checkpoint
 from export_policy import export, export_onnx
 from insertion import InsertionCfg, InsertionEnv
 from insertion.env import warp_stream
-from insertion.model import CHRONO_MAX_STEPS, GSDE_DISTRIBUTION, SkipRNNModel
+from insertion.model import CHRONO_MAX_STEPS, GSDE_DISTRIBUTION, MinGRU, SkipRNNModel
 from insertion.ppo import SmoothPPO
 from insertion.transforms import rotate, tip_pose
 from search_prior.train_search import SEARCH_SHAPES, search_runner
@@ -212,17 +212,24 @@ class SearchPriorTests(unittest.TestCase):
         config = search_runner(Namespace(steps=4, rnn_hidden=64, rnn_layers=2, mini_batches=4,
                                          gsde_resample_steps=25, phase_coef=0.1, phase_lr=1e-3,
                                          search_map=False, map_coef=0.5, map_lr=1e-3))
-        self.assertEqual(config["algorithm"]["recurrent_norm_max"], 2.)
         self.assertEqual(config["actor"]["distribution_cfg"]["class_name"], GSDE_DISTRIBUTION)
         metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg)}
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             atomic_json(output / "config.json", metadata)
             runner = ContinuousRunner(InsertionEnv(cfg, "cuda:0"), config, output, metadata)
-            self.assertIsInstance(runner.alg.critic, SkipRNNModel)
-            before = runner.alg.critic.rnn.rnn.weight_hh_l0.detach().clone()
+            for model in (runner.alg.actor, runner.alg.critic):
+                self.assertIsInstance(model.rnn.rnn, MinGRU)
+            # 初始保留比例 u/(1+u)，u 铺满 [1, T-1]
+            retain = 1 - torch.sigmoid(runner.alg.actor.rnn.rnn.layers[0].bias[:64].detach())
+            self.assertGreaterEqual(float(retain.min()), 0.5 - 1e-6)
+            self.assertLessEqual(float(retain.max()), 1 - 1 / CHRONO_MAX_STEPS + 1e-6)
+            tau = 1 / (1 - retain)
+            self.assertLess(float(tau.min()), 50.)
+            self.assertGreater(float(tau.max()), 400.)
+            before = runner.alg.critic.rnn.rnn.layers[1].weight.detach().clone()
             runner.learn(1)
-            self.assertFalse(torch.equal(before, runner.alg.critic.rnn.rnn.weight_hh_l0.detach()))
+            self.assertFalse(torch.equal(before, runner.alg.critic.rnn.rnn.layers[1].weight.detach()))
             saved = torch.load(output / "checkpoint.pt", weights_only=True, map_location="cpu")
             self.assertEqual(saved["critic_state_dict"]["phase_head.weight"].shape, (4, 64))
             labels = runner.env.get_observations()["phase"]
@@ -230,8 +237,8 @@ class SearchPriorTests(unittest.TestCase):
             self.assertTrue(bool(((labels >= 0) & (labels < 4)).all()))
             resumed = ContinuousRunner(InsertionEnv(cfg, "cuda:0"), config, output, metadata)
             resume_training(resumed, cfg, 1)
-            torch.testing.assert_close(resumed.alg.critic.rnn.rnn.weight_hh_l0.cpu(),
-                                       saved["critic_state_dict"]["rnn.rnn.weight_hh_l0"])
+            torch.testing.assert_close(resumed.alg.critic.rnn.rnn.layers[1].weight.cpu(),
+                                       saved["critic_state_dict"]["rnn.rnn.layers.1.weight"])
             # 旧检查点 actor/critic 共用一组：按当前分组切分，critic 恢复与 actor 相同的学习率
             optimizer = saved["optimizer_state_dict"]
             merged = {**optimizer, "param_groups": [{**optimizer["param_groups"][0], "lr": 1e-6, "params": [
@@ -241,19 +248,55 @@ class SearchPriorTests(unittest.TestCase):
                              [1e-6, 1e-6, 1e-3])
             resumed.learn(1)
             _, actor = load_checkpoint(output / "checkpoint.pt", "cuda:0")
-            self.assertIsInstance(actor, SkipRNNModel)
+            self.assertIsInstance(actor.rnn.rnn, MinGRU)
             self.assertEqual(actor.rnn.rnn.hidden_size, 64)
             self.assertEqual(actor.obs_dim, 13)
             self.assertFalse(any(isinstance(m, torch.nn.LayerNorm) for m in actor.modules()))
-            # 新建网络的更新门偏置铺满 log[1, T-1]，初始保留比例在 0.73 以上
-            fresh = ContinuousRunner(InsertionEnv(cfg, "cuda:0"), config, output, metadata).alg.actor.rnn.rnn
-            bias = fresh.bias_ih_l0[64:128]
-            self.assertGreaterEqual(float(bias.min()), 0.)
-            self.assertLessEqual(float(bias.max()), math.log(CHRONO_MAX_STEPS - 1) + 1e-6)
-            self.assertGreater(float(bias.std()), 0.7)
             # 导出函数内部逐步校验 TorchScript/ONNX 与原模型的序列数值等价
             export(output / "checkpoint.pt", output / "jit", samples=100)
             export_onnx(output / "checkpoint.pt", output / "onnx", samples=100)
+
+    def test_mingru_update_batch_matches_rollout_across_resets(self):
+        # 更新时按回合切分、零初始化的整段计算，须与带异步复位的逐步 rollout 一致（复位后无残留记忆）
+        for device in ("cpu", "cuda:0"):
+            with self.subTest(device=device):
+                torch.manual_seed(5)
+                n, steps = 6, 12
+                obs = TensorDict({"actor": torch.randn(n, 13), "critic": torch.randn(n, 15)}, [n], device=device)
+                groups = {"actor": ["actor"], "critic": ["critic"]}
+                model = dict(hidden_dims=(8,), rnn_type="gru", rnn_hidden_dim=8, rnn_num_layers=2)
+                actor = SkipRNNModel(obs, groups, "actor", 6, **model,
+                                     distribution_cfg={"class_name": GSDE_DISTRIBUTION}).to(device)
+                critic = SkipRNNModel(obs, groups, "critic", 1, **model).to(device)
+                storage = RolloutStorage("rl", n, steps, obs, [6], device=device)
+                alg = SmoothPPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=1, device=device)
+                dones = torch.rand(steps, n, device=device) < 0.25
+                with torch.inference_mode():
+                    for t in range(steps):
+                        step_obs = obs.apply(torch.randn_like)
+                        alg.act(step_obs)
+                        alg.process_env_step(step_obs, torch.randn(n, device=device), dones[t].long(), {})
+                    alg.compute_returns(obs)
+                    batch = next(storage.recurrent_mini_batch_generator(1, 1))
+                    actor(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[0],
+                          stochastic_output=True)
+                for new, old in zip(actor.output_distribution_params, batch.old_distribution_params, strict=True):
+                    torch.testing.assert_close(new, old, atol=1e-6, rtol=1e-5)
+
+    def test_mingru_fused_scan_gradients_match_stepwise(self):
+        torch.manual_seed(6)
+        rnn = MinGRU(13, 32, 2, CHRONO_MAX_STEPS).cuda()
+        x, h0 = torch.randn(64, 5, 13, device="cuda"), torch.randn(2, 5, 32, device="cuda").tanh()
+        out, last = rnn(x, h0)
+        fused = torch.autograd.grad(out.square().sum() + last.sum(), list(rnn.parameters()))
+        h, steps = h0, []
+        for t in range(x.shape[0]):
+            y, h = rnn(x[t:t + 1], h)
+            steps.append(y)
+        stepwise = torch.autograd.grad(torch.cat(steps).square().sum() + h.sum(), list(rnn.parameters()))
+        torch.testing.assert_close(out, torch.cat(steps), atol=1e-6, rtol=1e-5)
+        for a, b in zip(fused, stepwise, strict=True):
+            torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
 
     def test_ppo_single_environment_minibatch_pairs_likelihoods_by_step(self):
         torch.manual_seed(8)
@@ -301,32 +344,6 @@ class SearchPriorTests(unittest.TestCase):
                 actor_rate, critic_rate = [g["lr"] for g in alg.optimizer.param_groups]
                 self.assertAlmostEqual(actor_rate, 4e-5)
                 self.assertEqual(critic_rate, actor_rate if schedule == "actor" else schedule)
-
-    def test_recurrent_gate_blocks_are_spectrally_bounded_after_update(self):
-        torch.manual_seed(3)
-        obs = TensorDict({"actor": torch.randn(4, 13), "critic": torch.randn(4, 15)}, [4])
-        groups = {"actor": ["actor"], "critic": ["critic"]}
-        model = dict(hidden_dims=(8,), rnn_type="gru", rnn_hidden_dim=8, rnn_num_layers=2)
-        actor = SkipRNNModel(obs, groups, "actor", 6, **model, distribution_cfg={"class_name": GSDE_DISTRIBUTION})
-        critic = SkipRNNModel(obs, groups, "critic", 1, **model)
-        gru = actor.rnn.rnn
-        with torch.no_grad():
-            for k in range(2):
-                getattr(gru, f"weight_hh_l{k}").mul_(5.)
-        before = [torch.linalg.svdvals(getattr(gru, f"weight_hh_l{k}").detach().view(3, 8, 8)) for k in range(2)]
-        storage = RolloutStorage("rl", 4, 4, obs, [6])
-        alg = SmoothPPO(actor, critic, storage, num_learning_epochs=1, num_mini_batches=1,
-                        learning_rate=1e-6, recurrent_norm_max=2.)
-        with torch.inference_mode():
-            for _ in range(4):
-                alg.act(obs)
-                alg.process_env_step(obs, torch.randn(4), torch.zeros(4, dtype=torch.long), {})
-            alg.compute_returns(obs)
-        alg.update()
-        for k in range(2):
-            after = torch.linalg.svdvals(getattr(gru, f"weight_hh_l{k}").detach().view(3, 8, 8))
-            # 只截断超限的奇异值，其余方向不缩小
-            torch.testing.assert_close(after, before[k].clamp(max=2.), atol=1e-4, rtol=0.)
 
     def test_gsde_noise_is_state_dependent_consistent_and_matches_likelihood(self):
         torch.manual_seed(0)

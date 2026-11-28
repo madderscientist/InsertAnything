@@ -1,7 +1,8 @@
-"""GRU 记忆 + 当前观测跳连的循环模型：GRU 输出与归一化当前观测拼接再进 MLP"""
+"""minGRU 记忆 + 当前观测跳连的循环模型：记忆输出与归一化当前观测拼接再进 MLP"""
 
 import copy
 import math
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -70,31 +71,61 @@ class GSDEDistribution(GaussianDistribution):
         self.epsilon = torch.where(dones.bool().view(-1, 1, 1), fresh, self.epsilon)
 
 
-def chrono_init(gru: nn.GRU, max_steps: float) -> None:
-    """Xavier 输入权重、正交递归权重，更新门偏置 log U(1, T-1)，初始记忆时间常数铺满 2–T 步"""
-    h = gru.hidden_size
-    with torch.no_grad():
-        for k in range(gru.num_layers):
-            w_ih, w_hh = getattr(gru, f"weight_ih_l{k}"), getattr(gru, f"weight_hh_l{k}")
-            b_ih, b_hh = getattr(gru, f"bias_ih_l{k}"), getattr(gru, f"bias_hh_l{k}")
-            for g in range(3):
-                nn.init.xavier_uniform_(w_ih[g*h:(g+1)*h])
-                nn.init.orthogonal_(w_hh[g*h:(g+1)*h])
-            b_ih.zero_()
-            b_hh.zero_()
-            # 门顺序 r, z, n；h' = (1-z) n + z h，z 为保留比例
-            b_ih[h:2*h] = torch.empty(h).uniform_(1, max_steps - 1).log()
+class MinGRU(nn.Module):
+    """多层 minGRU：z = σ(W_z x)，h̃ = tanh(W_h x)，h = (1-z) h + z h̃，接口同 nn.GRU（时间优先）
+
+    门与候选只看本层输入，状态 Jacobian 为 diag(1-z)，范数 < 1，参数微小变化不会经门反馈沿序列放大
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, max_steps: float) -> None:
+        super().__init__()
+        self.input_size, self.hidden_size, self.num_layers = input_size, hidden_size, num_layers
+        self.layers = nn.ModuleList(nn.Linear(input_size if k == 0 else hidden_size, 2 * hidden_size)
+                                    for k in range(num_layers))
+        with torch.no_grad():
+            for layer in self.layers:
+                nn.init.xavier_uniform_(layer.weight[:hidden_size])
+                nn.init.xavier_uniform_(layer.weight[hidden_size:])
+                layer.bias.zero_()
+                # chrono 初始化：保留比例 1-z = u/(1+u)，u ~ U(1, T-1)；默认初始化 z≈0.5 记忆只有约 2 步
+                layer.bias[:hidden_size] = -torch.empty(hidden_size).uniform_(1, max_steps - 1).log()
+
+    def forward(self, x: torch.Tensor, h0: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if h0 is None:
+            h0 = x.new_zeros(self.num_layers, x.shape[1], self.hidden_size)
+        last: List[torch.Tensor] = []
+        for k, layer in enumerate(self.layers):
+            y = layer(x)
+            gate = y[..., :self.hidden_size]
+            retain = torch.sigmoid(-gate)
+            write = torch.sigmoid(gate) * torch.tanh(y[..., self.hidden_size:])
+            if x.is_cuda and x.shape[0] > 1 and not torch.jit.is_scripting():
+                x = self.scan(retain, write, h0[k])
+            else:
+                h = h0[k]
+                out: List[torch.Tensor] = []
+                for t in range(x.shape[0]):
+                    h = torch.addcmul(write[t], retain[t], h)
+                    out.append(h)
+                x = torch.stack(out)
+            last.append(x[-1])
+        return x, torch.stack(last)
+
+    @torch.jit.unused
+    def scan(self, retain: torch.Tensor, write: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
+        # 逐步 Python 循环的上百次小核启动使每轮学习慢一倍；融合核与 rollout 逐步递推逐位一致
+        from insertion.linear_scan import LinearScan
+        return LinearScan.apply(retain, write, h0)
 
 
 class SkipRNNModel(RNNModel):
     def __init__(self, *args, search_map: bool = False, **kwargs) -> None:
-        # 概率图编码与 GRU 并联接入 MLP，维度须在父类构建 MLP 前确定
+        # 概率图编码与 minGRU 并联接入 MLP，维度须在父类构建 MLP 前确定
         self.map_dim = MAP_FEATURES if search_map else 0
         super().__init__(*args, **kwargs)
-        if not isinstance(self.rnn.rnn, nn.GRU):
-            raise ValueError("SkipRNNModel supports GRU only")
-        # 默认初始化更新门约 0.5，记忆约 2 步且梯度沿时间迅速衰减；不加 LayerNorm，慢单元回合初幅度很小，归一化会放大微小变化
-        chrono_init(self.rnn.rnn, CHRONO_MAX_STEPS)
+        # 只借用 rsl_rl RNN 封装的隐状态管理；GRU 的门依赖隐状态，训练中递归权重增长后策略对参数极度敏感
+        rnn = self.rnn.rnn
+        self.rnn.rnn = MinGRU(rnn.input_size, rnn.hidden_size, rnn.num_layers, CHRONO_MAX_STEPS)
         if self.map_dim:
             self.map_encoder = MapEncoder()
         self.map_cache: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -141,16 +172,16 @@ class SkipRNNModel(RNNModel):
     def as_jit(self) -> nn.Module:
         if self.map_dim:
             raise NotImplementedError("search map policies are not exportable yet")
-        return _JitSkipGRU(self)
+        return _JitSkipRNN(self)
 
     def as_onnx(self, verbose: bool = False) -> nn.Module:
         del verbose
         if self.map_dim:
             raise NotImplementedError("search map policies are not exportable yet")
-        return _OnnxSkipGRU(self)
+        return _OnnxSkipRNN(self)
 
 
-class _ExportSkipGRU(nn.Module):
+class _ExportSkipRNN(nn.Module):
     def __init__(self, model: SkipRNNModel) -> None:
         super().__init__()
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
@@ -169,7 +200,7 @@ class _ExportSkipGRU(nn.Module):
         return self.deterministic_output(self.mlp(latent)), hidden
 
 
-class _JitSkipGRU(_ExportSkipGRU):
+class _JitSkipRNN(_ExportSkipRNN):
     def __init__(self, model: SkipRNNModel) -> None:
         super().__init__(model)
         self.register_buffer("hidden_state", torch.zeros(self.num_layers, 1, self.hidden_size))
@@ -184,7 +215,7 @@ class _JitSkipGRU(_ExportSkipGRU):
         self.hidden_state[:] = 0.0
 
 
-class _OnnxSkipGRU(_ExportSkipGRU):
+class _OnnxSkipRNN(_ExportSkipRNN):
     is_recurrent: bool = True
 
     def forward(self, obs: torch.Tensor, h_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
