@@ -17,13 +17,87 @@ from insertion import (InsertionCfg, InsertionEnv, PPO_DISCOUNT,
 from insertion.config import REAL2SIM_VALUES
 from insertion.curriculum import adaptive_environment_counts
 from insertion.transforms import quat_inv, rotate, rotvec_quat
-from insertion.env import PlantGroup, action_costs, lowpass_velocity, play_hysteresis_step
+from insertion.env import CURRICULUM_TRUNCATION, PlantGroup, action_costs, lowpass_velocity, play_hysteresis_step
 from insertion.shapes.base import PreparedGeometry
 from real2sim.evaluate_real2sim import sign_flips, velocity_reversals
 from real2sim.train_real2sim import real2sim_config
 
 
 class RewardAndCurriculumUnitTests(unittest.TestCase):
+    def test_clearance_upgrade_reports_only_interrupted_episodes_as_truncations(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=4, clearance_curriculum=True)
+        group = PlantGroup.__new__(PlantGroup)
+        group.cfg, group.shape, group.device, group.n = cfg, "square", "cpu", 4
+        group.clearance, group.pending_clearance = 0.002, None
+        group.length = torch.full((4,), 5)
+        group.episode_noise_scale = torch.ones(4)
+        group.episode_boundary = torch.zeros(4, dtype=torch.long)
+        group.shape_params = torch.full((4, 4), group.clearance)
+
+        def rebuild(clearance, *, reset_in_hole=True):
+            if clearance != group.clearance:
+                self.assertFalse(reset_in_hole)
+                group.clearance = clearance
+
+        group.set_clearance = rebuild
+        group.reset_masked = lambda done: group.length.masked_fill_(done, 0)
+        env = InsertionEnv.__new__(InsertionEnv)
+        env.groups, env.device, env.num_envs = [group], "cpu", group.n
+        env.policy_steps = env.total_transitions = 0
+        env.curriculum_rollout_steps, env.curriculum_distributed = 128, False
+        env.curriculum_pending = []
+        env.curriculum_cohort = env.curriculum_cohort_seen = env.curriculum_cohort_armed = None
+        env.curriculum_shape_ids = torch.zeros(4, dtype=torch.long)
+        env.episode_length_buf = torch.zeros_like(group.length)
+        env.search_map = None
+        env.noise_curriculum = SuccessNoiseCurriculum(cfg.shapes, cfg.active_clearance_levels, 0)
+        env.noise_curriculum.level = 1
+        env.apply_curriculum(group, defer_clearance=True)
+        old_rewards = torch.tensor([-0.1, -0.2, 20., -10.])
+        reasons = torch.tensor([0, 0, 1, 4])
+        info = {"reason": reasons, "time_outs": reasons == 4, "hard_start": torch.zeros(4, dtype=torch.bool),
+                "tip_z_m": torch.tensor([0.001, 0.012, -0.01, 0.001])}
+
+        def launch(chunks):
+            self.assertEqual(group.clearance, 0.002)
+            self.assertEqual(group.pending_clearance, 0.001)
+            return [(old_rewards, reasons != 0, info, torch.zeros(4, dtype=torch.bool), {})]
+
+        env.launch_groups = launch
+        env.concurrent_groups = lambda work, inputs: [work(group, inputs[0])]
+        env.get_observations = lambda: None
+        _, rewards, done, extras = env.step(torch.zeros(4, 6))
+        torch.testing.assert_close(rewards, old_rewards)
+        torch.testing.assert_close(done, torch.tensor([True, False, True, True]))
+        torch.testing.assert_close(extras["terminal"]["reason"], torch.tensor([CURRICULUM_TRUNCATION, 0, 1, 4]))
+        torch.testing.assert_close(extras["time_outs"], torch.tensor([True, False, False, False]))
+        torch.testing.assert_close(env.episode_length_buf, torch.tensor([0, 5, 0, 0]))
+        self.assertAlmostEqual(float(env.advance_noise_curriculum()["success/square"]), 0.5)
+
+    def test_partial_reset_preserves_each_active_worlds_delayed_targets(self):
+        group = PlantGroup.__new__(PlantGroup)
+        group.n = 3
+        group.everyone = torch.arange(3)
+        group.reset_request = torch.tensor([False, True, False])
+        group.expanded_fields = ()
+        data = SimpleNamespace(**{name: torch.zeros(3, 1)
+                                  for name in ("qpos", "qvel", "xfrc_applied")})
+        group.sim = SimpleNamespace(data=data)
+        group.targets_p = torch.arange(27).view(3, 3, 3).clone()
+        group.targets_q = torch.arange(36).view(3, 3, 4).clone()
+        old_history = [group.targets_p.clone(), group.targets_q.clone()]
+
+        def reset_state(ids, mask):
+            group.targets_p[:, ids] = -1
+            group.targets_q[:, ids] = -1
+
+        group.reset_state = reset_state
+        group.finish_reset = lambda capturing: None
+        group.masked_reset(capturing=True)
+        for current, original in zip((group.targets_p, group.targets_q), old_history):
+            original[:, 1] = -1
+            torch.testing.assert_close(current, original)
+
     def test_curriculum_waits_for_full_cohort_including_slow_failures(self):
         curriculum = SuccessNoiseCurriculum(("square",))
         env = SimpleNamespace(
@@ -748,6 +822,9 @@ class BatchedEnvIntegrationTests(unittest.TestCase):
         env.noise_curriculum.windows["square"].extend([True] * 996)
         env.record_curriculum_outcomes(torch.tensor([[0, 1, 1, 1, 0]] * 4, device=self.device))
         logs = env.advance_noise_curriculum()
+        self.assertEqual(group.clearance, 0.002)
+        self.assertEqual(group.pending_clearance, 0.001)
+        env.step(torch.zeros(4, 6, device=self.device))
         self.assertEqual(group.clearance, 0.001)
         self.assertEqual(group.sim.wp_data.naconmax, group.n * 64)
         self.assertEqual(group.sim.wp_data.njmax, 256)

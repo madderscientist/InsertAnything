@@ -344,7 +344,7 @@ class InsertionCfg:
             raise ValueError("noise curriculum mode must be steps, success or adr")
         if self.noise_curriculum_mode in ("success", "adr") and not self.noise_curriculum:
             raise ValueError("success and ADR noise curricula require noise_curriculum=True")
-        if self.noise_curriculum_mode == "adr" and (
+        if self.training and self.noise_curriculum_mode == "adr" and (
                 not self.shape_randomization or {"square", "circle"} & set(self.shapes)):
             raise ValueError("ADR per-episode clearance requires shape randomization without square or circle")
         if self.grasp_error_distribution not in ("gaussian", "uniform"):

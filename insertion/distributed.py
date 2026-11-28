@@ -27,7 +27,7 @@ from .env import InsertionEnv
 from .model import SKIP_RNN_MODEL, SkipRNNModel
 from .ppo import SMOOTH_PPO, SmoothPPO
 from train import (ContinuousRunner, LiveInsertionEnv, TrainingStopped, atomic_json,
-                   load_recovery_checkpoint, resume_training)
+                   load_recovery_checkpoint, resume_training, validate_ppo_batch_layout)
 
 
 def validate_layout(metadata: dict, device: str) -> int:
@@ -37,11 +37,7 @@ def validate_layout(metadata: dict, device: str) -> int:
         raise ValueError("distributed PPO requires cuda:0 as primary and contiguous CUDA devices")
     if world_size > torch.cuda.device_count():
         raise ValueError("distributed PPO requests unavailable CUDA devices")
-    cfg = InsertionCfg.from_checkpoint(metadata["environment"])
-    if (cfg.envs_per_shape % world_size
-            or any(n % world_size for n in cfg.environment_counts)
-            or sum(cfg.environment_counts)//world_size % 4):
-        raise ValueError("each rank must have whole shape shards and an environment count divisible by four")
+    validate_ppo_batch_layout(metadata, distributed=True)
     if metadata["runner"]["algorithm"]["class_name"] not in ("PPO", SMOOTH_PPO) or any(
             metadata["runner"][key]["class_name"] not in SHARED_MODELS for key in ("actor", "critic")):
         raise ValueError("distributed insertion training requires the existing recurrent PPO configuration")
@@ -112,7 +108,8 @@ class DistributedInsertionEnv(LiveInsertionEnv):
 
 def global_logging_step(env: InsertionEnv, rewards: torch.Tensor, dones: torch.Tensor,
                         extras: dict) -> tuple[torch.Tensor, torch.Tensor, dict]:
-    fields = [rewards, dones.float()]
+    # 终止原因 0 表示进行中；保留其他编码供课程区分自然结束与换几何截断。
+    fields = [rewards, extras["terminal"]["reason"].float()]
     if env.noise_curriculum is not None:
         fields.extend(((extras["terminal"]["reason"] == 1).float(),
                        extras["terminal"]["curriculum_eligible"].float(),
@@ -186,13 +183,12 @@ class DistributedRunner(ContinuousRunner):
                 dist.all_reduce(timing, op=dist.ReduceOp.MAX)
                 self.current_learning_iteration = iteration
                 curriculum_logs = self.env.advance_noise_curriculum()
-                if curriculum_logs:
-                    self.logger.ep_extras.append(curriculum_logs)
                 self.logger.log(it=iteration, start_it=first,
                                 total_it=first+iterations if iterations is not None else iteration+1000,
                                 collect_time=float(timing[0]), learn_time=float(timing[1]),
                                 loss_dict=losses, learning_rate=self.alg.learning_rate,
-                                action_std=self.alg.actor.output_std, rnd_weight=None)
+                                action_std=self.alg.actor.output_std, rnd_weight=None,
+                                curriculum_logs=curriculum_logs)
                 sys.stdout.flush()
                 if verify:
                     self.verify_shared_state()

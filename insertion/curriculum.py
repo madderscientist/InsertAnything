@@ -76,6 +76,10 @@ class SuccessNoiseCurriculum:
     def load_levels(self, state: dict) -> None:
         self.level = state["level"]
 
+    def clear_history(self) -> None:
+        for window in self.windows.values():
+            window.clear()
+
     def update(self, outcomes: dict[str, list[bool]],
                boundary: dict[str, list[bool]] | None = None) -> bool:
         del boundary
@@ -88,8 +92,7 @@ class SuccessNoiseCurriculum:
                 and sum(window) / len(window) >= self.threshold
                 for window in self.windows.values()):
             self.level += 1
-            for window in self.windows.values():
-                window.clear()
+            self.clear_history()
             return True
         return False
 
@@ -161,6 +164,11 @@ class ADRCurriculum:
 
     def load_levels(self, state: dict) -> None:
         self.phi.update({shape: list(phi) for shape, phi in state["phi"].items() if shape in self.phi})
+
+    def clear_history(self) -> None:
+        for shape, window in self.windows.items():
+            window.clear()
+            self.boundary[shape] = [[0, 0], [0, 0]]
 
     def update(self, outcomes: dict[str, list[bool]],
                boundary: dict[str, tuple[list[bool], list[bool]]] | None = None) -> bool:

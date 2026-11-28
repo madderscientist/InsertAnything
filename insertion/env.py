@@ -75,6 +75,8 @@ def bounded_stiffness_step(current: torch.Tensor, target: torch.Tensor, initial:
 
 CONTACT_THRESHOLD_N = 0.05
 SIMULATION_FAILURE = 5
+CURRICULUM_TRUNCATION = 6
+CLEARANCE_RESET_HEIGHT_M = 0.002
 LOWPASS_OFF_MAX_RAD_S = 100.0
 
 
@@ -219,6 +221,7 @@ class PlantGroup:
         self.clearance_max = cfg.active_clearance_levels[0]
         self.clearance = cfg.clearance if self.adr else self.clearance_max
         self.clearance_floor = self.clearance_max
+        self.pending_clearance: float | None = None
         self.shape = shape
         self._build_simulation()
         self._init_shape()
@@ -413,7 +416,8 @@ class PlantGroup:
     def randomize_shape(self, ids: torch.Tensor) -> None:
         cfg, n = self.cfg, len(ids)
         self.shape_params[ids, :3] = self.geometry.definition.sample_params(self.geometry, n, self.uniform).float()
-        present = self.uniform(n, 1, 0., 1.)[:, 0] < cfg.rim_probability * self.difficulty
+        rim_probability = cfg.rim_probability if self.rim_geom_ids else 0.
+        present = self.uniform(n, 1, 0., 1.)[:, 0] < rim_probability * self.difficulty
         height = self.curriculum_uniform(
             n, 1, cfg.rim_height_min_m, cfg.rim_height_max_m, cfg.rim_height_min_m)[:, 0] * cfg.scale
         self.rim_height[ids] = torch.where(present, height, torch.zeros_like(height))
@@ -767,7 +771,7 @@ class PlantGroup:
         self.wrench_bias.add_(bias * hit.unsqueeze(-1) * self.episode_noise_scale[:, None])
         self.step_bias_active |= hit
 
-    def set_clearance(self, clearance: float) -> None:
+    def set_clearance(self, clearance: float, *, reset_in_hole: bool = True) -> None:
         if self.adr:
             self.clearance_floor = clearance
             return
@@ -808,10 +812,11 @@ class PlantGroup:
         self.physics_graph_signature = None
         self.observation_graph = None
         self.observation_outputs = None
-        pos, q, _, _ = self.state()
-        in_hole = (tip_pose(pos, q, self.offset)[:, 2] <= 0.002).nonzero().flatten()
-        if len(in_hole):
-            self.reset(in_hole)
+        if reset_in_hole:
+            pos, q, _, _ = self.state()
+            in_hole = (tip_pose(pos, q, self.offset)[:, 2] <= CLEARANCE_RESET_HEIGHT_M).nonzero().flatten()
+            if len(in_hole):
+                self.reset(in_hole)
 
     def warp_on_current_stream(self) -> wp.ScopedStream:
         # 重置中的 torch 与 warp 操作统一排在当前 torch 流上，保证顺序且可整体捕获
@@ -857,17 +862,17 @@ class PlantGroup:
 
     def per_env_state(self) -> list[tuple[torch.Tensor, int]]:
         """重置可能改写的逐环境张量及其环境维；广播常量（含 0 步长）不可写而跳过"""
-        tensors = [t for t in vars(self).values() if isinstance(t, torch.Tensor)]
+        # 指令历史为 (延迟帧, 环境, 分量)。环境数等于历史长度 3 时无法从大小推断环境轴。
+        state = [(self.targets_p, 1), (self.targets_q, 1)]
+        tensors = [t for name, t in vars(self).items()
+                   if isinstance(t, torch.Tensor) and name not in ("targets_p", "targets_q")]
         tensors += [getattr(self.sim.model, name)[:] for name in self.expanded_fields]
         tensors += [getattr(self.sim.data, name)[:] for name in ("qpos", "qvel", "xfrc_applied")]
-        state = []
         for t in tensors:
             if t.dim() == 0 or 0 in t.stride():
                 continue
             if t.shape[0] == self.n:
                 state.append((t, 0))
-            elif t.dim() > 1 and t.shape[1] == self.n:
-                state.append((t, 1))
         return state
 
     def masked_reset(self, capturing: bool = False) -> None:
@@ -1558,6 +1563,14 @@ class PlantGroup:
                 invalid, -self.cfg.safety_failure_penalty, terms["safety_failure_penalty"])
             self.last_reward_terms = terms
         info["simulation_failure"] = invalid
+        if self.pending_clearance is not None:
+            # 旧几何的最后一个动作已经结算。新几何可能与孔口处的插头相交；
+            # 让这些回合经过正常的 done/reset 路径，同步重置策略记忆等逐回合状态。
+            truncated = ~done & (info["tip_z_m"] <= CLEARANCE_RESET_HEIGHT_M)
+            self.set_clearance(self.pending_clearance, reset_in_hole=False)
+            self.pending_clearance = None
+            info["reason"] = torch.where(truncated, CURRICULUM_TRUNCATION, info["reason"])
+            done = done | truncated
         return reward, done, info
 
     def outcome(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
@@ -1709,7 +1722,7 @@ class InsertionEnv(VecEnv):
         scale = None if self.noise_curriculum is None else self.noise_curriculum.scale_for(group.shape)
         return group.cfg.noise_scale(self.policy_steps) if scale is None else scale
 
-    def apply_curriculum(self, group: PlantGroup) -> None:
+    def apply_curriculum(self, group: PlantGroup, *, defer_clearance: bool = False) -> None:
         curriculum = self.noise_curriculum
         group.difficulty = curriculum.difficulty
         group.noise_scale = self.curriculum_noise_scale(group)
@@ -1717,7 +1730,11 @@ class InsertionEnv(VecEnv):
             group.noise_floor = curriculum.noise_floor_for(group.shape)
             group.clearance_max = curriculum.clearance_ceiling_for(group.shape)
         if hasattr(group, "set_clearance"):
-            group.set_clearance(curriculum.clearance_for(group.shape))
+            clearance = curriculum.clearance_for(group.shape)
+            if defer_clearance and isinstance(curriculum, SuccessNoiseCurriculum) and clearance != group.clearance:
+                group.pending_clearance = clearance
+            else:
+                group.set_clearance(clearance)
 
     def record_curriculum_outcomes(self, outcomes: torch.Tensor) -> None:
         if self.noise_curriculum is not None:
@@ -1753,7 +1770,8 @@ class InsertionEnv(VecEnv):
         boundary = {}
         logs = {}
         for index, shape in enumerate(shapes):
-            ended = (outcomes[:, 0] == index) & outcomes[:, 1].bool()
+            reason = outcomes[:, 1]
+            ended = (outcomes[:, 0] == index) & reason.bool() & (reason != CURRICULUM_TRUNCATION)
             completed = outcomes[ended, 2].bool()
             logs[f"success/{shape}"] = (completed.float().mean() if completed.numel()
                                         else outcomes.new_tensor(0., dtype=torch.float32))
@@ -1789,7 +1807,7 @@ class InsertionEnv(VecEnv):
                 self.noise_curriculum.difficulty, previous_scale, self.noise_curriculum.scale,
             )
         for group in self.groups:
-            self.apply_curriculum(group)
+            self.apply_curriculum(group, defer_clearance=True)
         logs["curriculum/clearance_mm"] = outcomes.new_tensor(
             max(curriculum.clearance_for(s) for s in shapes) * 1000, dtype=torch.float32)
         logs["curriculum/difficulty"] = outcomes.new_tensor(
@@ -1879,17 +1897,18 @@ class InsertionEnv(VecEnv):
                 # 普通回合两维本就随机；边界回合须钉在当前边界（课程中途变化或困难状态回放的不计）
                 eligible = (probes == 0) | ((probes == 1) & scale_ok) | ((probes == 2) & clearance_ok)
             else:
-                eligible = scale_ok & clearance_ok
+                eligible = scale_ok & clearance_ok & (terminal["reason"] != CURRICULUM_TRUNCATION)
             terminal["curriculum_boundary"] = probes
             terminal["curriculum_eligible"] = eligible
             if not self.curriculum_distributed:
                 self.record_curriculum_outcomes(torch.stack((
-                    self.curriculum_shape_ids, dones, terminal["reason"] == 1,
+                    self.curriculum_shape_ids, terminal["reason"], terminal["reason"] == 1,
                     terminal["curriculum_eligible"], probes), dim=1))
         logs = {}
         logs["episode/simulation_failures"] = terminal["simulation_failure"].float().sum()
-        hard = terminal["hard_start"] & dones
-        logs["episode/hard_start_fraction"] = hard.float().sum() / dones.float().sum().clamp_min(1)
+        ended = dones & (terminal["reason"] != CURRICULUM_TRUNCATION)
+        hard = terminal["hard_start"] & ended
+        logs["episode/hard_start_fraction"] = hard.float().sum() / ended.float().sum().clamp_min(1)
         logs["episode/hard_start_success"] = (
             (hard & (terminal["reason"] == 1)).float().sum() / hard.float().sum().clamp_min(1))
         logs["curriculum/noise_scale"] = torch.tensor(
@@ -1922,7 +1941,7 @@ class InsertionEnv(VecEnv):
             logs.pop("curriculum/noise_scale")
             if not self.curriculum_distributed and self.policy_steps % self.curriculum_rollout_steps == 0:
                 logs.update(self.advance_noise_curriculum())
-        # 超时视为真实任务失败，不向 PPO 发送超时价值自举信号
+        # 任务超时为失败，仅因课程几何切换而截断的回合自举。
         return self.get_observations(), rewards, dones, {
-            "time_outs": torch.zeros_like(terminal["time_outs"]),
+            "time_outs": terminal["reason"] == CURRICULUM_TRUNCATION,
             "log": logs, "terminal": terminal}

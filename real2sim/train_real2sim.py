@@ -17,7 +17,7 @@ import torch
 from insertion import InsertionCfg
 from insertion.config import REAL2SIM_FIELDS, REAL2SIM_VALUES
 from insertion.ppo import SMOOTH_PPO
-from train import atomic_json, contract, supervise
+from train import atomic_json, contract, supervise, validate_ppo_batch_layout
 
 DEFAULT_SOURCE = Path("runs/releases/stage2-outer-xy-best-961/checkpoint.pt")
 # 训练长期被自适应 KL 压在 1e-5 学习率下限；悬空力旋量扰动取实测灵敏度量级
@@ -47,8 +47,7 @@ def prepare(source: Path, output: Path, device: str, envs_per_shape: int | None 
     runner["actor"]["distribution_cfg"]["std_range"] = [std_range[0], ACTION_STD_MAX]
     if steps is not None:
         runner["num_steps_per_env"] = steps
-    output.mkdir(parents=True, exist_ok=False)
-    atomic_json(output / "config.json", {
+    metadata = {
         "environment": asdict(cfg), "runner": runner, "contract": contract(cfg),
         "simulation_devices": [device], "collection_backend": "serial",
         "real2sim_source": {
@@ -56,7 +55,10 @@ def prepare(source: Path, output: Path, device: str, envs_per_shape: int | None 
             "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "applied_fields": list(REAL2SIM_FIELDS),
         },
-    })
+    }
+    validate_ppo_batch_layout(metadata, distributed=False)
+    output.mkdir(parents=True, exist_ok=False)
+    atomic_json(output / "config.json", metadata)
     # 保留源 infos.environment，使续训检测到配置变化并清空成功率窗口
     shutil.copyfile(source, output / "checkpoint.pt")
 

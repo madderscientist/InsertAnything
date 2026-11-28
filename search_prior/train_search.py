@@ -17,7 +17,7 @@ from insertion import InsertionCfg
 from insertion.config import REAL2SIM_VALUES, runner_config
 from insertion.model import GSDE_DISTRIBUTION, SKIP_RNN_MODEL
 from insertion.ppo import DEFAULT_ACTOR_MIN_LR
-from train import atomic_json, contract, supervise
+from train import atomic_json, contract, supervise, validate_ppo_batch_layout
 
 SEARCH_SHAPES = ("triangle", "pentagon", "hexagon", "l", "rectangle", "dual")
 
@@ -71,12 +71,14 @@ def search_runner(args: argparse.Namespace) -> dict:
 def prepare(args: argparse.Namespace) -> None:
     devices = [f"cuda:{i}" for i in range(args.gpus)]
     cfg = search_config(args)
-    args.output.mkdir(parents=True, exist_ok=False)
-    atomic_json(args.output / "config.json", {
+    metadata = {
         "environment": asdict(cfg), "runner": search_runner(args), "contract": contract(cfg),
         "simulation_devices": devices,
         "collection_backend": "distributed" if len(devices) > 1 else "serial",
-    })
+    }
+    validate_ppo_batch_layout(metadata, distributed=len(devices) > 1)
+    args.output.mkdir(parents=True, exist_ok=False)
+    atomic_json(args.output / "config.json", metadata)
 
 
 def main() -> None:

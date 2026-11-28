@@ -23,7 +23,7 @@ from insertion import InsertionCfg, TRAIN_SHAPES
 from insertion.transforms import rotate, tip_pose
 from train import (ContinuousRunner, LiveInsertionEnv, TrainingStopped,
                    atomic_json, contract, health_state, resume_training,
-                   stop_worker)
+                   stop_worker, validate_ppo_batch_layout)
 
 
 class RoughLiveInsertionEnv(LiveInsertionEnv):
@@ -407,8 +407,6 @@ def build_stage_metadata(source_saved: dict, args: argparse.Namespace,
         observation_cuda_graph=args.observation_cuda_graph,
     )
     total_envs = cfg.envs_per_shape * len(cfg.shapes)
-    if total_envs % 4:
-        raise ValueError("total environment count must be divisible by 4")
     runner = copy.deepcopy(source_saved["infos"]["runner"])
     runner["seed"] = args.seed
     runner["save_interval"] = 1
@@ -422,7 +420,7 @@ def build_stage_metadata(source_saved: dict, args: argparse.Namespace,
         raise ValueError("init_action_std must lie within [min_action_std, max_action_std]")
     runner["actor"]["distribution_cfg"]["std_range"] = [args.min_action_std, args.max_action_std]
     runner["actor"]["distribution_cfg"]["init_std"] = args.init_action_std
-    return {
+    metadata = {
         "stage": "rough_surface_no_timeout",
         "source_checkpoint": str(source_path.resolve()),
         "source_iteration": int(source_saved["iter"]),
@@ -436,14 +434,16 @@ def build_stage_metadata(source_saved: dict, args: argparse.Namespace,
         "simulation_devices": [args.device],
         "collection_backend": "serial",
     }
+    validate_ppo_batch_layout(metadata, distributed=False, recurrent_batches=True)
+    return metadata
 
 
 def bootstrap_stage(output: Path, source_checkpoint: Path, args: argparse.Namespace) -> None:
     if not source_checkpoint.is_file():
         raise FileNotFoundError(f"source checkpoint not found: {source_checkpoint}")
-    output.mkdir(parents=True, exist_ok=False)
     saved = torch.load(source_checkpoint, map_location="cpu", weights_only=True)
     metadata = build_stage_metadata(saved, args, source_checkpoint)
+    output.mkdir(parents=True, exist_ok=False)
     shutil.copyfile(source_checkpoint, output / "bootstrap_source.pt")
     atomic_json(output / "config.json", metadata)
     atomic_json(output / "stage_manifest.json", {
@@ -467,6 +467,7 @@ def bootstrap_stage(output: Path, source_checkpoint: Path, args: argparse.Namesp
 
 def rough_worker(output: Path, device: str, attempt: int) -> None:
     metadata = json.loads((output / "config.json").read_text())
+    validate_ppo_batch_layout(metadata, distributed=False, recurrent_batches=True)
     cfg = InsertionCfg.from_checkpoint(metadata["environment"])
     torch.set_num_threads(1)
     torch.manual_seed(cfg.seed + attempt)
@@ -681,8 +682,11 @@ def supervise_rough_stage(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     if not args.resume:
         bootstrap_stage(output, args.source_checkpoint, args)
-    elif not (output / "config.json").is_file():
-        raise FileNotFoundError(f"resume requires {output / 'config.json'}")
+    else:
+        if not (output / "config.json").is_file():
+            raise FileNotFoundError(f"resume requires {output / 'config.json'}")
+        validate_ppo_batch_layout(json.loads((output / "config.json").read_text()),
+                                  distributed=False, recurrent_batches=True)
 
     if (output / "STOP").exists():
         raise RuntimeError("STOP exists; remove STOP before resuming")

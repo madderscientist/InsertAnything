@@ -1,6 +1,6 @@
 """几何建模与刚体坐标变换单元测试"""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import math
 from typing import Any
 import unittest
@@ -14,6 +14,7 @@ import torch
 from insertion import (ALL_SHAPES, InsertionCfg, action_target, actor_observation,
                        build_model, canonical_quat, geometry, get_shape, quat_inv,
                        quat_rotvec, rotate, rotvec_quat, transform_wrench)
+from insertion.env import PlantGroup
 
 
 class GeometryAndTransformTests(unittest.TestCase):
@@ -77,6 +78,35 @@ class GeometryAndTransformTests(unittest.TestCase):
         for values in invalid_cases:
             with self.subTest(values=values), self.assertRaises(ValueError):
                 InsertionCfg(**values)
+
+    def test_fixed_clearance_evaluation_of_shapes_without_adr_or_rims(self):
+        cfg = InsertionCfg(shapes=("triangle",), shape_randomization=True, noise_curriculum=True,
+                           noise_curriculum_mode="adr", clearance_curriculum=True, rim_probability=1.)
+        for shape in ("square", "circle"):
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(ValueError, "ADR"):
+                    replace(cfg, shapes=(shape,))
+                evaluation = replace(cfg, shapes=(shape,), training=False)
+                self.assertEqual(evaluation.active_clearance_levels, (cfg.clearance,))
+                group = PlantGroup.__new__(PlantGroup)
+                group.cfg, group.device, group.n, group.difficulty = evaluation, "cpu", 1, 1.
+                group.generator = torch.Generator().manual_seed(7)
+                group.geometry = geometry(shape, evaluation.clearance, randomized=True)
+                group.model = build_model(group.geometry)
+                group.default_geom_pos = torch.as_tensor(group.model.geom_pos).float()
+                group._init_shape()
+                self.assertEqual(group.rim_geom_ids, [])
+                group.shape_params = torch.tensor([[1., 0., 0., evaluation.clearance]])
+                group.opening_radius, group.rim_height, group.rim_width = torch.zeros(3, 1).unbind()
+                group.randomize_shape(torch.tensor([0]))
+                self.assertEqual(group.rim_height.item(), 0.)
+                data = MjData(group.model)
+                data.qpos[:3] = [0., 0., 0.045]
+                mj_forward(group.model, data)
+                self.assertEqual(data.ncon, 0)
+                data.qpos[0] += 0.002
+                mj_forward(group.model, data)
+                self.assertGreater(data.ncon, 0)
 
     def test_square_uses_boxes_with_exact_inner_clearance(self):
         for scale, clearance in ((1., 0.0001), (0.8, 0.0005), (1.2, 0.002)):

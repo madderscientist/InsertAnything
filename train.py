@@ -19,12 +19,13 @@ import time
 
 import torch
 from rsl_rl.runners import OnPolicyRunner
+from rsl_rl.utils import resolve_callable
 from rsl_rl.utils.logger import Logger
 
 from insertion import InsertionCfg, InsertionEnv, TRAIN_SHAPES, runner_config
 from insertion.config import REAL2SIM_FIELDS
 from insertion.curriculum import adaptive_environment_counts
-from insertion.env import capture_graph
+from insertion.env import CURRICULUM_TRUNCATION, capture_graph
 
 
 def prepare_runner_config(config: dict) -> dict:
@@ -35,8 +36,46 @@ def prepare_runner_config(config: dict) -> dict:
     return config
 
 
+def validate_ppo_batch_layout(metadata: dict, *, distributed: bool, recurrent_batches: bool | None = None) -> None:
+    cfg = InsertionCfg.from_checkpoint(metadata["environment"])
+    devices = len(metadata.get("simulation_devices", ["cuda:0"]))
+    if not devices or any(n % devices for n in cfg.environment_counts):
+        raise ValueError("each shape must have a whole number of environments per simulation device")
+    if distributed and cfg.envs_per_shape % devices:
+        raise ValueError("envs_per_shape must be divisible by the number of distributed PPO ranks")
+    config = metadata["runner"]
+    batches = config["algorithm"].get("num_mini_batches", 4)
+    if type(batches) is not int or batches < 1:
+        raise ValueError(f"num_mini_batches must be a positive integer, got {batches!r}")
+    per_rank = sum(cfg.environment_counts) // (devices if distributed else 1)
+    unit = "environments"
+    if recurrent_batches is None:
+        recurrent_batches = any(resolve_callable(config[model]["class_name"]).is_recurrent
+                                for model in ("actor", "critic"))
+    if not recurrent_batches:
+        per_rank *= config["num_steps_per_env"]
+        unit = "transitions"
+    if per_rank % batches:
+        raise ValueError(f"{per_rank} {unit} per PPO rank must be divisible by num_mini_batches={batches}")
+
+
+def validate_training_layout(metadata: dict, device: str) -> None:
+    backend = metadata.get("collection_backend", "serial")
+    if backend == "distributed":
+        from insertion.distributed import validate_layout
+        validate_layout(metadata, device)
+    elif backend == "serial":
+        validate_ppo_batch_layout(metadata, distributed=False)
+    else:
+        raise ValueError("unknown collection backend")
+
+
 class GroupedLogger(Logger):
-    def log(self, *args, **kwargs) -> None:
+    def log(self, *args, curriculum_logs: dict | None = None, **kwargs) -> None:
+        if self.writer is None:
+            return
+        if curriculum_logs:
+            self.ep_extras.append(curriculum_logs)
         labels = {
             f"{key}:" if "/" in key else f"Mean episode {key}:"
             for extras in self.ep_extras for key in extras}
@@ -417,11 +456,11 @@ def load_recovery_checkpoint(output: Path, device: str) -> dict:
             logging.exception("Cannot read recovery checkpoint %s.", candidate)
             continue
         if candidate == previous:
-            logging.warning("Recovering from previous.pt; retaining rejected checkpoint.")
-            if checkpoint.exists():
-                checkpoint.replace(output / "rejected_checkpoint.pt")
+            logging.warning("Recovering from previous.pt.")
             temporary = output / "checkpoint.pt.tmp"
             shutil.copyfile(previous, temporary)
+            if checkpoint.exists():
+                checkpoint.replace(output / "rejected_checkpoint.pt")
             temporary.replace(checkpoint)
         return saved
     raise RuntimeError("No readable recovery checkpoint; inspect the explicit errors above.")
@@ -510,8 +549,8 @@ class LiveInsertionEnv(InsertionEnv):
         offset = 0
         for group in self.groups:
             section = slice(offset, offset+group.n)
-            ended = dones[section]
             reason = terminal["reason"][section]
+            ended = dones[section] & (reason != CURRICULUM_TRUNCATION)
             force = terminal["peak_force"][section] > group.cfg.max_force
             moment = terminal["peak_moment"][section] > group.cfg.max_moment
             masks = (ended, ended & (reason == 1),
@@ -590,8 +629,9 @@ class ContinuousRunner(OnPolicyRunner):
             "progress": {"policy_steps": self.env.policy_steps,
                          "transitions": self.env.total_transitions},
         }
-        if self.env.noise_curriculum is not None:
-            saved["infos"]["noise_curriculum_state"] = self.env.noise_curriculum.state_dict()
+        curriculum = self.env.noise_curriculum
+        if curriculum is not None:
+            saved["infos"]["noise_curriculum_state"] = curriculum.state_dict()
         cfg = InsertionCfg.from_checkpoint(self.metadata["environment"])
         if cfg.adaptive_sampling:
             saved["infos"]["adaptive_sampling_state"] = json.loads(
@@ -607,6 +647,13 @@ class ContinuousRunner(OnPolicyRunner):
         archive_checkpoint(self.output, self.current_learning_iteration)
         reward = list(self.logger.rewbuffer)
         memory = self.release_update_cache()
+        group = self.env.groups[0]
+        clearance, difficulty, noise_scale = group.clearance, group.difficulty, group.noise_scale
+        if curriculum is not None:
+            clearance = max(curriculum.clearance_for(shape) for shape in cfg.shapes)
+            difficulty = curriculum.difficulty
+            if curriculum.scale_for(group.shape) is not None:
+                noise_scale = curriculum.scale
         progress = {
             "timestamp": time.time(),
             "pid": os.getpid(),
@@ -615,9 +662,9 @@ class ContinuousRunner(OnPolicyRunner):
             "transitions": self.env.total_transitions,
             "mean_episode_reward": sum(reward)/len(reward) if reward else None,
             "learning_rate": self.alg.learning_rate,
-            "clearance": self.env.groups[0].clearance,
-            "difficulty": self.env.groups[0].difficulty,
-            "noise_scale": self.env.groups[0].noise_scale,
+            "clearance": clearance,
+            "difficulty": difficulty,
+            "noise_scale": noise_scale,
             "checkpoint": str(checkpoint),
             "cuda_memory": memory,
             "shape_environment_counts": dict(zip(cfg.shapes, cfg.environment_counts, strict=True)),
@@ -657,6 +704,7 @@ def worker(output: Path, device: str, attempt: int) -> None:
         from insertion.distributed import run_distributed
         run_distributed(output, device, attempt)
         return
+    validate_training_layout(metadata, device)
     cfg = InsertionCfg.from_checkpoint(metadata["environment"])
     torch.set_num_threads(1)
     torch.manual_seed(cfg.seed + attempt)
@@ -684,7 +732,7 @@ def worker(output: Path, device: str, attempt: int) -> None:
 
 def resume_training(runner: ContinuousRunner, cfg: InsertionCfg, attempt: int,
                     rank: int = 0, world_size: int = 1) -> None:
-    if (runner.output / "checkpoint.pt").exists():
+    if (runner.output / "checkpoint.pt").exists() or (runner.output / "previous.pt").exists():
         saved = load_recovery_checkpoint(runner.output, str(runner.env.device))
         restore_training_state(runner, saved)
         runner.current_learning_iteration = saved["iter"]+1
@@ -730,9 +778,8 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
                     "plate_friction_max",
                 )
                 if any(getattr(previous_cfg, key) != getattr(cfg, key) for key in changed_fields):
-                    for window in env.noise_curriculum.windows.values():
-                        window.clear()
-                    logging.warning("Initial pose, observation/reward contract or success criteria changed; retaining curriculum level, clearing windows.")
+                    env.noise_curriculum.clear_history()
+                    logging.warning("Environment contract changed. Retaining curriculum difficulty and clearing episode statistics.")
             else:
                 logging.info("Resetting success curriculum to level 0 for updated curriculum config.")
         else:
@@ -775,12 +822,7 @@ def resize_training(output: Path, envs_per_shape: int) -> None:
     metadata = json.loads((output / "config.json").read_text())
     cfg = replace(InsertionCfg.from_checkpoint(metadata["environment"]),
                   envs_per_shape=envs_per_shape, shape_env_counts=())
-    devices = metadata.get("simulation_devices", ["cuda:0"])
-    if envs_per_shape % len(devices) or envs_per_shape*len(cfg.shapes) % 4:
-        raise ValueError("environment counts must divide evenly across devices and PPO mini-batches")
-    if metadata.get("collection_backend", "serial") == "distributed":
-        from insertion.distributed import validate_layout
-        validate_layout({**metadata, "environment": asdict(cfg)}, "cuda:0")
+    validate_training_layout({**metadata, "environment": asdict(cfg)}, "cuda:0")
     pid = registered_worker_pid(output)
     timestamp = time.time_ns()
     atomic_json(output / f"config_before_resize_{timestamp}.json", metadata)
@@ -853,26 +895,23 @@ def stop_worker(process: subprocess.Popen, grace_seconds: float) -> None:
 
 def supervise(args: argparse.Namespace) -> None:
     output = args.output.resolve()
-    if not args.resume:
-        output.mkdir(parents=True, exist_ok=False)
+    if args.resume:
+        if not (output / "config.json").is_file():
+            raise FileNotFoundError("resume requires an existing run config.json")
+        metadata = json.loads((output / "config.json").read_text())
+    else:
         cfg = environment_config(args)
-        if cfg.envs_per_shape * len(cfg.shapes) % 4:
-            raise ValueError("environment count must be divisible by four")
         config = runner_config(args.steps)
         config["save_interval"] = 1
-        atomic_json(output / "config.json", {
+        metadata = {
             "environment": asdict(cfg), "runner": config, "contract": contract(cfg),
             "simulation_devices": args.simulation_devices or [args.device],
             "collection_backend": "distributed" if args.distributed_ppo else "serial",
-        })
-    elif not (output / "config.json").is_file():
-        raise FileNotFoundError("resume requires an existing run config.json")
-    metadata = json.loads((output / "config.json").read_text())
-    if metadata.get("collection_backend", "serial") == "distributed":
-        from insertion.distributed import validate_layout
-        validate_layout(metadata, args.device)
-    elif metadata.get("collection_backend", "serial") != "serial":
-        raise ValueError("unknown collection backend")
+        }
+    validate_training_layout(metadata, args.device)
+    if not args.resume:
+        output.mkdir(parents=True, exist_ok=False)
+        atomic_json(output / "config.json", metadata)
     if (output / "STOP").exists():
         raise RuntimeError("STOP exists; remove this run's STOP file before explicitly resuming")
     stopping = False
@@ -951,14 +990,12 @@ def run_finite(args: argparse.Namespace) -> None:
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
     cfg = environment_config(args)
-    count = cfg.envs_per_shape * len(cfg.shapes)
-    if count < 4 or count % 4:
-        raise ValueError("environment count must be a positive multiple of four")
-    args.output.mkdir(parents=True, exist_ok=False)
     config = runner_config(args.steps)
     metadata = {"environment": asdict(cfg), "runner": config, "contract": contract(cfg),
                 "simulation_devices": args.simulation_devices or [args.device],
                 "collection_backend": "distributed" if args.distributed_ppo else "serial"}
+    validate_training_layout(metadata, args.device)
+    args.output.mkdir(parents=True, exist_ok=False)
     atomic_json(args.output / "config.json", metadata)
     if args.distributed_ppo:
         from insertion.distributed import run_distributed

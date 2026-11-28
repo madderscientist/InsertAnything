@@ -19,12 +19,13 @@ from rsl_rl.models import RNNModel
 from export_policy import OfflinePolicy, export_onnx
 from evaluate import load_checkpoint
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv, SuccessNoiseCurriculum, runner_config
-from insertion.curriculum import adaptive_environment_counts
+from insertion.curriculum import ADRCurriculum, adaptive_environment_counts
 from insertion.distributed import run_distributed, validate_layout
 from train import (ContinuousRunner, GroupedLogger, LiveInsertionEnv, TrainingStopped,
                    adapt_training_layout, archive_checkpoint, atomic_json, contract,
                    environment_config, health_state, load_recovery_checkpoint, main,
-                   prepare_runner_config, restore_environment_progress, resume_training)
+                   prepare_runner_config, resize_training, restore_environment_progress, resume_training,
+                   validate_training_layout)
 from viser_view import SnapshotScene, replay_config, replay_index, vector_arrow, visible_wrench_vector
 
 
@@ -241,14 +242,13 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                   "curriculum/noise_scale": 0.2, "reward/action_penalty": -0.001,
                   "curriculum/success/triangle": 0.9, "curriculum/difficulty": 1.}
         for order in (list(values), list(reversed(values))):
-            logger.ep_extras = [{key: torch.tensor(values[key]) for key in order},
-                                {"curriculum/success/square": torch.tensor(0.6)}]
+            logger.ep_extras = [{key: torch.tensor(values[key]) for key in order}]
             logger.writer.reset_mock()
             output = io.StringIO()
             with redirect_stdout(output):
                 logger.log(it=0, start_it=0, total_it=1, collect_time=1., learn_time=1.,
                            loss_dict={}, learning_rate=0.001, action_std=torch.ones(1),
-                           rnd_weight=None)
+                           rnd_weight=None, curriculum_logs={"curriculum/success/square": torch.tensor(0.6)})
             rows = [line.strip().split(":", 1)[0] for line in output.getvalue().splitlines()
                     if line.strip().split(":", 1)[0] in values]
             self.assertEqual(rows, sorted(values))
@@ -261,6 +261,41 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                        loss_dict={}, learning_rate=0.001, action_std=torch.ones(1),
                        rnd_weight=None, print_minimal=True)
         self.assertNotIn("reward/time_penalty:", output.getvalue())
+
+    def test_nonwriter_rank_does_not_buffer_curriculum_logs(self):
+        config = prepare_runner_config(runner_config(4))
+        config["algorithm"]["rnd_cfg"] = None
+        logger = GroupedLogger(None, config, {}, 4, True, 2, 1, "cpu")
+        for iteration in range(3):
+            logger.log(it=iteration, start_it=0, total_it=3, collect_time=1., learn_time=1.,
+                       loss_dict={}, learning_rate=0.001, action_std=torch.ones(1), rnd_weight=None,
+                       curriculum_logs={"curriculum/difficulty": torch.tensor(0.5)})
+            self.assertEqual(logger.ep_extras, [])
+
+    def test_heartbeat_reports_active_curriculum_bounds_and_step_noise(self):
+        shapes = ("triangle", "hexagon")
+        cfg = InsertionCfg(shapes=shapes, shape_randomization=True, clearance_curriculum=True,
+                           noise_curriculum=True, noise_curriculum_mode="adr")
+        group = SimpleNamespace(shape=shapes[0], clearance=cfg.clearance, difficulty=0.5, noise_scale=0.9)
+        adr = ADRCurriculum(shapes, cfg.active_clearance_levels[0], cfg.clearance)
+        adr.phi.update(triangle=[0.9, 0.8], hexagon=[0.5, 0.3])
+        steps = SuccessNoiseCurriculum(shapes, cfg.active_clearance_levels, noise_levels=0)
+        for curriculum, expected in ((adr, (adr.clearance_for("hexagon"), 0.5, 0.5)),
+                                     (steps, (steps.clearance, steps.difficulty, 0.9)),
+                                     (None, (cfg.clearance, 0.5, 0.9))):
+            with self.subTest(curriculum=type(curriculum).__name__), tempfile.TemporaryDirectory() as directory:
+                runner = ContinuousRunner.__new__(ContinuousRunner)
+                runner.env = SimpleNamespace(groups=[group], advance_noise_curriculum=lambda: {},
+                                             noise_curriculum=curriculum, policy_steps=128, total_transitions=256)
+                runner.alg = SimpleNamespace(actor=torch.nn.Identity(), critic=torch.nn.Identity(),
+                                             learning_rate=0.001, save=lambda: {})
+                runner.output, runner.metadata = Path(directory), {"environment": asdict(cfg)}
+                runner.current_learning_iteration, runner.stop_requested, runner.last_saved = 1, False, None
+                runner.logger = SimpleNamespace(rewbuffer=[])
+                with patch.object(runner, "release_update_cache", return_value={}), patch("train.publish_scene"):
+                    runner.save(str(runner.output / "checkpoint.pt"))
+                progress = json.loads((runner.output / "heartbeat.json").read_text())
+                self.assertEqual(tuple(progress[k] for k in ("clearance", "difficulty", "noise_scale")), expected)
 
     def test_periodic_checkpoint_every_500_iterations_and_preserves_old_archives(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -394,6 +429,28 @@ class RuntimeAndDistributedTests(unittest.TestCase):
                 self.assertEqual(state["iteration"], 160)
                 self.assertEqual(kill.call_count, 2)
 
+    def test_adr_resume_discards_boundary_counts_only_when_environment_changes(self):
+        shape = "triangle"
+        cfg = InsertionCfg(shapes=(shape,), shape_randomization=True, clearance_curriculum=True,
+                           noise_curriculum=True, noise_curriculum_mode="adr")
+        curriculum = ADRCurriculum(cfg.shapes, cfg.active_clearance_levels[0], cfg.active_clearance_levels[-1])
+        curriculum.phi[shape] = [0.5, 0.5]
+        successes = [True] * (curriculum.boundary_episodes - 1)
+        curriculum.update({shape: successes}, {shape: (successes, successes)})
+        env = SimpleNamespace(noise_curriculum=curriculum, curriculum_pending=[], groups=[])
+        history = curriculum.state_dict()
+        saved = {"infos": {"progress": {"policy_steps": 128}, "environment": asdict(cfg),
+                           "noise_curriculum_state": history}}
+        restore_environment_progress(env, cfg, saved, 0)
+        self.assertEqual(curriculum.state_dict(), history)
+        with self.assertLogs(level="WARNING"):
+            restore_environment_progress(env, replace(cfg, episode_seconds=cfg.episode_seconds / 2), saved, 1)
+        self.assertEqual(curriculum.phi, history["phi"])
+        self.assertFalse(curriculum.windows[shape])
+        self.assertEqual(curriculum.boundary[shape], [[0, 0], [0, 0]])
+        self.assertFalse(curriculum.update({shape: [False, False]}, {shape: ([False], [False])}))
+        self.assertEqual(curriculum.boundary[shape], [[0, 1], [0, 1]])
+
     def test_changed_sensor_bias_retains_level_but_invalidates_old_windows(self):
         cfg = InsertionCfg(noise_curriculum=True, noise_curriculum_mode="success",
                            force_bias=0.5, moment_bias=0.01)
@@ -487,6 +544,49 @@ class RuntimeAndDistributedTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_layout(metadata, "cuda:0")
 
+    def test_ppo_batches_use_per_rank_environment_counts(self):
+        cfg = InsertionCfg(shapes=("triangle", "hexagon"), envs_per_shape=24, shape_env_counts=(14, 34))
+        runner = runner_config(4)
+        runner["algorithm"]["num_mini_batches"] = 16
+        metadata = {"environment": asdict(cfg), "runner": runner, "simulation_devices": ["cuda:0", "cuda:1"]}
+        validate_training_layout(metadata, "cuda:0")  # One PPO rank collects all 48 environments.
+        with patch("torch.cuda.device_count", return_value=2):
+            with self.assertRaisesRegex(ValueError, "24 environments per PPO rank.*num_mini_batches=16"):
+                validate_layout(metadata, "cuda:0")
+            metadata["environment"] = asdict(replace(cfg, envs_per_shape=32, shape_env_counts=(18, 46)))
+            self.assertEqual(validate_layout(metadata, "cuda:0"), 2)
+            metadata["environment"] = asdict(replace(cfg, envs_per_shape=18, shape_env_counts=(16, 20)))
+            runner["algorithm"]["num_mini_batches"] = 3
+            self.assertEqual(validate_layout(metadata, "cuda:0"), 2)
+        runner["algorithm"]["num_mini_batches"] = 0
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            validate_training_layout(metadata, "cuda:0")
+        # Feed-forward PPO partitions transitions across rollout steps.
+        metadata["environment"] = asdict(InsertionCfg(shapes=("triangle",), envs_per_shape=24))
+        runner["algorithm"]["num_mini_batches"] = 16
+        for model in ("actor", "critic"):
+            runner[model]["class_name"] = "MLPModel"
+        validate_training_layout(metadata, "cuda:0")
+
+    def test_invalid_batch_counts_rejected_before_prepare_or_resize(self):
+        from search_prior.train_search import main as search_main
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "search"
+            args = ["train_search.py", "--gpus", "2", "--mini-batches", "16",
+                    "--prepare-only", "--output", str(output), "--envs-per-shape"]
+            with (patch("sys.argv", args + ["8"]),
+                  self.assertRaisesRegex(ValueError, "24 environments per PPO rank.*num_mini_batches=16")):
+                search_main()
+            self.assertFalse(output.exists())
+            with patch("sys.argv", args + ["16"]):
+                search_main()
+            config = (output / "config.json").read_bytes()
+            with (patch("torch.cuda.device_count", return_value=2), patch("train.registered_worker_pid") as pid,
+                  self.assertRaisesRegex(ValueError, "24 environments per PPO rank.*num_mini_batches=16")):
+                resize_training(output, 8)
+            pid.assert_not_called()
+            self.assertEqual(config, (output / "config.json").read_bytes())
+
     def test_update_cache_released_once_per_simulation_device(self):
         runner = ContinuousRunner.__new__(ContinuousRunner)
         runner.env = SimpleNamespace(groups=[
@@ -516,6 +616,35 @@ class RuntimeAndDistributedTests(unittest.TestCase):
             with self.assertLogs(level="WARNING"):
                 recovered = load_recovery_checkpoint(output, "cpu")
             self.assertEqual(recovered["iter"], 7)
+
+    def test_serial_resume_retries_interrupted_checkpoint_recovery(self):
+        cfg = InsertionCfg()
+        env = SimpleNamespace(device="cpu", groups=[], noise_curriculum=None)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            runner = SimpleNamespace(env=env, output=output, alg=Mock(), current_learning_iteration=0)
+            saved = {"actor_state_dict": {}, "critic_state_dict": {}, "optimizer_state_dict": {},
+                     "iter": 7, "infos": {"environment": asdict(cfg), "progress": {"policy_steps": 128}}}
+            torch.save(saved, output / "previous.pt")
+            checkpoint = output / "checkpoint.pt"
+            checkpoint.write_bytes(b"truncated")
+            replace_path = Path.replace
+
+            def interrupted_replace(source, target):
+                if target == checkpoint:
+                    raise OSError("interrupted while installing recovery checkpoint")
+                return replace_path(source, target)
+
+            with (patch.object(Path, "replace", interrupted_replace), self.assertLogs(level="WARNING"),
+                  self.assertRaises(OSError)):
+                resume_training(runner, cfg, 1)
+            self.assertFalse(checkpoint.exists())
+            self.assertEqual((output / "rejected_checkpoint.pt").read_bytes(), b"truncated")
+            with self.assertLogs(level="WARNING"):
+                resume_training(runner, cfg, 2)
+            runner.alg.load.assert_called_once_with(saved, None, True)
+            self.assertEqual((runner.current_learning_iteration, env.policy_steps), (8, 128))
+            self.assertEqual(torch.load(checkpoint, weights_only=True)["iter"], 7)
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA GPUs")
     def test_distributed_training_and_checkpoint_roundtrip(self):
