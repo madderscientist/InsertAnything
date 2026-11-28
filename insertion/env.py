@@ -14,7 +14,7 @@ from rsl_rl.env import VecEnv
 from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 
-from .config import ALL_SHAPES, InsertionCfg
+from .config import ALL_SHAPES, PPO_DISCOUNT, InsertionCfg
 from .curriculum import ADR_BOUNDARY_FRACTION, ADRCurriculum, SuccessNoiseCurriculum
 from .geometry import build_model, geometry, rough_surface_tiles
 from .shapes.base import PARKED_OFFSET_M
@@ -1661,7 +1661,8 @@ class PlantGroup:
         reason = torch.where(success, 1, torch.where(excessive, 2, torch.where(escaped, 3,
                              torch.where(timeout, 4, 0))))
         info = {"reason": reason, "length": self.length.clone(),
-                "tip_z_m": tip[:, 2].clone(), "tilt_rad": tilt.clone(),
+                "tip_z_m": tip[:, 2].clone(), "tip_center_z_m": tip_center_z.clone(),
+                "tilt_rad": tilt.clone(),
                 "target_depth_m": -self.goal[:, 2].clone(),
                 "peak_force": self.peak_force.clone(), "peak_moment": self.peak_moment.clone(),
                 "time_outs": timeout & ~success & ~excessive & ~escaped,
@@ -1699,6 +1700,7 @@ class InsertionEnv(VecEnv):
         self.episode_length_buf = torch.zeros(self.num_envs, device=device, dtype=torch.long)
         self.policy_steps = 0
         self.total_transitions = 0
+        self.depth_potential = torch.zeros(self.num_envs, device=device)
         use_success_curriculum = cfg.training and (
             cfg.noise_curriculum_mode in ("success", "adr") or cfg.clearance_curriculum)
         noise_levels = (10 if cfg.noise_curriculum and cfg.noise_curriculum_mode == "success"
@@ -1880,6 +1882,13 @@ class InsertionEnv(VecEnv):
         dones = torch.cat([r[1].to(self.device) for r in results])
         terminal = {key: torch.cat([r[2][key].to(self.device) for r in results])
                     for key in results[0][2]}
+        depth_shaping = None
+        if (weight := self.groups[0].cfg.insertion_depth_reward) > 0:
+            depth = (-terminal["tip_center_z_m"]).clamp_min(0.) / terminal["target_depth_m"]
+            potential = torch.where(dones.bool(), 0., weight * depth.clamp_max(1.))
+            depth_shaping = PPO_DISCOUNT * potential - self.depth_potential
+            rewards = rewards + depth_shaping
+            self.depth_potential.copy_(potential)
         if self.noise_curriculum is not None:
             episode_scales = torch.cat([g.episode_noise_scale.to(self.device) for g in self.groups])
             episode_clearances = torch.cat([g.shape_params[:, 3].to(self.device) for g in self.groups])
@@ -1917,6 +1926,8 @@ class InsertionEnv(VecEnv):
             logs[f"reward/{key}"] = torch.stack(
                 [g.last_reward_terms[key].mean().to(self.device)
                  for g in self.groups]).mean()
+        if depth_shaping is not None:
+            logs["reward/insertion_depth_shaping"] = depth_shaping.mean()
         successes = {}
         for group, (_, done, info) in zip(self.groups, results, strict=True):
             if self.noise_curriculum is None and bool(done.any()):
