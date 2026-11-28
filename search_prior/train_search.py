@@ -128,7 +128,7 @@ def main() -> None:
                         help="per-episode probability of a raised rim around the opening")
     parser.add_argument("--episode-seconds", type=float, default=InsertionCfg.episode_seconds)
     parser.add_argument("--insertion-depth-reward", type=float, default=0.0,
-                        help="weight of the potential-based insertion-depth shaping (0 disables)")
+                        help="weight of the insertion-depth shaping with terminal partial credit (0 disables)")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

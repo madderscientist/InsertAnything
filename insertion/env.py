@@ -1940,10 +1940,10 @@ class InsertionEnv(VecEnv):
         depth_shaping = None
         if (weight := self.groups[0].cfg.insertion_depth_reward) > 0:
             depth = (-terminal["tip_center_z_m"]).clamp_min(0.) / terminal["target_depth_m"]
-            potential = torch.where(dones.bool(), 0., weight * depth.clamp_max(1.))
+            potential = weight * depth.clamp_max(1.)
             depth_shaping = PPO_DISCOUNT * potential - self.depth_potential
             rewards = rewards + depth_shaping
-            self.depth_potential.copy_(potential)
+            self.depth_potential.copy_(torch.where(dones.bool(), 0., potential))
         if self.noise_curriculum is not None:
             episode_scales = torch.cat([g.episode_noise_scale.to(self.device) for g in self.groups])
             episode_clearances = torch.cat([g.shape_params[:, 3].to(self.device) for g in self.groups])
