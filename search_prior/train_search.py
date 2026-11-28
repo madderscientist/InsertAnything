@@ -43,6 +43,7 @@ def search_config(args: argparse.Namespace) -> InsertionCfg:
         shapes=SEARCH_SHAPES, shape_randomization=True, rim_probability=args.rim_probability,
         episode_seconds=args.episode_seconds,
         envs_per_shape=args.envs_per_shape, shape_env_counts=(), adaptive_sampling=True,
+        spatial_memory=getattr(args, "spatial_memory", False),
         search_map=args.search_map, search_coverage_reward=args.coverage_reward if args.search_map else 0.,
         # 上限约为噪声满量程名义先验的 2 倍，噪声课程放开前就见过各种先验宽度
         search_map_sigma_min_m=0.0005 if args.search_map else 0.,
@@ -61,6 +62,9 @@ def search_runner(args: argparse.Namespace) -> dict:
     if getattr(args, "critic_rnn_layers", None) is not None:
         runner["critic"]["rnn_num_layers"] = args.critic_rnn_layers
     runner["actor"]["search_map"] = args.search_map
+    if getattr(args, "spatial_memory", False):
+        runner["actor"]["spatial_memory"] = True
+        runner["algorithm"]["height_coef"] = args.height_coef
     distribution = runner["actor"]["distribution_cfg"]
     runner["actor"]["distribution_cfg"] = {
         "class_name": GSDE_DISTRIBUTION, "init_std": distribution["init_std"],
@@ -108,7 +112,11 @@ def main() -> None:
                         help="phase cross-entropy weight on the actor memory (default: 0.1, use 0 to disable)")
     parser.add_argument("--phase-lr", type=float, default=1e-3,
                         help="fixed Adam learning rate of the phase head, independent of the KL schedule")
-    parser.add_argument("--search-map", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--spatial-memory", action="store_true",
+                      help="learn a locally updated latent grid with a surface-height decoder")
+    parser.add_argument("--height-coef", type=float, default=0.5, help="local surface-height auxiliary loss weight")
+    mode.add_argument("--search-map", action="store_true",
                         help="add the prior-initialized, erase-only hole probability map to the observations")
     parser.add_argument("--map-coef", type=float, default=0.5,
                         help="one-step NLL weight for the map erase head")

@@ -9,6 +9,7 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.utils import unpad_trajectories
 
 from .search_map import ERASE_MAX, MAP_BATCH, MAP_KEYS, MAP_NLL, MapHead, erase_nll
+from .spatial_memory import HEIGHT_TARGET, REPLAY
 
 WRENCH_SLICE = slice(7, 13)
 SMOOTH_PPO = "insertion.ppo:SmoothPPO"
@@ -23,7 +24,7 @@ torch.backends.cuda.matmul.allow_tf32 = False
 class SmoothPPO(PPO):
     def __init__(self, actor, critic, *args, smooth_coef: float = 0.0, smooth_force_std: float = 0.5,
                  smooth_moment_std: float = 0.05, phase_coef: float = 0.0, phase_learning_rate: float = 1e-3,
-                 map_coef: float = 0.0, map_learning_rate: float = 1e-3,
+                 map_coef: float = 0.0, map_learning_rate: float = 1e-3, height_coef: float = 0.0,
                  actor_min_lr: float = DEFAULT_ACTOR_MIN_LR, critic_learning_rate: float | Literal["actor"] = "actor",
                  **kwargs) -> None:
         if not 0 < actor_min_lr <= 1e-2:
@@ -46,6 +47,10 @@ class SmoothPPO(PPO):
         self.smooth_std = torch.tensor([smooth_force_std]*3 + [smooth_moment_std]*3, device=self.device)
         self.phase_coef = phase_coef
         self.map_coef = map_coef
+        if not math.isfinite(height_coef) or height_coef < 0:
+            raise ValueError("height_coef must be finite and nonnegative")
+        self.height_coef = height_coef
+        self.spatial_start = None
         self.search_map = None
         self.memory: torch.Tensor | None = None
         phase_params = list(self.critic.phase_head.parameters()) if phase_coef > 0 else []
@@ -97,6 +102,12 @@ class SmoothPPO(PPO):
         return nn.functional.cross_entropy(logits, labels), accuracy
 
     def act(self, obs):
+        spatial = getattr(self._raw_actor, "spatial", None)
+        if spatial is not None and self.storage.step == 0:
+            spatial.initialize(obs["actor"])
+            # rollout 在 inference_mode 中，重放的 activation checkpoint 需要普通张量。
+            with torch.inference_mode(False):
+                self.spatial_start = (spatial.flat_grid.clone(), spatial.coarse.clone())
         actions = super().act(obs)
         if self.map_coef > 0 and self.search_map is not None:
             logits = self._raw_critic.map_head(self.memory.squeeze(0), obs[MAP_NLL])
@@ -146,9 +157,14 @@ class SmoothPPO(PPO):
         maps = {key: self.storage.observations.pop(key) for key in MAP_KEYS
                 if key in self.storage.observations.keys()}
         size = self.storage.num_envs // self.num_mini_batches
+        if self.spatial_start is not None:
+            totals.update(height=0., height_mae_mm=0.)
         for index, batch in enumerate(generator):
+            envs = slice(index % self.num_mini_batches * size, (index % self.num_mini_batches + 1) * size)
+            if self.spatial_start is not None:
+                grid, coarse = self.spatial_start
+                batch.observations.set_non_tensor(REPLAY, (grid[envs], coarse[envs], self.storage.dones[:, envs, 0].bool()))
             if maps:
-                envs = slice(index % self.num_mini_batches * size, (index % self.num_mini_batches + 1) * size)
                 batch.observations.set_non_tensor(MAP_BATCH, {key: value[:, envs] for key, value in maps.items()})
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -201,6 +217,12 @@ class SmoothPPO(PPO):
             if self.map_coef > 0:
                 map_nll, map_gain = self.map_loss(batch)
                 loss = loss + self.map_coef * map_nll
+            if self.spatial_start is not None:
+                target = unpad_trajectories(batch.observations[HEIGHT_TARGET], batch.masks)
+                height_loss, height_error = self._raw_actor.spatial.height_loss(target)
+                loss = loss + self.height_coef * height_loss
+                totals["height"] += height_loss.detach().item()
+                totals["height_mae_mm"] += height_error.item()
             smooth = torch.zeros((), device=self.device)
             if self.smooth_coef > 0:
                 smooth = self.smooth_loss(batch, clean_mean)
@@ -222,6 +244,7 @@ class SmoothPPO(PPO):
             totals["phase_accuracy"] += phase_accuracy.item()
             totals["map"] += map_nll.item()
             totals["map_gain"] += map_gain.item()
+        self.spatial_start = None
         self.storage.observations.update(maps)
         observations = self.storage.observations.flatten(0, 1)
         self.actor.update_normalization(observations)

@@ -100,6 +100,18 @@ micromamba run -n mj python export_policy.py runs/continuous_dual/checkpoint.pt 
 ```
 
 
+### 局部空间隐状态实验
+
+在 `search-spatial-memory` 分支，以下命令使用 8 秒回合、双卡 PPO 和局部高度监督，从新目录训练。
+
+```bash
+python -m search_prior.train_search --spatial-memory --output runs/search/spatial_8s
+```
+
+actor 保留原来的时序 minGRU。另一个局部 minGRU 在观测目标坐标系维护 48 × 48 格，每格 1 mm。每格有七个学习通道和一个已写入标志。每步由当前时序记忆和格心相对尖端的偏移更新 3 × 3 邻域。动作头同时读取这个邻域和全图的 6 × 6 汇总。PPO 从 rollout 起点的空间状态重放各环境的写入，跨回合清零。
+
+高度以普通板面为 0 mm，凸台为正。训练时对写入窗口的格心竖直投射射线，排除工具本身。射线穿过通孔时，以板厚的负值截断，默认 −25 mm。每回合初始隐状态及解码高度都为零，已写入标志区分未知格与高度预测同为零的已写格。高度训练使用 10 mm 为单位的 Huber 损失，转折点为 1 mm，`--height-coef` 默认 0.5。日志中的 `height_mae_mm` 以毫米报告。几何标签只进入辅助损失。Viser 交互回放显示模型解码的高度与未知格。此模式的策略训练和回放使用 PyTorch。
+
 ### 单卡持续训练
 
 以下为 24 GB RTX 4090 的参考配置，较小显存应降低环境数。启动新训练时不要复用已有输出目录：

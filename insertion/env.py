@@ -19,6 +19,8 @@ from .curriculum import ADR_BOUNDARY_FRACTION, ADRCurriculum, SuccessNoiseCurric
 from .geometry import build_model, geometry, rough_surface_tiles
 from .search_map import SearchMap, prior_log_mass
 from .shapes.base import PARKED_OFFSET_M
+from .spatial_memory import HEIGHT_TARGET, cell_centers, local_patch
+from .surface_height import SurfaceRays
 from .transforms import (action_target, actor_observation, canonical_quat,
                          quat_inv, quat_mul, quat_rotvec, rotate,
                          rotvec_quat, tip_pose, transform_wrench)
@@ -223,6 +225,7 @@ class PlantGroup:
         self.clearance = cfg.clearance if self.adr else self.clearance_max
         self.clearance_floor = self.clearance_max
         self.pending_clearance: float | None = None
+        self.surface_rays = None
         self.shape = shape
         self._build_simulation()
         self._init_shape()
@@ -1340,6 +1343,16 @@ class PlantGroup:
         observed = tip_pose(pos, q, self.nominal_offset + self.calibration) - tip_pose(pos, q, self.offset)
         return (observed - self.bias)[:, :2]
 
+    def spatial_height_target(self, actor: torch.Tensor) -> torch.Tensor:
+        indices, _, _ = local_patch(-actor[:, :2])
+        points = cell_centers(indices) - self.search_map_target()[:, None]
+        with wp.ScopedDevice(self.device), self.warp_on_current_stream():
+            if self.surface_rays is None:
+                ceiling = (self.cfg.workspace_z_max_m + 2 * self.cfg.rough_max_amplitude_m) * self.cfg.scale
+                self.surface_rays = SurfaceRays(self.n, self.device, self.body_id, ceiling)
+            return self.surface_rays.sample(self.sim.wp_model, self.sim.wp_data, points,
+                                            -self.rim_height[:, None], self.geometry.depth)
+
     def record_position_observation(self, position_noise: torch.Tensor) -> None:
         if not self.cfg.position_observation_delay:
             return
@@ -1886,6 +1899,9 @@ class InsertionEnv(VecEnv):
         actor = torch.cat([p[0].to(self.device) for p in pairs])
         critic = torch.cat([p[1].to(self.device) for p in pairs])
         obs = {"free_air": free_air, "noise_scale": noise_scale, "phase": phase}
+        if self.groups[0].cfg.spatial_memory and self.groups[0].cfg.training:
+            patches = self.concurrent_groups(lambda group, pair: group.spatial_height_target(pair[0]), pairs)
+            obs[HEIGHT_TARGET] = torch.cat([height.to(self.device) for height in patches])
         if self.search_map is not None:
             truth = torch.cat([g.search_map_target().to(self.device) for g in self.groups])
             obs.update(self.search_map.observe(-actor[:, :2], truth))

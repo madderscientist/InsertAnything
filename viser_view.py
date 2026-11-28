@@ -44,7 +44,7 @@ def replay_config(environment: dict, shape: str, zero_noise: bool = False,
     # training_level 保留训练态采样，由调用方按检查点课程等级设置难度、间隙与噪声
     cfg = replace(cfg,
                   shapes=(shape,), shape_env_counts=(), adaptive_sampling=False,
-                  envs_per_shape=1, training=training_level,
+                  envs_per_shape=1, training=training_level, spatial_memory=False,
                   terminate_on_overload=cfg.terminate_on_overload if training_level else not ignore_overload,
                   hard_state_reset_probability=0. if training_level else cfg.hard_state_reset_probability)
     if zero_noise:
@@ -1311,8 +1311,6 @@ class EnvScene:
 
 def search_map_html(env: Any, scale: int = 6) -> str:
     """环境 0 的孔位后验概率图：按当前最大值归一的对数色标，白点=尖端，红点=真实孔位；X 向右、Y 向上"""
-    from PIL import Image
-
     m = env.search_map
     logits = (m.log_prior[0] + m.erased[0]).float()
     # 每帧按当前后验整体重新着色，擦除后剩余格的概率上升会同步变亮
@@ -1328,17 +1326,36 @@ def search_map_html(env: Any, scale: int = 6) -> str:
         row = min(max(round((GRID - y) * scale), 1), size - 1)
         col = min(max(round(x * scale), 1), size - 1)
         image[row - 1:row + 1, col - 1:col + 1] = color
-    image = (image * 255).astype(np.uint8)
+    return grid_panel_html(image, f'孔位概率图（X→ Y↑，{CELL_M*1000:.0f} mm/格，{GRID}×{GRID}）',
+                           '亮=后验概率高（相对当前最大值，对数色标 8 nats） '
+                           '<span style="color:#fff">■</span>尖端 <span style="color:#f33">■</span>真实孔位')
+
+
+def grid_panel_html(image, title, legend):
+    from PIL import Image
+
     buffer = io.BytesIO()
-    Image.fromarray(image).save(buffer, format="PNG")
+    Image.fromarray((image * 255).astype(np.uint8)).save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode()
-    # 固定定位到窗口左上角，不占右侧控制面板
     return (f'<div style="position:fixed;top:12px;left:12px;z-index:1000;background:rgba(20,20,20,0.85);'
-            f'padding:6px;border-radius:6px;color:#eee;font-size:12px;line-height:1.4">'
-            f'孔位概率图（X→ Y↑，{CELL_M*1000:.0f} mm/格，{GRID}×{GRID}）<br>'
+            f'padding:6px;border-radius:6px;color:#eee;font-size:12px;line-height:1.4">{title}<br>'
             f'<img src="data:image/png;base64,{encoded}" style="display:block;image-rendering:pixelated"><br>'
-            f'亮=后验概率高（相对当前最大值，对数色标 8 nats） <span style="color:#fff">■</span>尖端 '
-            f'<span style="color:#f33">■</span>真实孔位</div>')
+            f'{legend}</div>')
+
+
+def spatial_height_html(spatial, depth: float, scale: int = 6) -> str:
+    if spatial.grid is None:
+        return ""
+    heights, written = spatial.decoded_surface(0)
+    # 白色是普通板面，蓝色是孔，橙色是凸起。浅色变化在毫米级也可见。
+    z = heights.float().cpu().numpy()
+    down = np.sqrt(np.clip(-z / depth, 0., 1.))
+    up = np.clip(z / 0.002, 0., 1.)
+    rgb = np.stack((1. - down, 1. - 0.7 * down - 0.5 * up, 1. - up), -1)
+    rgb[~written.cpu().numpy()] = 0.28
+    image = np.kron(np.flipud(rgb.transpose(1, 0, 2)), np.ones((scale, scale, 1)))
+    return grid_panel_html(image, '预测表面高度（X→ Y↑，1 mm/格）',
+                           f'灰=未写入　白=板面 0 mm　蓝=−{depth*1000:g} mm　橙=+2 mm')
 
 
 def run_env_interactive(args: argparse.Namespace) -> None:
@@ -1385,7 +1402,13 @@ def run_env_interactive(args: argparse.Namespace) -> None:
         client.camera.up_direction = (0., 0., 1.)
 
     status_md = server.gui.add_markdown("正在构建 GPU 仿真环境...")
-    map_panel = server.gui.add_html("") if base.search_map else None
+    map_panel = server.gui.add_html("") if base.search_map or base.spatial_memory else None
+
+    def map_image(env):
+        if base.spatial_memory:
+            return spatial_height_html(actor.spatial, env.groups[0].geometry.depth)
+        return search_map_html(env)
+
     # 课程默认值取检查点当前等级
     probe_env, _ = build_env(args.shape if args.shape in base.shapes else
                              ("dual" if "dual" in base.shapes else base.shapes[0]), False)
@@ -1590,7 +1613,7 @@ def run_env_interactive(args: argparse.Namespace) -> None:
         episode.update(info=episode_info(g), peak=0.)
         obs = env.get_observations()
         if map_panel is not None:
-            map_panel.content = search_map_html(env)
+            map_panel.content = map_image(env)
         return env, scene, obs
 
     frames = 0
@@ -1655,7 +1678,7 @@ def run_env_interactive(args: argparse.Namespace) -> None:
                 if frames % 3 == 0 or request["mode"] == "paused":
                     render_status(last_frame)
                     if map_panel is not None:
-                        map_panel.content = search_map_html(env)
+                        map_panel.content = map_image(env)
     finally:
         server.stop()
 

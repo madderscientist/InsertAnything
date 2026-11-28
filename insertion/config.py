@@ -154,6 +154,7 @@ class InsertionCfg:
     # 训练时以此概率从近期记录的接触难点位姿（贴板、孔口卡滞、半插入）开始回合
     hard_state_reset_probability: float = 0.25
     # 空间概率记忆：按目标偏差初始化、只减不加的孔位概率图进入观测（insertion/search_map.py）
+    spatial_memory: bool = False
     search_map: bool = False
     # 势函数整形系数 c：Φ = c Σ P0 (1 - e^s)，奖励 γΦ' - Φ，终止时 Φ' = 0，整回合折扣和为零
     search_coverage_reward: float = 0.0
@@ -321,6 +322,8 @@ class InsertionCfg:
             raise ValueError("lateral workspace radius must be positive and contain the full initial X/Y square")
         if not math.isfinite(self.plate_outer_radius_m) or self.plate_outer_radius_m < 0:
             raise ValueError("plate outer radius must be finite and nonnegative; zero selects legacy geometry")
+        if self.spatial_memory and self.search_map:
+            raise ValueError("choose either spatial memory or the probability map")
         if self.search_map and (self.position_bias > 0.015 or (self.training and self.position_bias == 0.)):
             raise ValueError("search map position_bias must be at most 15 mm and positive during training")
         if self.search_map_sigma_max_m and not (

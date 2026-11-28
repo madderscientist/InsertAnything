@@ -14,6 +14,7 @@ from torch.distributions import Normal
 from torch.utils.checkpoint import checkpoint
 
 from .search_map import MAP_BATCH, MAP_COARSE, MAP_FEATURES, MAP_FINE, MapEncoder
+from .spatial_memory import FEATURES as SPATIAL_FEATURES, REPLAY, SpatialMemory
 
 SKIP_RNN_MODEL = "insertion.model:SkipRNNModel"
 GSDE_DISTRIBUTION = "insertion.model:GSDEDistribution"
@@ -119,14 +120,17 @@ class MinGRU(nn.Module):
 
 
 class SkipRNNModel(RNNModel):
-    def __init__(self, *args, search_map: bool = False, **kwargs) -> None:
+    def __init__(self, *args, search_map: bool = False, spatial_memory: bool = False, **kwargs) -> None:
         # 概率图编码与 minGRU 并联接入 MLP，维度须在父类构建 MLP 前确定
-        self.map_dim = MAP_FEATURES if search_map else 0
+        if search_map and spatial_memory:
+            raise ValueError("choose a single spatial memory representation")
+        self.map_dim = SPATIAL_FEATURES if spatial_memory else (MAP_FEATURES if search_map else 0)
         super().__init__(*args, **kwargs)
         # 只借用 rsl_rl RNN 封装的隐状态管理；GRU 的门依赖隐状态，训练中递归权重增长后策略对参数极度敏感
         rnn = self.rnn.rnn
         self.rnn.rnn = MinGRU(rnn.input_size, rnn.hidden_size, rnn.num_layers, CHRONO_MAX_STEPS)
-        if self.map_dim:
+        self.spatial = SpatialMemory(self.latent_dim) if spatial_memory else None
+        if search_map:
             self.map_encoder = MapEncoder()
         self.map_cache: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -135,7 +139,7 @@ class SkipRNNModel(RNNModel):
         if not isinstance(self.distribution, GSDEDistribution):
             return super().forward(obs, masks, hidden_state, stochastic_output)
         *body, head = self.mlp
-        features = self.get_latent(obs, masks, hidden_state)
+        features = self.get_latent(obs, masks, hidden_state, predict_height=stochastic_output)
         for layer in body:
             features = layer(features)
         mean = head(features)
@@ -147,14 +151,26 @@ class SkipRNNModel(RNNModel):
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state=None) -> None:
         super().reset(dones, hidden_state)
+        if self.spatial is not None and hidden_state is None:
+            self.spatial.reset(dones)
         if isinstance(self.distribution, GSDEDistribution) and hidden_state is None:
             self.distribution.resample(dones)
 
-    def get_latent(self, obs, masks=None, hidden_state=None) -> torch.Tensor:
+    def get_latent(self, obs, masks=None, hidden_state=None, *, predict_height=True) -> torch.Tensor:
         current = MLPModel.get_latent(self, obs)
-        memory = self.rnn(current, masks, hidden_state).squeeze(0)
-        if masks is not None:
+        memory = self.rnn(current, masks, hidden_state)
+        if masks is None:
+            memory = memory.squeeze(0)
+        else:
             current = unpad_trajectories(current, masks)
+        if self.spatial is not None:
+            tip_xy = -obs["actor"][..., :2]
+            if masks is None:
+                spatial = self.spatial(memory, tip_xy)
+            else:
+                spatial = self.spatial(memory, unpad_trajectories(tip_xy, masks), obs.get_non_tensor(REPLAY),
+                                       predict_height=predict_height)
+            return torch.cat((memory, current, spatial), -1)
         if not self.map_dim:
             return torch.cat((memory, current), -1)
         if masks is None:
@@ -171,13 +187,13 @@ class SkipRNNModel(RNNModel):
 
     def as_jit(self) -> nn.Module:
         if self.map_dim:
-            raise NotImplementedError("search map policies are not exportable yet")
+            raise NotImplementedError("spatial and probability map policies require stateful map export")
         return _JitSkipRNN(self)
 
     def as_onnx(self, verbose: bool = False) -> nn.Module:
         del verbose
         if self.map_dim:
-            raise NotImplementedError("search map policies are not exportable yet")
+            raise NotImplementedError("spatial and probability map policies require stateful map export")
         return _OnnxSkipRNN(self)
 
 
