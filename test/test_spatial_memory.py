@@ -20,9 +20,9 @@ from insertion.env import PlantGroup
 from insertion.geometry import build_model, geometry
 from insertion.model import GSDE_DISTRIBUTION, SKIP_RNN_MODEL, SkipRNNModel
 from insertion.ppo import SmoothPPO
-from insertion.spatial_memory import (BLOCK, CELLS, CHANNELS, COARSE, GRID, HEIGHT_TARGET,
+from insertion.spatial_memory import (BLOCK, CELL_M, CELLS, CHANNELS, COARSE, GRID, HEIGHT_TARGET,
                                       REPLAY, SpatialMemory, local_patch)
-from insertion.surface_height import SurfaceRays
+from insertion.surface_height import SurfaceHeights
 
 
 class SpatialMemoryTests(unittest.TestCase):
@@ -96,7 +96,7 @@ class SpatialMemoryTests(unittest.TestCase):
         torch.testing.assert_close(latent.grad, other.grad, rtol=2e-5, atol=3e-6)
         torch.testing.assert_close(m.write.weight.grad, ref.write.weight.grad, rtol=2e-5, atol=3e-6)
 
-    def test_height_rays_match_mujoco_and_exclude_tool(self):
+    def test_cell_heights_match_mujoco_and_exclude_tool(self):
         for shape in ("triangle", "pentagon", "hexagon", "l", "rectangle", "dual"):
             with self.subTest(shape=shape), wp.ScopedDevice("cpu"):
                 geom = geometry(shape, 0.0002, 1., None, 0.06, False, 0.022, True)
@@ -114,20 +114,54 @@ class SpatialMemoryTests(unittest.TestCase):
                 mujoco.mj_forward(model, data)
                 coords = torch.tensor([[-18., -6.35, -3., 0., 3., 6.35, 10., 12., 18.]]) * 0.001
                 xy = torch.stack((coords, torch.zeros_like(coords)), dim=-1)
-                rays = SurfaceRays(1, "cpu", tool, 0.08)
-                result = rays.sample(mjwarp.put_model(model), mjwarp.put_data(model, data, nworld=1),
-                                     xy, torch.tensor([[-0.0015]]), 0.022)
+                surface = SurfaceHeights(model, tool, "cpu")
+                result = surface.sample(mjwarp.put_model(model), mjwarp.put_data(model, data, nworld=1),
+                                        xy, torch.tensor([[-0.0015]]), 0.022)
                 expected = []
+                axis = np.linspace(-CELL_M / 2, CELL_M / 2, 5)
                 for point in xy[0].numpy():
-                    hit = mujoco.mj_ray(model, data, np.array([*point, 0.08]), np.array([0., 0., -1.]),
-                                        None, True, tool, np.zeros(1, dtype=np.int32))
-                    expected.append(max(0.08 - hit + 0.0015, -0.022) if hit >= 0 else -0.022)
+                    top = -0.022
+                    for dx in axis:
+                        for dy in axis:
+                            hit = mujoco.mj_ray(model, data, np.array([point[0] + dx, point[1] + dy, 0.08]),
+                                                np.array([0., 0., -1.]), None, True, tool, np.zeros(1, dtype=np.int32))
+                            if hit >= 0:
+                                top = max(top, 0.08 - hit + 0.0015)
+                    expected.append(top)
                 torch.testing.assert_close(result[0], torch.tensor(expected).float(), rtol=0., atol=2e-6)
                 self.assertAlmostEqual(result[0, 0].item(), 0., places=5)
                 self.assertAlmostEqual(result[0, 7].item(), 0.0015, places=5)
                 if shape == "dual":
                     for slot in (1, 3, 5):
                         self.assertAlmostEqual(result[0, slot].item(), -0.022, places=5)
+
+    def test_subcell_rim_hole_edge_and_tilted_tile(self):
+        model = mujoco.MjModel.from_xml_string("""
+            <mujoco>
+              <worldbody>
+                <geom name="rim" type="box" pos="0.00030 0.0002 0.00075" size="0.00001 0.00003 0.00075"/>
+                <geom name="plate" type="box" pos="0.0052 0 -0.0005" size="0.001 0.001 0.0005"/>
+                <geom name="tile" type="box" pos="0 0.005 0" euler="0 30 0" size="0.003 0.001 0.0005"/>
+                <body name="tool" pos="0 0 0.01"><freejoint/><geom type="sphere" size="0.002"/></body>
+              </worldbody>
+            </mujoco>""")
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        tool = model.body("tool").id
+        # Neither the center ray nor any corner ray hits the narrow rim.
+        half = CELL_M / 2
+        for dx, dy in ((0, 0), (-half, -half), (-half, half), (half, -half), (half, half)):
+            hit = mujoco.mj_ray(model, data, np.array([dx, dy, 0.08]), np.array([0., 0., -1.]),
+                                None, True, tool, np.zeros(1, dtype=np.int32))
+            self.assertLess(hit, 0.)
+        with wp.ScopedDevice("cpu"):
+            surface = SurfaceHeights(model, tool, "cpu")
+            xy = torch.tensor([[[0., 0.], [0.004, 0.], [0.002, 0.], [0., 0.005]]])
+            result = surface.sample(mjwarp.put_model(model), mjwarp.put_data(model, data, nworld=1),
+                                    xy, torch.zeros(1, 1), 0.025)
+        tilted_top = 0.0005 / np.cos(np.pi / 6) + half * np.tan(np.pi / 6)
+        torch.testing.assert_close(result, torch.tensor([[0.0015, 0., -0.025, tilted_top]]).float(),
+                                   rtol=0., atol=1e-8)
 
     def test_training_label_projects_observed_cells_into_the_true_hole_frame(self):
         with wp.ScopedDevice("cpu"):
@@ -139,8 +173,8 @@ class SpatialMemoryTests(unittest.TestCase):
             mujoco.mj_forward(model, data)
             g.sim = SimpleNamespace(wp_model=mjwarp.put_model(model), wp_data=mjwarp.put_data(model, data, nworld=2))
             g.body_id = model.body("tool").id
-            g.surface_rays, g.warp_on_current_stream = None, nullcontext
-            g.cfg = SimpleNamespace(workspace_z_max_m=0.07, rough_max_amplitude_m=0., scale=1.)
+            g.surface_heights = SurfaceHeights(model, g.body_id, "cpu")
+            g.warp_on_current_stream = nullcontext
             g.rim_height = torch.zeros(2)
             g.nominal_offset = g.offset = g.calibration = torch.zeros(2, 3)
             g.bias = torch.tensor([[0., 0., 0.], [0.018, 0., 0.]])

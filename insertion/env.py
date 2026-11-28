@@ -20,7 +20,7 @@ from .geometry import build_model, geometry, rough_surface_tiles
 from .search_map import SearchMap, prior_log_mass
 from .shapes.base import PARKED_OFFSET_M
 from .spatial_memory import HEIGHT_TARGET, cell_centers, local_patch
-from .surface_height import SurfaceRays
+from .surface_height import SurfaceHeights
 from .transforms import (action_target, actor_observation, canonical_quat,
                          quat_inv, quat_mul, quat_rotvec, rotate,
                          rotvec_quat, tip_pose, transform_wrench)
@@ -225,7 +225,6 @@ class PlantGroup:
         self.clearance = cfg.clearance if self.adr else self.clearance_max
         self.clearance_floor = self.clearance_max
         self.pending_clearance: float | None = None
-        self.surface_rays = None
         self.shape = shape
         self._build_simulation()
         self._init_shape()
@@ -362,6 +361,8 @@ class PlantGroup:
                                  cfg.shape_randomization)
         self.model = build_model(self.geometry)
         self.body_id = self.model.body("tool").id
+        self.surface_heights = (SurfaceHeights(self.model, self.body_id, self.device)
+                                if cfg.spatial_memory and cfg.training else None)
         nconmax, njmax = self.geometry.definition.contact_limits(cfg.rough_surface)
         self.sim = Simulation(
             self.n, SimulationCfg(nconmax=nconmax, njmax=njmax,
@@ -1347,11 +1348,8 @@ class PlantGroup:
         indices, _, _ = local_patch(-actor[:, :2])
         points = cell_centers(indices) - self.search_map_target()[:, None]
         with wp.ScopedDevice(self.device), self.warp_on_current_stream():
-            if self.surface_rays is None:
-                ceiling = (self.cfg.workspace_z_max_m + 2 * self.cfg.rough_max_amplitude_m) * self.cfg.scale
-                self.surface_rays = SurfaceRays(self.n, self.device, self.body_id, ceiling)
-            return self.surface_rays.sample(self.sim.wp_model, self.sim.wp_data, points,
-                                            -self.rim_height[:, None], self.geometry.depth)
+            return self.surface_heights.sample(self.sim.wp_model, self.sim.wp_data, points,
+                                               -self.rim_height[:, None], self.geometry.depth)
 
     def record_position_observation(self, position_noise: torch.Tensor) -> None:
         if not self.cfg.position_observation_delay:
