@@ -799,6 +799,8 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
         group.generator.manual_seed(seed)
         group.walk_generator.manual_seed(seed + 500003)
         group.reset(torch.arange(group.n, device=group.device))
+    if cfg.search_map:
+        env.reset_search_map(torch.ones(env.num_envs, dtype=torch.bool, device=env.device))
 
 
 def restore_training_state(runner: ContinuousRunner, saved: dict,

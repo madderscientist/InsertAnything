@@ -10,7 +10,7 @@ from mujoco._functions import mj_forward
 from mujoco._structs import MjData, MjvCamera
 import torch
 
-from evaluate import load_checkpoint
+from evaluate import MapPolicy, load_checkpoint
 from insertion import ALL_SHAPES, InsertionCfg, InsertionEnv
 
 
@@ -34,6 +34,8 @@ def main() -> None:
                                         else args.target_depth),
                   envs_per_shape=1, shape_env_counts=(), adaptive_sampling=False, training=False)
     env = InsertionEnv(cfg, args.device)
+    if isinstance(actor, MapPolicy):
+        actor.search_map = env.search_map
     obs = env.get_observations()
     group = env.groups[0]
 

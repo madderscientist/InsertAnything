@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from evaluate import load_checkpoint
+from evaluate import MapPolicy, load_checkpoint
 from insertion import InsertionCfg, InsertionEnv, TRAIN_SHAPES
 from insertion.env import CONTACT_THRESHOLD_N
 from insertion.transforms import tip_pose
@@ -71,6 +71,8 @@ COUNTERS = ("steps", "surface_steps", "abs_trans", "abs_rot", "trans_flips", "tr
 def evaluate_real(actor, cfg: InsertionCfg, device: str, trials_per_shape: int) -> list[dict]:
     actor.reset()
     env = InsertionEnv(cfg, device)
+    if isinstance(actor, MapPolicy):
+        actor.search_map = env.search_map
     n = env.num_envs
     shapes = [group.shape for group in env.groups for _ in range(group.n)]
     stats = {key: torch.zeros(n, device=device) for key in COUNTERS}

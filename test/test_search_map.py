@@ -1,29 +1,77 @@
 """空间概率记忆 C1：先验校准、只减不加的擦除、一步 NLL 公式与端到端训练"""
 
 from argparse import Namespace
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import unpad_trajectories
 from tensordict import TensorDict
 import torch
 
+import play
 from evaluate import MapPolicy, load_checkpoint
 from insertion import InsertionCfg, InsertionEnv
 from insertion.distributed import run_distributed
 from insertion.search_map import (CELL_M, DENSITY_MAX, DENSITY_MIN, DENSITY_SCALE, ERASE_MAX, GRID, LOG_FLOOR,
                                   MAP_COARSE, MAP_FINE, MAP_NLL, PATCH, SearchMap, erase_nll, prior_log_mass)
+from real2sim import evaluate_real2sim
 from search_prior.train_search import search_runner
-from train import ContinuousRunner, atomic_json, contract
+from train import ContinuousRunner, atomic_json, contract, restore_environment_progress
+from viser_view import replay_config
 
 SEARCH = dict(position_bias=0.005, initial_xy=0.005, workspace_xy_radius_m=0.025)
 
 
 class SearchMapTests(unittest.TestCase):
+    def test_zero_noise_map_replay_keeps_a_normalized_prior(self):
+        cfg = InsertionCfg(shapes=("triangle",), search_map=True, **SEARCH)
+        replay = replay_config(asdict(cfg), "triangle", zero_noise=True)
+        self.assertEqual(replay.position_bias, 0.)
+        self.assertTrue(replay.search_map)
+        with self.assertRaisesRegex(ValueError, "position_bias"):
+            replace(replay, training=True)
+        with self.assertRaisesRegex(ValueError, "position_bias"):
+            replace(replay, position_bias=0.016)
+        env = Namespace(device="cpu", search_map=SearchMap(1, "cpu"),
+                        groups=[Namespace(cfg=replay, episode_noise_scale=torch.ones(1))])
+        InsertionEnv.reset_search_map(env, torch.ones(1, dtype=torch.bool))
+        torch.testing.assert_close(env.search_map.log_prior, prior_log_mass(torch.zeros(1)))
+        torch.testing.assert_close(env.search_map.log_prior.exp().sum(), torch.tensor(1.))
+
+    def test_replay_entry_points_bind_their_own_map_before_first_action(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=1, search_map=True, **SEARCH)
+        actor = Mock(spec=MapPolicy)
+        for entry in ("play", "real2sim"):
+            with self.subTest(entry=entry):
+                memory = SearchMap(1, "cpu")
+                env = Mock(num_envs=1, max_episode_length=1, groups=[Namespace(n=1, shape="square")],
+                           search_map=memory)
+                action = torch.zeros(1, 6)
+                terminal = {"reason": torch.ones(1), "length": torch.ones(1)}
+                def step(actions):
+                    self.assertIs(actor.search_map, memory)
+                    return env.get_observations(), torch.zeros(1), torch.ones(1, dtype=torch.bool), {"terminal": terminal}
+                env.step.side_effect = step
+                env.get_observations.return_value = {"actor": torch.zeros(1, 13)}
+                actor.return_value = action
+                if entry == "play":
+                    with patch.object(play, "InsertionEnv", return_value=env), \
+                         patch.object(play, "load_checkpoint", return_value=({"environment": asdict(cfg)}, actor)), \
+                         patch("sys.argv", ["play", "checkpoint.pt", "--headless", "--steps", "1", "--device", "cpu"]):
+                        play.main()
+                else:
+                    flags = torch.zeros(1, dtype=torch.bool)
+                    with patch.object(evaluate_real2sim, "InsertionEnv", return_value=env), \
+                         patch.object(evaluate_real2sim, "probe", return_value=(torch.zeros(1, 3), flags, flags)):
+                        rows = evaluate_real2sim.evaluate_real(actor, cfg, "cpu", 1)
+                    self.assertEqual(len(rows), 1)
+                env.step.assert_called_once_with(action)
+
     def test_episode_prior_sigma_is_log_uniform_and_independent_of_noise(self):
         cfg = InsertionCfg(search_map=True, search_map_sigma_min_m=0.0005, search_map_sigma_max_m=0.003)
         group = Namespace(cfg=cfg, episode_noise_scale=torch.zeros(2000))
@@ -39,6 +87,26 @@ class SearchMapTests(unittest.TestCase):
         self.assertAlmostEqual(float(log_std.mean()), (math.log(0.0005) + math.log(0.003)) / 2, delta=0.1)
         with self.assertRaises(ValueError):
             InsertionCfg(search_map_sigma_min_m=0.0005, search_map_sigma_max_m=0.003)
+
+    def test_resume_builds_map_prior_from_the_reset_episodes(self):
+        cfg = InsertionCfg(shapes=("square",), envs_per_shape=1, search_map=True, noise_curriculum=True,
+                           grasp_position_error=0., tip_calibration_error=0., **SEARCH)
+        group = Namespace(cfg=cfg, n=1, device="cpu", episode_noise_scale=torch.zeros(1),
+                          generator=torch.Generator(), walk_generator=torch.Generator())
+        group.reset = lambda ids: group.episode_noise_scale.index_fill_(0, ids, group.noise_scale)
+        env = InsertionEnv.__new__(InsertionEnv)
+        env.device, env.num_envs, env.groups, env.noise_curriculum = "cpu", 1, [group], None
+        env.search_map = SearchMap(1, "cpu")
+        env.reset_search_map(torch.ones(1, dtype=torch.bool))
+        startup_prior = env.search_map.log_prior.clone()
+
+        saved = {"infos": {"progress": {"policy_steps": cfg.noise_full_steps}, "environment": asdict(cfg)}}
+        restore_environment_progress(env, cfg, saved, 1)
+
+        self.assertEqual(float(group.episode_noise_scale[0]), 1.)
+        expected = prior_log_mass(torch.tensor([cfg.position_bias / math.sqrt(3)]))
+        self.assertFalse(torch.allclose(startup_prior, expected))
+        torch.testing.assert_close(env.search_map.log_prior, expected)
 
     def test_prior_is_normalized_gaussian_with_given_std(self):
         std = torch.tensor([0.001, 0.003, 0.005])

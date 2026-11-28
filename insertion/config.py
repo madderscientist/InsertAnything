@@ -321,8 +321,8 @@ class InsertionCfg:
             raise ValueError("lateral workspace radius must be positive and contain the full initial X/Y square")
         if not math.isfinite(self.plate_outer_radius_m) or self.plate_outer_radius_m < 0:
             raise ValueError("plate outer radius must be finite and nonnegative; zero selects legacy geometry")
-        if self.search_map and not 0 < self.position_bias <= 0.015:
-            raise ValueError("search map requires 0 < position_bias <= 15 mm inside its 48 mm grid")
+        if self.search_map and (self.position_bias > 0.015 or (self.training and self.position_bias == 0.)):
+            raise ValueError("search map position_bias must be at most 15 mm and positive during training")
         if self.search_map_sigma_max_m and not (
                 self.search_map and 0 < self.search_map_sigma_min_m <= self.search_map_sigma_max_m <= 0.015):
             raise ValueError("search map sigma range requires the search map and 0 < min <= max <= 15 mm")
