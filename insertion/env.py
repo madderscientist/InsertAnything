@@ -232,6 +232,8 @@ class PlantGroup:
         self.difficulty = 0.0 if cfg.training else 1.0
         self.constants: dict[tuple[float, ...], torch.Tensor] = {}
         self.noise_scale = cfg.noise_scale(0)
+        # ADR 收拢阶段的回合噪声系数下限
+        self.noise_floor = 0.0
         self.episode_noise_scale = torch.full((self.n,), self.noise_scale, device=device)
         # ADR 边界回合钉住的维度：0 普通回合，1 噪声，2 间隙
         self.episode_boundary = torch.zeros(self.n, dtype=torch.long, device=device)
@@ -832,7 +834,8 @@ class PlantGroup:
         if not cfg.physics_cuda_graph:
             self.masked_reset()
             return
-        signature = (self.difficulty, self.noise_scale, self.clearance, self.clearance_floor)
+        signature = (self.difficulty, self.noise_scale, self.noise_floor, self.clearance,
+                     self.clearance_floor, self.clearance_max)
         if self.masked_reset_graph is not None and signature == self.masked_reset_signature:
             self.masked_reset_graph.replay()
             return
@@ -909,7 +912,8 @@ class PlantGroup:
             clearance_probe = probe & (u[:, 1] < 0.5)
             noise_probe = probe & ~clearance_probe
             self.episode_boundary[ids] = noise_probe.long() + 2*clearance_probe.long()
-            self.episode_noise_scale[ids] = torch.where(noise_probe, 1., u[:, 2]) * self.noise_scale
+            self.episode_noise_scale[ids] = self.noise_floor + torch.where(
+                noise_probe, 1., u[:, 2]) * (self.noise_scale - self.noise_floor)
             low, high = math.log(self.clearance_floor), math.log(self.clearance_max)
             self.shape_params[ids, 3] = torch.where(
                 clearance_probe, self.clearance_floor, (low + (high-low)*u[:, 3]).exp())
@@ -1705,6 +1709,16 @@ class InsertionEnv(VecEnv):
         scale = None if self.noise_curriculum is None else self.noise_curriculum.scale_for(group.shape)
         return group.cfg.noise_scale(self.policy_steps) if scale is None else scale
 
+    def apply_curriculum(self, group: PlantGroup) -> None:
+        curriculum = self.noise_curriculum
+        group.difficulty = curriculum.difficulty
+        group.noise_scale = self.curriculum_noise_scale(group)
+        if isinstance(curriculum, ADRCurriculum):
+            group.noise_floor = curriculum.noise_floor_for(group.shape)
+            group.clearance_max = curriculum.clearance_ceiling_for(group.shape)
+        if hasattr(group, "set_clearance"):
+            group.set_clearance(curriculum.clearance_for(group.shape))
+
     def record_curriculum_outcomes(self, outcomes: torch.Tensor) -> None:
         if self.noise_curriculum is not None:
             self.curriculum_pending.append(outcomes)
@@ -1770,10 +1784,7 @@ class InsertionEnv(VecEnv):
                 self.noise_curriculum.difficulty, previous_scale, self.noise_curriculum.scale,
             )
         for group in self.groups:
-            group.noise_scale = self.curriculum_noise_scale(group)
-            group.difficulty = self.noise_curriculum.difficulty
-            if hasattr(group, "set_clearance"):
-                group.set_clearance(self.noise_curriculum.clearance_for(group.shape))
+            self.apply_curriculum(group)
         logs["curriculum/clearance_mm"] = outcomes.new_tensor(
             max(curriculum.clearance_for(s) for s in shapes) * 1000, dtype=torch.float32)
         logs["curriculum/difficulty"] = outcomes.new_tensor(
@@ -1781,8 +1792,10 @@ class InsertionEnv(VecEnv):
         logs["curriculum/noise_scale"] = outcomes.new_tensor(
             self.noise_curriculum.scale, dtype=torch.float32)
         if adr:
-            for shape, (noise_phi, _) in curriculum.phi.items():
+            for shape, (noise_phi, clearance_phi) in curriculum.phi.items():
                 logs[f"curriculum/noise_phi/{shape}"] = outcomes.new_tensor(noise_phi, dtype=torch.float32)
+                logs[f"curriculum/clearance_phi/{shape}"] = outcomes.new_tensor(
+                    clearance_phi, dtype=torch.float32)
                 logs[f"curriculum/clearance_mm/{shape}"] = outcomes.new_tensor(
                     curriculum.clearance_for(shape) * 1000, dtype=torch.float32)
         for shape, window in self.noise_curriculum.windows.items():

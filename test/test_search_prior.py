@@ -97,6 +97,7 @@ class SearchPriorTests(unittest.TestCase):
         g = env.groups[0]
         g.difficulty = 0.7
         g.set_clearance(0.0005)
+        g.noise_scale, g.noise_floor, g.clearance_max = 0.8, 0.3, 0.001
         g.hard_valid[:16] = True
 
         def state():
@@ -171,6 +172,15 @@ class SearchPriorTests(unittest.TestCase):
             self.assertTrue(bool(((c >= 0.0005) & (c <= 0.002 + 1e-9)).all()))
             probe = g.episode_boundary == 2
             self.assertTrue(bool(probe.any()) and bool((c[probe] == 0.0005).all()))
+            # 收拢阶段：间隙上限与噪声下限向难侧移动
+            g.noise_scale, g.noise_floor, g.clearance_max = 0.8, 0.5, 0.001
+            g.reset(torch.arange(g.n, device=g.device))
+            c, s = g.shape_params[:, 3], g.episode_noise_scale
+            self.assertTrue(bool(((c >= 0.0005) & (c <= 0.001 + 1e-9)).all()))
+            self.assertTrue(bool(((s >= 0.5) & (s <= 0.8 + 1e-6)).all()))
+            self.assertTrue(bool(torch.allclose(s[g.episode_boundary == 1], torch.tensor(0.8, device=g.device))))
+            g.noise_floor, g.clearance_max = 0., 0.002
+            g.reset(torch.arange(g.n, device=g.device))
         g, sides = env.groups[0], 5
         half_angle = math.pi/sides
         peg_apothem = g.geometry.radius*g.shape_params[:, 0]*math.cos(half_angle) - cfg.clearance/2

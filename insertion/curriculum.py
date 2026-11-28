@@ -114,14 +114,17 @@ ADR_BOUNDARY_FRACTION = 0.2
 
 
 class ADRCurriculum:
-    """两维自动域随机化：每形状噪声上界 φ[0] 与间隙进度 φ[1] 各按自己的边界回合成功率双向调节。
+    """两维自动域随机化：每形状噪声 φ[0] 与间隙 φ[1] ∈ [0, 2] 各按自己的边界回合成功率双向调节。
 
-    边界回合把一维钉在当前边界（噪声取 φ[0]，间隙取最紧值 c(φ[1])），另一维照常采样；
-    c(φ) 在最松与目标间隙之间对数插值；初始位姿、阻尼等其余随机化难度取 min φ[0]"""
+    φ ≤ 1 时放开难侧边界，易侧固定（噪声下限 0、间隙上限最松值）；φ > 1 时难侧已满，
+    易侧边界按 φ-1 向难侧收拢，φ = 2 时整维钉在最难值（噪声系数 1、目标间隙）。
+    边界回合把一维钉在难侧边界（噪声取 min(φ[0], 1)，间隙取最紧值），另一维照常采样；
+    c(φ) 在最松与目标间隙之间对数插值；初始位姿、阻尼等其余随机化难度取 min φ[0]（截到 1）"""
     window_size = 1000
     expand_above = 0.8
     shrink_below = 0.5
     step = 0.05
+    limit = 2.0
     # 每次调节 φ 前需累计的边界回合数
     boundary_episodes = 200
 
@@ -135,17 +138,26 @@ class ADRCurriculum:
 
     @property
     def difficulty(self) -> float:
-        return min(phi[0] for phi in self.phi.values())
+        return min(min(phi[0], 1.) for phi in self.phi.values())
 
     @property
     def scale(self) -> float:
         return self.difficulty
 
     def scale_for(self, shape: str) -> float:
-        return self.phi[shape][0]
+        return min(self.phi[shape][0], 1.)
+
+    def noise_floor_for(self, shape: str) -> float:
+        return max(self.phi[shape][0] - 1., 0.)
+
+    def clearance_at(self, progress: float) -> float:
+        return self.loosest * (self.tightest/self.loosest) ** progress
 
     def clearance_for(self, shape: str) -> float:
-        return self.loosest * (self.tightest/self.loosest) ** self.phi[shape][1]
+        return self.clearance_at(min(self.phi[shape][1], 1.))
+
+    def clearance_ceiling_for(self, shape: str) -> float:
+        return self.clearance_at(max(self.phi[shape][1] - 1., 0.))
 
     def load_levels(self, state: dict) -> None:
         self.phi.update({shape: list(phi) for shape, phi in state["phi"].items() if shape in self.phi})
@@ -165,7 +177,7 @@ class ADRCurriculum:
                     continue
                 rate, old = stats[0] / stats[1], self.phi[shape][d]
                 if rate > self.expand_above:
-                    self.phi[shape][d] = min(1.0, round(old + self.step, 6))
+                    self.phi[shape][d] = min(self.limit, round(old + self.step, 6))
                 elif rate < self.shrink_below:
                     self.phi[shape][d] = max(0.0, round(old - self.step, 6))
                 self.boundary[shape][d] = [0, 0]
@@ -181,7 +193,7 @@ class ADRCurriculum:
 
     def load_state_dict(self, state: dict) -> None:
         if (set(state.get("phi", ())) != set(self.phi)
-                or any(len(phi) != 2 or not all(0 <= p <= 1 for p in phi) for phi in state["phi"].values())
+                or any(len(phi) != 2 or not all(0 <= p <= self.limit for p in phi) for phi in state["phi"].values())
                 or set(state.get("boundary", ())) != set(self.boundary)
                 or set(state.get("windows", ())) != set(self.windows)):
             raise ValueError("invalid ADR curriculum checkpoint")

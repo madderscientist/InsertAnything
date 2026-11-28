@@ -747,10 +747,7 @@ def restore_environment_progress(env: InsertionEnv, cfg: InsertionCfg, saved: di
         env.curriculum_cohort_armed = None
     for index, group in enumerate(env.groups):
         if env.noise_curriculum is not None:
-            group.difficulty = env.noise_curriculum.difficulty
-            group.noise_scale = env.curriculum_noise_scale(group)
-            if hasattr(group, "set_clearance"):
-                group.set_clearance(env.noise_curriculum.clearance_for(group.shape))
+            env.apply_curriculum(group)
         else:
             group.difficulty = min(1., env.policy_steps/cfg.curriculum_steps)
             group.noise_scale = cfg.noise_scale(env.policy_steps)

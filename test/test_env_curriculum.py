@@ -520,12 +520,25 @@ class RewardAndCurriculumUnitTests(unittest.TestCase):
         for _ in range(20):
             curriculum.update(full, {"square": ([True] * 200, [True] * 200),
                                      "triangle": ([True] * 200, [True] * 200)})
-        self.assertEqual(curriculum.phi, {"square": [1., 1.], "triangle": [1., 1.]})
-        self.assertEqual(curriculum.difficulty, 1.)
+        self.assertEqual(curriculum.phi, {"square": [1.05, 1.], "triangle": [1., 1.]})
+        self.assertEqual((curriculum.difficulty, curriculum.scale_for("square")), (1., 1.))
+        self.assertAlmostEqual(curriculum.noise_floor_for("square"), 0.05)
         self.assertAlmostEqual(curriculum.clearance_for("triangle"), 0.0001)
+        self.assertEqual((curriculum.noise_floor_for("triangle"), curriculum.clearance_ceiling_for("triangle")),
+                         (0., 0.002))
+        # 难侧满后易侧边界向难侧收拢，直到整维钉在最难值
+        for _ in range(20):
+            curriculum.update(full, {"square": ([True] * 200, [True] * 200),
+                                     "triangle": ([True] * 200, [True] * 200)})
+        self.assertEqual(curriculum.phi, {"square": [2., 2.], "triangle": [2., 2.]})
+        self.assertEqual((curriculum.difficulty, curriculum.scale_for("square"),
+                          curriculum.noise_floor_for("square")), (1., 1., 1.))
+        self.assertAlmostEqual(curriculum.clearance_for("square"), 0.0001)
+        self.assertAlmostEqual(curriculum.clearance_ceiling_for("square"), 0.0001)
         self.assertTrue(curriculum.update(full, {"square": ([], [False] * 200), "triangle": none}))
-        self.assertEqual(curriculum.phi["square"], [1., 0.95])
-        self.assertAlmostEqual(curriculum.clearance_for("square"), 0.002 * 0.05 ** 0.95)
+        self.assertEqual(curriculum.phi["square"], [2., 1.95])
+        self.assertAlmostEqual(curriculum.clearance_for("square"), 0.0001)
+        self.assertAlmostEqual(curriculum.clearance_ceiling_for("square"), 0.002 * 0.05 ** 0.95)
         restored = ADRCurriculum(("square", "triangle"), 0.002, 0.0001)
         restored.load_state_dict(curriculum.state_dict())
         self.assertEqual(restored.state_dict(), curriculum.state_dict())
