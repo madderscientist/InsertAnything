@@ -20,7 +20,6 @@ from train import atomic_json, contract, supervise, validate_ppo_batch_layout
 
 SEARCH_SHAPES = ("triangle", "pentagon", "hexagon", "l", "rectangle", "dual")
 SEARCH_ACTOR_MIN_LR = 1e-6
-SEARCH_RECURRENT_NORM_MAX = 2.0
 
 
 def parse_critic_lr(value: str) -> float | str:
@@ -56,20 +55,15 @@ def search_runner(args: argparse.Namespace) -> dict:
                             hidden_dims=(args.rnn_hidden, args.rnn_hidden // 2))
     if getattr(args, "critic_rnn_layers", None) is not None:
         runner["critic"]["rnn_num_layers"] = args.critic_rnn_layers
-    recurrence = getattr(args, "actor_recurrence", "gru")
-    runner["actor"]["recurrence"] = recurrence
     distribution = runner["actor"]["distribution_cfg"]
     runner["actor"]["distribution_cfg"] = {
         "class_name": GSDE_DISTRIBUTION, "init_std": distribution["init_std"],
         "std_range": distribution["std_range"], "resample_steps": args.gsde_resample_steps}
-    # 每卡环境数 × 序列长度 × 256 维 GRU 的更新显存较大，需更小的 minibatch
+    # 每卡环境数 × 序列长度 × 256 维记忆的更新显存较大，需更小的 minibatch
     runner["algorithm"].update(num_mini_batches=args.mini_batches,
                                phase_coef=args.phase_coef, phase_learning_rate=args.phase_lr)
     runner["algorithm"].update(actor_min_lr=getattr(args, "actor_min_lr", SEARCH_ACTOR_MIN_LR),
-                               critic_learning_rate=getattr(args, "critic_lr", "actor"),
-                               # minGRU 状态无递归权重，无需谱范数约束
-                               recurrent_norm_max=None if recurrence == "mingru" else
-                               getattr(args, "recurrent_norm_max", SEARCH_RECURRENT_NORM_MAX))
+                               critic_learning_rate=getattr(args, "critic_lr", "actor"))
     return runner
 
 
@@ -95,20 +89,16 @@ def main() -> None:
                         help="rollout steps per environment; also the truncated BPTT horizon")
     parser.add_argument("--mini-batches", type=int, default=16)
     parser.add_argument("--rnn-hidden", type=int, default=256)
-    parser.add_argument("--rnn-layers", type=int, help="override both GRU depths (default: 2)")
-    parser.add_argument("--critic-rnn-layers", type=int, help="override the critic GRU depth independently")
-    parser.add_argument("--actor-recurrence", choices=("gru", "mingru"), default="gru",
-                        help="actor recurrent unit; the critic always uses a GRU")
+    parser.add_argument("--rnn-layers", type=int, help="override both minGRU depths (default: 2)")
+    parser.add_argument("--critic-rnn-layers", type=int, help="override the critic minGRU depth independently")
     parser.add_argument("--actor-min-lr", type=float, default=SEARCH_ACTOR_MIN_LR,
                         help="lower bound for the actor KL learning-rate schedule")
     parser.add_argument("--critic-lr", type=parse_critic_lr, default="actor", metavar="RATE|actor",
                         help="follow the actor KL schedule (default), or specify a fixed critic learning rate")
-    parser.add_argument("--recurrent-norm-max", type=float, default=SEARCH_RECURRENT_NORM_MAX,
-                        help="spectral-norm cap of each actor GRU recurrent gate block, applied after every step")
     parser.add_argument("--gsde-resample-steps", type=int, default=25,
                         help="gSDE exploration matrix resample period in policy steps")
     parser.add_argument("--phase-coef", type=float, default=0.1,
-                        help="phase cross-entropy weight on the actor GRU (default: 0.1, use 0 to disable)")
+                        help="phase cross-entropy weight on the actor memory (default: 0.1, use 0 to disable)")
     parser.add_argument("--phase-lr", type=float, default=1e-3,
                         help="fixed Adam learning rate of the phase head, independent of the KL schedule")
     parser.add_argument("--rim-probability", type=float, default=0.5,
