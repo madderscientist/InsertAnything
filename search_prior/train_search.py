@@ -104,7 +104,7 @@ def main() -> None:
                         help="fixed Adam learning rate of the phase head, independent of the KL schedule")
     parser.add_argument("--rim-probability", type=float, default=0.5,
                         help="per-episode probability of a raised rim around the opening")
-    parser.add_argument("--episode-seconds", type=float, default=18.0)
+    parser.add_argument("--episode-seconds", type=float, default=InsertionCfg.episode_seconds)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

@@ -13,7 +13,7 @@ from torch.distributions import Normal
 
 SKIP_RNN_MODEL = "insertion.model:SkipRNNModel"
 GSDE_DISTRIBUTION = "insertion.model:GSDEDistribution"
-# 约 10 s，搜索回合 18 s
+# 50 Hz 控制频率下约 10 s
 CHRONO_MAX_STEPS = 500.
 
 
